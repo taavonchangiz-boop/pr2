@@ -1,16 +1,21 @@
+# =====================================================================
+# POSTYAR — Caddy gateway (security-hardened)
+# ---------------------------------------------------------------------
+# SECURITY (audit §7-A): the previous configuration forwarded every
+# public request carrying `?XTransformPort=<port>` to
+# `localhost:{query.XTransformPort}` — an ARBITRARY INTERNAL PROXY.
+# Any unauthenticated caller could probe or reach internal services
+# (Redis 6379, MariaDB 3306, Ollama 11434, admin panels, ...) by
+# setting that query parameter. That is a CRITICAL SSRF/internal-proxy
+# vulnerability: the upstream destination MUST be server-controlled.
+#
+# The application exposes its complete public surface (pages + all
+# /api/* routes) through the single Next.js server on port 3000, so
+# every request is pinned to that one upstream. No query parameter,
+# header, or path component can influence the upstream destination.
+# =====================================================================
 :81 {
-	@transform_port_query {
-		query XTransformPort=*
-	}
-
-	handle @transform_port_query {
-		reverse_proxy localhost:{query.XTransformPort} {
-			header_up Host {host}
-			header_up X-Forwarded-For {remote_host}
-			header_up X-Forwarded-Proto {scheme}
-			header_up X-Real-IP {remote_host}
-		}
-	}
+	encode zstd gzip
 
 	handle {
 		reverse_proxy localhost:3000 {
