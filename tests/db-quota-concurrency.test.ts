@@ -280,23 +280,17 @@ describe("quota engine: getQuotaState + requireQuota + incrementQuotaUsage (DB-b
     });
   });
 
-  test("CONCURRENT incrementQuotaUsage (5 parallel) — CHARACTERIZATION: known lost-update (count=1, not 5)", async () => {
-    // This test DOCUMENTS the known lost-update behavior of
-    // incrementQuotaUsage. The function reads usedQuota (JSON string),
-    // mutates it in JS, and writes the whole string back — with NO
-    // atomic WHERE-clause guard and NO transaction. Under concurrent
-    // calls, all 5 read the SAME used value (0), all 5 compute 0+1=1,
-    // and all 5 write 1 — the final value is 1 (last write wins), NOT 5.
+  test("CONCURRENT incrementQuotaUsage (5 parallel) — REGRESSION: no lost updates (count=5)", async () => {
+    // ROOT-CAUSE FIX REGRESSION (audit §18): the previous implementation
+    // did read-mutate-write of the whole usedQuota JSON with NO
+    // transaction and NO WHERE guard — under concurrency, all N callers
+    // read the SAME value and the last write won (final count 1, not 5).
+    // incrementQuotaUsage now performs an optimistic CAS loop
+    // (UPDATE ... WHERE usedQuota = <previously-read string>); a losing
+    // writer retries with fresh state, so EVERY increment is preserved.
     //
-    // This is a REAL production safety issue when quota is enforced
-    // under real concurrency (MariaDB with multiple connections).
-    // At the SQLite test tier, the behavior is the SAME (lost-update)
-    // because Prisma's SQLite pool still issues the 3 separate queries
-    // (read, mutate-in-JS, write) without a transaction wrapping them.
-    //
-    // The fix would be to use an atomic numeric decrement or a Prisma
-    // transaction with a WHERE guard — documented in FINAL-REPORT.md
-    // as a project owner action item.
+    // Invariant asserted: 5 parallel increments of 1 ⇒ usedQuota.aiPerMonth
+    // is EXACTLY 5 (no lost update, no float, no error).
     const endsAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
     const sub = await db.subscription.create({
       data: {
@@ -316,15 +310,8 @@ describe("quota engine: getQuotaState + requireQuota + incrementQuotaUsage (DB-b
 
     const updated = await db.subscription.findUnique({ where: { id: sub.id } });
     const used = JSON.parse(updated!.usedQuota!);
-    // CHARACTERIZATION: the lost-update means the final count is LESS
-    // THAN 5 (the theoretical max if all increments were serialized).
-    // The exact value is non-deterministic (1–4 depending on read/write
-    // interleaving) — we assert the KEY invariant: count < 5 (lost-update
-    // occurred) AND count >= 1 (at least one write succeeded) AND the
-    // value is always an integer (never a float / NaN / undefined).
-    // This documents the known issue — see FINAL-REPORT.md for the fix.
-    expect(used.aiPerMonth).toBeGreaterThanOrEqual(1);
-    expect(used.aiPerMonth).toBeLessThan(5);
+    // REGRESSION INVARIANT: the atomic CAS preserves ALL increments.
+    expect(used.aiPerMonth).toBe(5);
     expect(Number.isInteger(used.aiPerMonth)).toBe(true);
   });
 });
