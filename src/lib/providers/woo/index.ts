@@ -11,6 +11,7 @@
 // =====================================================================
 import { db } from "@/lib/db";
 import { encryptString, decryptString } from "@/lib/security/crypto";
+import { assertSafeOutboundUrl, outboundUrlErrorFa } from "@/lib/security/net-guard";
 import { audit } from "@/lib/server/auth";
 
 // ---------------------------------------------------------------------
@@ -60,6 +61,23 @@ function normalizeStoreUrl(u: string): string {
   return url.replace(/\/$/, "");
 }
 
+/**
+ * ROOT-CAUSE FIX (audit §27 — SSRF): the store URL is fully user-supplied
+ * and was previously fetched with no scheme/host restrictions, turning
+ * the sync endpoint into an internal-network probe (loopback, RFC1918,
+ * cloud metadata) with an error-message oracle. Every fetch now passes
+ * the shared egress guard (https-only, no userinfo, resolved addresses
+ * checked against private ranges) and network errors return a GENERIC
+ * message — never the raw exception text.
+ */
+async function safeWooUrl(storeUrl: string, path: string): Promise<URL> {
+  const base = await assertSafeOutboundUrl(normalizeStoreUrl(storeUrl), {
+    allowedPorts: [443],
+  });
+  const url = new URL(`${base.origin}/wp-json/wc/v3/${path.replace(/^\//, "")}`);
+  return url;
+}
+
 function maskKey(k: string): string {
   if (!k) return "";
   if (k.length <= 8) return "••••";
@@ -91,7 +109,12 @@ async function wooFetch<T>(
   path: string,
   opts: { method?: "GET" | "POST"; qs?: Record<string, string | number>; body?: unknown } = {},
 ): Promise<{ ok: true; data: T } | { ok: false; status?: number; errorFa: string }> {
-  const url = new URL(`${store.storeUrl.replace(/\/$/, "")}/wp-json/wc/v3/${path.replace(/^\//, "")}`);
+  let url: URL;
+  try {
+    url = await safeWooUrl(store.storeUrl, path);
+  } catch (e) {
+    return { ok: false, errorFa: outboundUrlErrorFa(e) };
+  }
   if (opts.qs) for (const [k, v] of Object.entries(opts.qs)) url.searchParams.set(k, String(v));
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20_000);
@@ -106,18 +129,26 @@ async function wooFetch<T>(
       },
       body: opts.body ? JSON.stringify(opts.body) : undefined,
       signal: controller.signal,
+      // Never follow redirects — an attacker-controlled host could 302
+      // the request to an internal address after validation.
+      redirect: "error",
     });
-  } catch (e) {
+  } catch {
     clearTimeout(timer);
-    const msg = e instanceof Error ? e.message : "network error";
-    return { ok: false, errorFa: `ارتباط با فروشگاه ناموفق بود: ${msg}` };
+    // Generic message only — raw error text is an SSRF/probing oracle.
+    return { ok: false, errorFa: "ارتباط با فروشگاه ناموفق بود. آدرس فروشگاه را بررسی کنید." };
   }
   clearTimeout(timer);
   if (!res.ok) {
     let msg = `کد HTTP ${res.status}`;
     try {
       const j = (await res.json()) as { message?: string };
-      if (j.message) msg = j.message;
+      if (j.message && typeof j.message === "string" && j.message.length <= 200) {
+        // Bound + reflect only the store's own short message (the store
+        // is the user's own registered host — not an internal target,
+        // which the URL guard already rejected).
+        msg = j.message;
+      }
     } catch {
       // ignore
     }

@@ -92,7 +92,7 @@ export async function notify(input: NotifyInput): Promise<NotifyResult> {
       const r = await sendEmail({
         to: input.email.to,
         subjectFa: input.email.subjectFa ?? input.titleFa,
-        htmlFa: input.email.htmlFa ?? `<div dir="rtl" style="font-family:Vazirmatn,sans-serif;line-height:1.7"><h3>${escapeHtml(input.titleFa)}</h3><p>${escapeHtml(input.bodyFa)}</p><p style="color:#888">${formatJalaliDateTime(notif.createdAt, { withTime: true })}</p>${input.link ? `<p><a href="${input.link}">${escapeHtml(input.link)}</a></p>` : ""}</div>`,
+        htmlFa: input.email.htmlFa ?? `<div dir="rtl" style="font-family:Vazirmatn,sans-serif;line-height:1.7"><h3>${escapeHtml(input.titleFa)}</h3><p>${escapeHtml(input.bodyFa)}</p><p style="color:#888">${formatJalaliDateTime(notif.createdAt, { withTime: true })}</p>${input.link ? `<p><a href="${escapeHtml(input.link)}">${escapeHtml(input.link)}</a></p>` : ""}</div>`,
       });
       emailSent = r.ok;
     } catch {

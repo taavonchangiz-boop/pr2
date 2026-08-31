@@ -206,16 +206,38 @@ export async function GET() {
   }
   void user;
   const rows = await db.systemSetting.findMany();
+  // ROOT-CAUSE FIX (audit §28/§34 — secret disclosure): the previous GET
+  // returned the RAW value of every key, including SMS/SMTP/bank/BI
+  // credentials, so any read of this endpoint (or DB dump/backup) exposed
+  // all provider secrets in plaintext. Sensitive values are now MASKED in
+  // responses; setting a value still works (write-only semantics) and the
+  // UI already renders masked previews.
+  const sensitiveByKey = new Map<string, boolean>(GROUPS.flatMap((g) => g.keys.map((k) => [k.key, k.sensitive === true] as [string, boolean])));
   return NextResponse.json({
-    items: rows.map((r) => ({
-      key: r.key,
-      value: r.value,
-      updatedAt: r.updatedAt.toISOString(),
-      updatedAtFa: formatJalaliDateTime(r.updatedAt, { withTime: true }),
-    })),
+    items: rows.map((r) => {
+      const isSensitive = sensitiveByKey.get(r.key) ?? false;
+      const value = isSensitive ? maskSecretValue(r.value) : r.value;
+      return {
+        key: r.key,
+        value,
+        masked: isSensitive,
+        updatedAt: r.updatedAt.toISOString(),
+        updatedAtFa: formatJalaliDateTime(r.updatedAt, { withTime: true }),
+      };
+    }),
     allowedKeys: ALLOWED_KEYS,
     groups: GROUPS,
   });
+}
+
+/** Mask a secret for display: show nothing but a fixed placeholder. */
+const MASK_PLACEHOLDER = "••••••••";
+function maskSecretValue(v: string): string {
+  if (!v) return "";
+  return MASK_PLACEHOLDER;
+}
+function isSensitiveKey(key: string): boolean {
+  return GROUPS.some((g) => g.keys.some((it) => it.key === key && it.sensitive === true));
 }
 
 export async function POST(req: Request) {
@@ -238,6 +260,11 @@ export async function POST(req: Request) {
   if (!ALLOWED_KEYS.includes(parsed.data.key)) {
     return NextResponse.json({ errorFa: "این کلید تنظیمات پشتیبانی نمی‌شود." }, { status: 400 });
   }
+  // Guard against writing the masked placeholder back over a real secret
+  // (the GET response masks sensitive values — see maskSecretValue).
+  if (isSensitiveKey(parsed.data.key) && parsed.data.value === MASK_PLACEHOLDER) {
+    return NextResponse.json({ ok: true, unchanged: true });
+  }
   const updated = await db.systemSetting.upsert({
     where: { key: parsed.data.key },
     create: { key: parsed.data.key, value: parsed.data.value },
@@ -257,7 +284,8 @@ export async function POST(req: Request) {
     ok: true,
     setting: {
       key: updated.key,
-      value: updated.value,
+      value: isSensitiveKey(updated.key) ? MASK_PLACEHOLDER : updated.value,
+      masked: isSensitiveKey(updated.key),
       updatedAt: updated.updatedAt.toISOString(),
     },
   });
@@ -286,9 +314,14 @@ export async function PATCH(req: Request) {
   if (bad) {
     return NextResponse.json({ errorFa: `کلید «${bad.key}» پشتیبانی نمی‌شود.` }, { status: 400 });
   }
+  // Drop masked-placeholder writes for sensitive keys (see GET masking).
+  const writable = items.filter((it) => !(isSensitiveKey(it.key) && it.value === MASK_PLACEHOLDER));
+  if (writable.length === 0) {
+    return NextResponse.json({ ok: true, count: 0, unchanged: true });
+  }
   // Upsert each row sequentially (Prisma doesn't have batch upsert for a
   // heterogeneous key set; rows are few — ≤64 — so this is fine).
-  for (const it of items) {
+  for (const it of writable) {
     await db.systemSetting.upsert({
       where: { key: it.key },
       create: { key: it.key, value: it.value },

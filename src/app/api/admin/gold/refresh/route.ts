@@ -11,6 +11,7 @@ import { NextResponse } from "next/server";
 import { requireRole, clientIp, audit, AuthError } from "@/lib/server/auth";
 import { db } from "@/lib/db";
 import { decryptString } from "@/lib/security/crypto";
+import { assertSafeOutboundUrl, outboundUrlErrorFa } from "@/lib/security/net-guard";
 import { formatJalaliDateTime, formatRials, toPersianDigits } from "@/lib/persian";
 
 // Built-in instrument list (mirrors lib/providers/gold/index.ts).
@@ -82,6 +83,15 @@ export async function POST(req: Request) {
     );
   }
 
+  // ROOT-CAUSE FIX (audit §27 — SSRF): the endpoint is admin-configurable,
+  // but any config error (or compromised admin session) must not turn the
+  // server into an internal-network probe. Enforce https + public hosts.
+  try {
+    await assertSafeOutboundUrl(endpoint, { allowedPorts: [443] });
+  } catch (e) {
+    return NextResponse.json({ errorFa: outboundUrlErrorFa(e) }, { status: 400 });
+  }
+
   // Fetch.
   let resp: Response;
   try {
@@ -89,7 +99,7 @@ export async function POST(req: Request) {
     const timer = setTimeout(() => controller.abort(), 10_000);
     const headers: Record<string, string> = { Accept: "application/json" };
     if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
-    resp = await fetch(endpoint, { method: "GET", headers, signal: controller.signal });
+    resp = await fetch(endpoint, { method: "GET", headers, signal: controller.signal, redirect: "error" });
     clearTimeout(timer);
   } catch {
     await audit({

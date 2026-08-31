@@ -118,6 +118,17 @@ async function evalOneBot(bot: {
   }
 
   // Threshold crossed in configured direction — FIRE!
+  // ROOT-CAUSE FIX (audit G2 — fire race): claim the fire FIRST via a
+  // conditional UPDATE (CAS on the previously-read lastFiredAt). Two
+  // concurrent scheduler runs can no longer both pass the interval/day
+  // checks and double-fire; the loser of the CAS reports not-fired.
+  const claimed = await db.goldBot.updateMany({
+    where: { id: bot.id, lastFiredAt: bot.lastFiredAt },
+    data: { lastFiredAt: now },
+  });
+  if (claimed.count === 0) {
+    return { botId: bot.id, fired: false, reason: "به‌تازگی توسط پردازش دیگر فعال شده است." };
+  }
   const directionFa = deltaPct > 0 ? "صعودی" : "نزولی";
   const titleFa = `هشدار قیمت ${instrumentFa(instrument)}`;
   const bodyFa =
@@ -152,12 +163,6 @@ async function evalOneBot(bot: {
       // best-effort — notification row is already written
     }
   }
-
-  // Update lastFiredAt — idempotent for today.
-  await db.goldBot.update({
-    where: { id: bot.id },
-    data: { lastFiredAt: now },
-  });
 
   return { botId: bot.id, fired: true };
 }
