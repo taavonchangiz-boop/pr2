@@ -205,6 +205,31 @@ jobs:
             kill $(cat /tmp/server.pid) 2>/dev/null || true
           fi
 
+  unit-tests:
+    name: Test suite (bun test)
+    needs: install
+    runs-on: ubuntu-latest
+    container:
+      image: oven/bun:latest
+    env:
+      NODE_ENV: test
+      POSTYAR_MASTER_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      POSTYAR_JWT_SECRET: jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+      DATABASE_URL: file:/tmp/postyar-unit.db
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download node_modules
+        uses: actions/download-artifact@v4
+        with:
+          name: node-modules
+          path: node_modules
+      - name: Push schema to unit-test DB
+        run: bunx prisma db push --skip-generate
+      - name: Generate Prisma Client
+        run: bunx prisma generate
+      - name: Run bun test suite
+        run: bun test tests/*.test.ts
+
   security-scan:
     name: Security grep scan
     needs: install

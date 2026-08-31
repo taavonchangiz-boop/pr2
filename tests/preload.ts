@@ -32,5 +32,13 @@ delete process.env.REDIS_URL;
 //     Prisma's engine may open multiple connections; SQLite's
 //     file-level lock then deadlocks when parallel transactions
 //     compete for the write lock across connections.
-process.env.TEST_DATABASE_URL = "file:/home/z/my-project/db/test.db?socket_timeout=30000&busy_timeout=30000&connection_limit=1";
-(process.env as Record<string, string | undefined>).DATABASE_URL = "file:/home/z/my-project/db/test.db?socket_timeout=30000&busy_timeout=30000&connection_limit=1";
+import path from "node:path";
+// PORTABILITY FIX (audit — CI): the previous hardcoded absolute path
+// (file:/home/z/my-project/db/test.db) only existed on the original dev
+// sandbox; every other machine (including CI) got a broken test DB. The
+// test DB now resolves NEXT TO THE REPO (db/test.db), independent of the
+// checkout location.
+const TEST_DB_PATH = path.join(process.cwd(), "db", "test.db");
+const TEST_DB_URL = `file:${TEST_DB_PATH}?socket_timeout=30000&busy_timeout=30000&connection_limit=1`;
+process.env.TEST_DATABASE_URL = TEST_DB_URL;
+(process.env as Record<string, string | undefined>).DATABASE_URL = TEST_DB_URL;
