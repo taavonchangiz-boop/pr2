@@ -28,6 +28,7 @@ import { acquireLock, releaseLock } from "@/lib/security/cache";
 import { getDestinationProvider, isValidProviderName } from "@/lib/providers/index";
 import { getDestinationToken } from "@/lib/destinations/helpers";
 import { safeJsonParse } from "@/lib/server/auth";
+import { signMediaUrlToken } from "@/lib/security/crypto";
 import { assertTransition, isContentStatus } from "@/lib/publishing/state";
 import type { GlassButton } from "@/lib/types/glass-button";
 
@@ -42,10 +43,68 @@ export interface WorkerSummary {
 const DEFAULT_BATCH = 5;
 const BASE_BACKOFF_SEC = 30;
 const MAX_BACKOFF_SEC = 30 * 60;
+// A job left in `processing` longer than this is considered orphaned
+// (its worker crashed or the process died mid-publish). The lease is
+// deliberately much longer than the publish timeout so a LIVE publish
+// can never be re-claimed (§22/§24).
+const STALE_LEASE_MS = 10 * 60 * 1000;
 
 function computeBackoffSec(attempts: number): number {
   const s = Math.pow(2, attempts) * BASE_BACKOFF_SEC;
   return Math.min(s, MAX_BACKOFF_SEC);
+}
+
+/**
+ * ROOT-CAUSE FIX (audit §24 — crash recovery): jobs stuck in
+ * `processing` were never retried — a worker crash (or OOM kill) between
+ * the provider call and the status update left the job (and its Content)
+ * permanently frozen, because the candidate query only selects `queued`.
+ * This reaper re-queues orphaned jobs whose lease expired, honoring
+ * maxAttempts with the standard exponential backoff. At-least-once
+ * semantics: if the orphaned worker actually delivered before dying,
+ * the retry may double-send — that is inherent to provider APIs without
+ * idempotent send; the lease is kept long (10 min) to make the window
+ * rare, and attempts/maxAttempts still bound total sends.
+ */
+async function reclaimStaleProcessingJobs(): Promise<number> {
+  const staleBefore = new Date(Date.now() - STALE_LEASE_MS);
+  const stale = await db.publishJob.findMany({
+    where: { status: "processing", lockedAt: { lt: staleBefore } },
+    select: { id: true, attempts: true, maxAttempts: true },
+    take: 20,
+  });
+  let reclaimed = 0;
+  for (const job of stale) {
+    const attempts = job.attempts + 1;
+    if (attempts >= job.maxAttempts) {
+      const res = await db.publishJob.updateMany({
+        where: { id: job.id, status: "processing", lockedAt: { lt: staleBefore } },
+        data: {
+          status: "failed",
+          attempts,
+          failureReason: "مهلت پردازش منقضی شد (worker از دست رفت).",
+          lockedBy: null,
+          lockedAt: null,
+        },
+      });
+      reclaimed += res.count;
+    } else {
+      const backoffSec = computeBackoffSec(attempts);
+      const res = await db.publishJob.updateMany({
+        where: { id: job.id, status: "processing", lockedAt: { lt: staleBefore } },
+        data: {
+          status: "queued",
+          attempts,
+          runAt: new Date(Date.now() + backoffSec * 1000),
+          lockedBy: null,
+          lockedAt: null,
+          failureReason: "پردازش ناتمام ماند و برای تلاش مجدد بازگردانده شد.",
+        },
+      });
+      reclaimed += res.count;
+    }
+  }
+  return reclaimed;
 }
 
 function sanitizeResultPayload(raw: unknown): string {
@@ -62,6 +121,9 @@ function sanitizeResultPayload(raw: unknown): string {
 export async function runWorkerOnce(batchSize: number = DEFAULT_BATCH): Promise<WorkerSummary> {
   const summary: WorkerSummary = { processed: 0, delivered: 0, failed: 0, retried: 0, errors: [] };
   const now = new Date();
+
+  // Crash recovery first (audit §24): re-queue orphaned processing jobs.
+  await reclaimStaleProcessingJobs();
 
   // Claim queued jobs whose runAt is in the past.
   // We select candidates first, then attempt lock acquisition individually.
@@ -169,18 +231,22 @@ async function processJob(
   if (Array.isArray(mediaIds) && mediaIds.length > 0) {
     const m = await db.media.findUnique({ where: { id: mediaIds[0] } });
     if (m && m.ownerId === content.ownerId) {
-      // Build a relative URL — provider fetches via the gateway. The
-      // Caddy gateway requires no port in the path; the worker sets
-      // `XTransformPort` automatically for cross-port requests. We do
+      // Build a relative URL — provider fetches via the gateway. We do
       // not need to expose the storage URL to the provider — we expose
       // the public Next.js handler, which the provider can reach by
       // absolute URL via the gateway.
+      // ROOT-CAUSE FIX (audit §21 — provider media access): the media
+      // route is session-gated (and MUST stay that way — audit rule 45
+      // forbids dropping auth or making storage public). External
+      // providers cannot hold a session, so we append a SHORT-LIVED
+      // HMAC token scoped to exactly this media id (10-minute TTL).
       // NOTE: Telegram and Bale fetch by URL; if our app is behind a
       // domain, set POSTYAR_PUBLIC_BASE_URL. Otherwise we fall back to
       // sending text-only with the caption referring to the media.
       const publicBase = process.env.POSTYAR_PUBLIC_BASE_URL;
       if (publicBase) {
-        mediaUrl = `${publicBase.replace(/\/$/, "")}/api/media/${m.id}`;
+        const { exp, sig } = signMediaUrlToken(m.id, 10 * 60);
+        mediaUrl = `${publicBase.replace(/\/$/, "")}/api/media/${m.id}?exp=${exp}&sig=${sig}`;
       } else {
         // No public base — send text-only and treat as soft failure if
         // the destination's provider requires a public URL.

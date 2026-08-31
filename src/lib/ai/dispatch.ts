@@ -20,7 +20,7 @@ import {
   type AiChatResponse,
   redactAiPayload,
 } from "@/lib/providers/ai";
-import { requireQuota, incrementQuotaUsage } from "@/lib/payments/plans";
+import { consumeQuota } from "@/lib/payments/plans";
 import { toPersianDigits } from "@/lib/persian";
 
 // ---------------------------------------------------------------------
@@ -74,8 +74,16 @@ export async function dispatchAi(input: DispatchAiInput): Promise<DispatchAiResu
     throw new AuthError("درخواست‌های هوش مصنوعی بیش از حد مجاز در دقیقه است. اندکی بعد تلاش کنید.", 429);
   }
 
-  // 2) Plan quota check (requireQuota throws AuthError with 403 on exceed)
-  await requireQuota({ userId: input.userId, dimension: "aiPerMonth", amount: 1 });
+  // 2) Plan quota RESERVATION (audit §18 — atomic check+reserve). The old
+  //    requireQuota-here / incrementQuotaUsage-later pair was a TOCTOU
+  //    window: N parallel requests all passed the check then overwrote
+  //    each other's JSON counters. consumeQuota CAS-loops the check+reserve
+  //    atomically; a failed provider call keeps the reservation (fail-closed
+  //    semantics, documented) — it can never allow quota overrun.
+  const reserved = await consumeQuota({ userId: input.userId, dimension: "aiPerMonth", amount: 1 });
+  if (!reserved) {
+    throw new AuthError("سهمیه هوش مصنوعی ماهانه کافی نیست.", 403);
+  }
 
   // 3) Idempotency at the dispatch layer — if we've seen this key,
   //    return the cached result.
@@ -109,18 +117,39 @@ export async function dispatchAi(input: DispatchAiInput): Promise<DispatchAiResu
       return persistFailed(input, providerId, "پرامپت خالی است.");
     }
 
-    // 7) Persist queued AiJob
-    const aiJob = await db.aiJob.create({
-      data: {
-        userId: input.userId,
-        provider: providerId,
-        model: model ?? "",
-        task: input.task,
-        prompt: cleanPrompt,
-        status: "queued",
-        idempotencyKey: input.idempotencyKey,
-      },
-    });
+    // 7) Persist queued AiJob. A concurrent duplicate (same idempotencyKey)
+    //    throws P2002 on the UNIQUE key — degrade to the duplicate path
+    //    instead of a raw 500 (audit §13).
+    let aiJob;
+    try {
+      aiJob = await db.aiJob.create({
+        data: {
+          userId: input.userId,
+          provider: providerId,
+          model: model ?? "",
+          task: input.task,
+          prompt: cleanPrompt,
+          status: "queued",
+          idempotencyKey: input.idempotencyKey,
+        },
+      });
+    } catch (err) {
+      const msg = (err as { code?: string; message?: string })?.message ?? "";
+      if (/unique|UNIQUE|constraint/i.test(msg)) {
+        const existing = await db.aiJob.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+        return {
+          ok: existing?.status === "completed",
+          aiJobId: existing?.id ?? "",
+          content: existing?.output ?? "",
+          provider: providerId,
+          model: model ?? "",
+          tokensIn: existing?.tokensIn ?? 0,
+          tokensOut: existing?.tokensOut ?? 0,
+          errorFa: existing ? undefined : "درخواست تکراری است.",
+        };
+      }
+      throw err;
+    }
 
     // 8) Mark processing
     await db.aiJob.update({
@@ -164,7 +193,10 @@ export async function dispatchAi(input: DispatchAiInput): Promise<DispatchAiResu
         model: model ?? "",
         tokensIn: 0,
         tokensOut: 0,
-        errorFa: errMsg,
+        // Generic client-facing message — the raw provider exception text
+        // may reveal upstream endpoints/config (audit §34). Full detail
+        // stays in the AiJob row + audit meta (server-side).
+        errorFa: "فراخوانی هوش مصنوعی ناموفق بود. لطفاً دوباره تلاش کنید.",
       };
     }
 
@@ -179,12 +211,8 @@ export async function dispatchAi(input: DispatchAiInput): Promise<DispatchAiResu
       },
     });
 
-    // 12) Increment plan quota usage
-    try {
-      await incrementQuotaUsage({ userId: input.userId, dimension: "aiPerMonth", amount: 1 });
-    } catch {
-      // Best-effort; don't fail the AI call if the quota counter couldn't update.
-    }
+    // 12) Quota was ALREADY reserved atomically at dispatch entry
+    //     (consumeQuota, step 2) — no further increment here (double-count).
 
     // 13) Audit (no provider keys ever logged — only metadata)
     await audit({
