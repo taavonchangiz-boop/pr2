@@ -361,15 +361,24 @@ export async function processBaleUpdate(bot: Bot, update: BaleUpdate): Promise<{
     if (!ref) {
       return { handled: false, reason: "order_not_found" };
     }
-    // IDEMPOTENCY EARLY-RETURN: if chargeId is already set, this is a
-    // legitimate Bale webhook retry for an already-finalized payment.
-    // Return handled immediately — do NOT re-verify the secret (the
-    // rawPayload was overwritten with sanitized audit JSON after the
-    // first finalization, so decryptString would fail and produce a
-    // false "secret_mismatch_on_success" on retry). The financial
-    // integrity is already guaranteed by the first call's atomic
-    // updateMany({where:{chargeId:null}}) CAS — no double credit.
+    // IDEMPOTENCY EARLY-PATH: if chargeId is already set, this is a
+    // legitimate Bale webhook retry for a claimed payment. The rawPayload
+    // was overwritten with sanitized audit JSON after the first
+    // finalization, so re-verifying the secret would produce a false
+    // mismatch. Still re-run activateSubscription (idempotent, heals a
+    // crash between claim and fulfillment), then ack.
     if (ref.chargeId) {
+      const stillPayable = await db.order.findUnique({
+        where: { id: orderId },
+        select: { status: true, amountRials: true, kind: true, userId: true },
+      });
+      if (stillPayable && stillPayable.status !== "paid" && stillPayable.status !== "rejected" && stillPayable.status !== "failed" && stillPayable.status !== "expired" && stillPayable.status !== "cancelled") {
+        await activateSubscription({
+          orderId,
+          paidRials: stillPayable.amountRials,
+          idempotencyKey: `bale:${String(ref.chargeId)}`,
+        });
+      }
       return { handled: true, reason: "already_paid_idempotent" };
     }
     // Verify secret (constant-time)
@@ -402,14 +411,28 @@ export async function processBaleUpdate(bot: Bot, update: BaleUpdate): Promise<{
       return { handled: false, reason: "currency_mismatch_on_success" };
     }
 
+    // ROOT-CAUSE FIX (audit §5/§8): this transaction only CLAIMS the
+    // payment (BalePaymentRef.chargeId CAS). It no longer marks the
+    // order paid and no longer credits the wallet here — that split
+    // brain (bale inline credit + activateSubscription effects gated on
+    // an order that was already "paid") left subscription orders
+    // credited but never activated, and a crash between the two steps
+    // permanently lost the activation. activateSubscription is now the
+    // SINGLE owner of order→paid + ledger + wallet credit + subscription
+    // + referral, atomically, keyed by orderId-derived idempotency keys.
     const chargeId = sp.telegram_payment_charge_id ?? `bale-${update.update_id}`;
     const idemKey = `bale:${chargeId}`;
-    const walletIdemKey = `wallet:payment:bale:${chargeId}`;
-    const ledgerIdemKey = `ledger:payment:bale:${chargeId}`;
 
-    // Atomic finalize: insert charge id with UNIQUE; if exists, idempotent
+    let firstFinalize = false;
     try {
-      await db.$transaction(async (tx) => {
+      const claimed = await db.$transaction(async (tx) => {
+        // Record the provider charge reference on the order (traceability
+        // metadata only — the STATUS transition is owned exclusively by
+        // activateSubscription's CAS below).
+        await tx.order.update({
+          where: { id: order.id },
+          data: { providerRef: chargeId },
+        });
         // Set BalePaymentRef.chargeId, paidAt, rawPayload (sanitized),
         // and dedup updateId.
         const updated = await tx.balePaymentRef.updateMany({
@@ -429,88 +452,49 @@ export async function processBaleUpdate(bot: Bot, update: BaleUpdate): Promise<{
             })),
           },
         });
-        if (updated.count === 0) {
-          // Either already paid (idempotent re-entry) OR chargeId already
-          // set on a parallel webhook — both safe.
-          return;
-        }
-        // Order status → paid
-        await tx.order.update({
-          where: { id: order.id },
-          data: { status: "paid", providerRef: chargeId },
-        });
-        // Ledger + WalletTxn — use upserts keyed by deterministic idem keys
-        await tx.ledgerEntry.upsert({
-          where: { idempotencyKey: ledgerIdemKey },
-          create: {
-            userId: order.userId,
-            orderId: order.id,
-            eventType: "payment",
-            amountRials: order.amountRials,
-            currency: "IRR",
-            idempotencyKey: ledgerIdemKey,
-          },
-          update: {},
-        });
-        // Compute balanceAfter
-        const prev = await tx.walletTxn.findMany({
-          where: { userId: order.userId },
-          select: { amountRials: true, direction: true },
-        });
-        let running = 0;
-        for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
-        const balanceAfter = running + order.amountRials;
-        await tx.walletTxn.upsert({
-          where: { idempotencyKey: walletIdemKey },
-          create: {
-            userId: order.userId,
-            orderId: order.id,
-            amountRials: order.amountRials,
-            direction: "credit",
-            reason: "payment",
-            balanceAfter,
-            idempotencyKey: walletIdemKey,
-          },
-          update: {},
-        });
+        return updated.count === 1;
       });
+      firstFinalize = claimed;
     } catch (err) {
       // If chargeId was already set (UNIQUE constraint), this is idempotent re-entry
       const msg = (err as { code?: string; message?: string })?.message ?? "";
       if (!/unique|UNIQUE|constraint/i.test(msg)) throw err;
     }
 
-    // activateSubscription handles referral reward + plan activation atomically
-    // (also idempotent on the same idempotencyKey)
+    // Fulfillment — ALWAYS attempted (idempotent): covers first finalize,
+    // parallel webhooks, and re-entry after a crash between the claim
+    // above and fulfillment. Never double-credits (orderId-keyed upserts).
     await activateSubscription({
       orderId: order.id,
       paidRials: order.amountRials,
       idempotencyKey: idemKey,
     });
 
-    // Notify user
-    await db.notification.create({
-      data: {
+    // Notify + audit only on the first finalize (no duplicate spam).
+    if (firstFinalize) {
+      await db.notification.create({
+        data: {
+          userId: order.userId,
+          category: "payment",
+          titleFa: "پرداخت موفق",
+          bodyFa: `پرداخت ${formatRials(order.amountRials)} از طریق کیف پول بله با کد پیگیری ${toPersianDigits(chargeId.slice(-12))} تأیید شد.`,
+          link: "/dashboard/wallet",
+        },
+      });
+      await audit({
         userId: order.userId,
-        category: "payment",
-        titleFa: "پرداخت موفق",
-        bodyFa: `پرداخت ${formatRials(order.amountRials)} از طریق کیف پول بله با کد پیگیری ${toPersianDigits(chargeId.slice(-12))} تأیید شد.`,
-        link: "/dashboard/wallet",
-      },
-    });
-    await audit({
-      userId: order.userId,
-      actor: "provider",
-      action: "bale_payment_paid",
-      targetType: "order",
-      targetId: order.id,
-      meta: {
-        chargeId,
-        providerChargeId: sp.provider_payment_charge_id,
-        amountRials: order.amountRials,
-        updateId: updateIdStr,
-      },
-    });
+        actor: "provider",
+        action: "bale_payment_paid",
+        targetType: "order",
+        targetId: order.id,
+        meta: {
+          chargeId,
+          providerChargeId: sp.provider_payment_charge_id,
+          amountRials: order.amountRials,
+          updateId: updateIdStr,
+        },
+      });
+    }
     return { handled: true, reason: "successful_payment_processed" };
   }
 

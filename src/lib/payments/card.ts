@@ -160,46 +160,55 @@ export async function adminApproveCardOrder(input: {
       adminNotes: input.notes ?? null,
     },
   });
-  if (receiptUpdate.count === 0) {
-    // Already approved — idempotent re-entry
+  const firstApprove = receiptUpdate.count === 1;
+  if (!firstApprove && order.status === "paid") {
+    // Fully finalized previously — pure idempotent re-entry.
     return { ok: true, paidRials: order.amountRials };
   }
-  // Activate subscription via the helper which handles all wallet/ledger/referral
+  // ROOT-CAUSE FIX (audit §12): activateSubscription is the single owner
+  // of order→paid + ledger + wallet credit + subscription + referral and
+  // is internally idempotent, so it runs on first approve AND whenever a
+  // previous approve crashed between the receipt CAS above and
+  // fulfillment (receipt approved, order not yet paid). It also rejects
+  // non-payable orders (expired/failed/cancelled) instead of faking
+  // success.
   const result = await activateSubscription({
     orderId: order.id,
     paidRials: order.amountRials,
     idempotencyKey: idemKey,
   });
 
-  // Notify user
-  await db.notification.create({
-    data: {
-      userId: order.userId,
-      category: "payment",
-      titleFa: "تأیید رسید پرداخت",
-      bodyFa:
-        `پرداخت سفارش شما به مبلغ ${formatRials(order.amountRials)} تأیید شد.` +
-        (order.kind === "subscription" && result.subscriptionId
-          ? " اشتراک شما فعال شد."
-          : ""),
-      link: "/dashboard/orders",
-    },
-  });
+  // Notify + audit only on the first approve (no duplicate spam).
+  if (firstApprove) {
+    await db.notification.create({
+      data: {
+        userId: order.userId,
+        category: "payment",
+        titleFa: "تأیید رسید پرداخت",
+        bodyFa:
+          `پرداخت سفارش شما به مبلغ ${formatRials(order.amountRials)} تأیید شد.` +
+          (order.kind === "subscription" && result.subscriptionId
+            ? " اشتراک شما فعال شد."
+            : ""),
+        link: "/dashboard/orders",
+      },
+    });
 
-  await audit({
-    userId: order.userId,
-    actor: "admin",
-    action: "order_approve",
-    targetType: "order",
-    targetId: order.id,
-    ip: input.ip,
-    meta: {
-      adminId: input.adminId,
-      amountRials: order.amountRials,
-      receiptId: order.cardReceipt.id,
-      subscriptionId: result.subscriptionId,
-    },
-  });
+    await audit({
+      userId: order.userId,
+      actor: "admin",
+      action: "order_approve",
+      targetType: "order",
+      targetId: order.id,
+      ip: input.ip,
+      meta: {
+        adminId: input.adminId,
+        amountRials: order.amountRials,
+        receiptId: order.cardReceipt.id,
+        subscriptionId: result.subscriptionId,
+      },
+    });
+  }
   return {
     ok: true,
     paidRials: order.amountRials,
@@ -235,10 +244,17 @@ export async function adminRejectCardOrder(input: {
       },
     });
   }
-  await db.order.update({
-    where: { id: order.id },
+  // ROOT-CAUSE FIX (audit TOCTOU): the paid-check above is a plain read;
+  // an approve completing between that read and the write below used to
+  // flip a fully-fulfilled order to rejected. The conditional updateMany
+  // re-checks atomically and refuses to touch paid orders.
+  const rejected = await db.order.updateMany({
+    where: { id: order.id, status: { not: "paid" } },
     data: { status: "rejected" },
   });
+  if (rejected.count === 0) {
+    throw new AuthError("سفارش قبلاً پرداخت شده و قابل رد نیست.", 400);
+  }
   await db.notification.create({
     data: {
       userId: order.userId,

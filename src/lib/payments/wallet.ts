@@ -143,71 +143,77 @@ export async function adminAdjustWallet(input: {
   const direction = input.amount > 0 ? "credit" : "debit";
   const amountAbs = Math.abs(input.amount);
 
+  // ROOT-CAUSE FIX (audit §30/§13): the idempotency key is scoped by
+  // adminId + userId + direction + amount, so a client-supplied key can
+  // never collide with an UNRELATED prior adjustment and silently drop
+  // the new mutation (the previous raw key caused exactly that). Retrying
+  // the SAME adjustment (same inputs) still hits the same key → no-op.
+  const scopedKey = `${input.adminId}:${input.userId}:${direction}:${amountAbs}:${input.idempotencyKey}`;
+  const ledgerIdemKey = `ledger:admin_adjust:${scopedKey}`;
+  const walletIdemKey = `wallet:admin_adjust:${scopedKey}`;
+
   const result = await db.$transaction(async (tx) => {
-    const ledgerIdemKey = `ledger:admin_adjust:${input.idempotencyKey}`;
-    const walletIdemKey = `wallet:admin_adjust:${input.idempotencyKey}`;
-
-    // Compute current balance
-    const prev = await tx.walletTxn.findMany({
-      where: { userId: input.userId },
-      select: { amountRials: true, direction: true },
-    });
-    let running = 0;
-    for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
-    const balanceAfter = running + (direction === "credit" ? amountAbs : -amountAbs);
-
-    const walletTxn = await tx.walletTxn.upsert({
+    // Idempotency check first: an existing row for this exact key means
+    // this adjustment was already applied — do NOT create anything and
+    // do NOT re-send the notification.
+    const existing = await tx.walletTxn.findUnique({
       where: { idempotencyKey: walletIdemKey },
-      create: {
-        userId: input.userId,
-        amountRials: amountAbs,
-        direction,
-        reason: "admin_adjust",
-        balanceAfter,
-        idempotencyKey: walletIdemKey,
-      },
-      update: {},
+      select: { id: true },
     });
-    await tx.ledgerEntry.upsert({
-      where: { idempotencyKey: ledgerIdemKey },
-      create: {
-        userId: input.userId,
-        eventType: "admin_adjust",
-        amountRials: direction === "credit" ? amountAbs : -amountAbs,
-        currency: "IRR",
-        idempotencyKey: ledgerIdemKey,
-      },
-      update: {},
-    });
+    if (!existing) {
+      const prev = await tx.walletTxn.findMany({
+        where: { userId: input.userId },
+        select: { amountRials: true, direction: true },
+      });
+      let running = 0;
+      for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
+      const balanceAfter = running + (direction === "credit" ? amountAbs : -amountAbs);
 
-    // Notify user
-    await tx.notification.create({
-      data: {
-        userId: input.userId,
-        category: "payment",
-        titleFa: direction === "credit" ? "افزایش اعتبار کیف پول" : "کاهش اعتبار کیف پول",
-        bodyFa:
-          (direction === "credit" ? "مبلغ " : "کسر مبلغ ") +
-          formatRials(amountAbs) +
-          (input.reason ? ` — دلیل: ${input.reason}` : ""),
-        link: "/dashboard/wallet",
-      },
-    });
+      await tx.walletTxn.create({
+        data: {
+          userId: input.userId,
+          amountRials: amountAbs,
+          direction,
+          reason: "admin_adjust",
+          balanceAfter,
+          idempotencyKey: walletIdemKey,
+        },
+      });
+      await tx.ledgerEntry.create({
+        data: {
+          userId: input.userId,
+          eventType: "admin_adjust",
+          amountRials: direction === "credit" ? amountAbs : -amountAbs,
+          currency: "IRR",
+          idempotencyKey: ledgerIdemKey,
+        },
+      });
 
-    // Idempotent re-entry guard: if the upsert above was a no-op (the
-    // idempotencyKey already existed), `balanceAfter` above reflects the
-    // HYPOTHETICAL balance as if the txn were applied again — which is
-    // wrong. Recompute the ACTUAL balance from the WalletTxn sum so
-    // callers always see the true balance (addendum §8 — derived
-    // balance, no false duplicates).
+      // Notify user (only when a real mutation happened — no duplicate
+      // notification spam on idempotent re-entry).
+      await tx.notification.create({
+        data: {
+          userId: input.userId,
+          category: "payment",
+          titleFa: direction === "credit" ? "افزایش اعتبار کیف پول" : "کاهش اعتبار کیف پول",
+          bodyFa:
+            (direction === "credit" ? "مبلغ " : "کسر مبلغ ") +
+            formatRials(amountAbs) +
+            (input.reason ? ` — دلیل: ${input.reason}` : ""),
+          link: "/dashboard/wallet",
+        },
+      });
+    }
+
+    // Always report the TRUE derived balance (addendum §8): recomputed
+    // from the WalletTxn sum inside the same transaction.
     const postTxns = await tx.walletTxn.findMany({
       where: { userId: input.userId },
       select: { amountRials: true, direction: true },
     });
     let actualBalance = 0;
     for (const t of postTxns) actualBalance += t.direction === "credit" ? t.amountRials : -t.amountRials;
-
-    return { walletTxn, balanceAfter: actualBalance };
+    return { balanceAfter: actualBalance };
   });
 
   await audit({
@@ -243,27 +249,32 @@ export async function refund(input: {
   if (input.amount > order.amountRials) {
     throw new Error("مبلغ بازگشتی بیشتر از مبلغ سفارش است.");
   }
-  // Balance guard: never let the wallet go negative on a refund. The
-  // balance is derived from the WalletTxn sum; refunding more than the
-  // user currently holds would push the running balance below zero,
-  // which is a financial anomaly (addendum §8 — exact monetary
-  // integrity). Compute the pre-refund balance and reject if
-  // insufficient. The check happens BEFORE the $transaction so a
-  // rejected refund leaves no row behind.
-  const pre = await db.walletTxn.findMany({
-    where: { userId: order.userId },
-    select: { amountRials: true, direction: true },
-  });
-  let currentBalance = 0;
-  for (const t of pre) currentBalance += t.direction === "credit" ? t.amountRials : -t.amountRials;
-  if (currentBalance < input.amount) {
-    throw new Error("موجودی کیف پول برای بازگشت این مبلغ کافی نیست.");
-  }
+
+  const walletIdemKey = `wallet:refund:${input.idempotencyKey}`;
+  const ledgerIdemKey = `ledger:refund:${input.idempotencyKey}`;
 
   const result = await db.$transaction(async (tx) => {
-    const ledgerIdemKey = `ledger:refund:${input.idempotencyKey}`;
-    const walletIdemKey = `wallet:refund:${input.idempotencyKey}`;
+    // Idempotent re-entry: an existing row for this exact key means this
+    // refund was already applied — report the true balance, change nothing.
+    const existing = await tx.walletTxn.findUnique({
+      where: { idempotencyKey: walletIdemKey },
+      select: { id: true },
+    });
+    if (existing) {
+      const txns = await tx.walletTxn.findMany({
+        where: { userId: order.userId },
+        select: { amountRials: true, direction: true },
+      });
+      let bal = 0;
+      for (const t of txns) bal += t.direction === "credit" ? t.amountRials : -t.amountRials;
+      return { balanceAfter: bal, duplicate: true as const };
+    }
 
+    // Create the debit FIRST: the INSERT takes the database write lock,
+    // which serializes this refund against any concurrent refund/credit
+    // for the remainder of the transaction (audit §14/§36 — the old
+    // code ran its balance guard as a check-then-act OUTSIDE the
+    // transaction, so two concurrent refunds could both pass).
     const prev = await tx.walletTxn.findMany({
       where: { userId: order.userId },
       select: { amountRials: true, direction: true },
@@ -272,9 +283,8 @@ export async function refund(input: {
     for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
     const balanceAfter = running - input.amount;
 
-    await tx.walletTxn.upsert({
-      where: { idempotencyKey: walletIdemKey },
-      create: {
+    await tx.walletTxn.create({
+      data: {
         userId: order.userId,
         orderId: order.id,
         amountRials: input.amount,
@@ -283,11 +293,26 @@ export async function refund(input: {
         balanceAfter,
         idempotencyKey: walletIdemKey,
       },
-      update: {},
     });
-    await tx.ledgerEntry.upsert({
-      where: { idempotencyKey: ledgerIdemKey },
-      create: {
+
+    // Invariant (audit §14): ONE refund per order. With the write lock
+    // already held, this count is serialized — a second refund for the
+    // same order under a different key rolls back here.
+    const refundCount = await tx.walletTxn.count({
+      where: { orderId: order.id, reason: "refund" },
+    });
+    if (refundCount > 1) {
+      throw new Error("این سفارش قبلاً یک بازگشت وجه داشته است.");
+    }
+
+    // Balance guard INSIDE the transaction: derived balance must never
+    // go negative. Throwing rolls back the debit created above.
+    if (balanceAfter < 0) {
+      throw new Error("موجودی کیف پول برای بازگشت این مبلغ کافی نیست.");
+    }
+
+    await tx.ledgerEntry.create({
+      data: {
         userId: order.userId,
         orderId: order.id,
         eventType: "refund",
@@ -295,7 +320,6 @@ export async function refund(input: {
         currency: "IRR",
         idempotencyKey: ledgerIdemKey,
       },
-      update: {},
     });
     await tx.notification.create({
       data: {
@@ -306,27 +330,28 @@ export async function refund(input: {
         link: "/dashboard/wallet",
       },
     });
-    // Idempotent re-entry: if the upsert no-op'd (duplicate idem key),
-    // `balanceAfter` above is the hypothetical balance, not the real
-    // one. Recompute from the WalletTxn sum (addendum §8 — derived
-    // balance, no false duplicates).
+
+    // Recompute the ACTUAL derived balance so callers never see a
+    // hypothetical value (addendum §8).
     const postTxns = await tx.walletTxn.findMany({
       where: { userId: order.userId },
       select: { amountRials: true, direction: true },
     });
     let actualBalance = 0;
     for (const t of postTxns) actualBalance += t.direction === "credit" ? t.amountRials : -t.amountRials;
-    return { balanceAfter: actualBalance };
+    return { balanceAfter: actualBalance, duplicate: false as const };
   });
 
-  await audit({
-    userId: order.userId,
-    actor: "admin",
-    action: "wallet_refund",
-    targetType: "order",
-    targetId: order.id,
-    ip: input.ip,
-    meta: { adminId: input.adminId, amountRials: input.amount, balanceAfter: result.balanceAfter },
-  });
+  if (!result.duplicate) {
+    await audit({
+      userId: order.userId,
+      actor: "admin",
+      action: "wallet_refund",
+      targetType: "order",
+      targetId: order.id,
+      ip: input.ip,
+      meta: { adminId: input.adminId, amountRials: input.amount, balanceAfter: result.balanceAfter },
+    });
+  }
   return { balanceRials: result.balanceAfter };
 }

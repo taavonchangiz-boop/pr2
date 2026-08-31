@@ -245,20 +245,13 @@ export async function createAdDraft(input: {
   // POST a campaign with a placement that wasn't yet in AdPlacement.
   await ensureAdPlacementsSeeded();
   const placementKey = (input.placement ?? "user_dashboard_top").trim();
-  // Validate the placement FK exists; if the admin deleted the default,
-  // we still create it on demand so the user is never blocked.
-  let placement = await db.adPlacement.findUnique({ where: { key: placementKey } });
+  // ROOT-CAUSE FIX (audit — placement spam): the previous on-demand
+  // creation let any authenticated user mint UNLIMITED AdPlacement rows
+  // by inventing new keys. Placements are admin-managed: unknown keys are
+  // now rejected with 400 (defaults are always seeded).
+  const placement = await db.adPlacement.findUnique({ where: { key: placementKey } });
   if (!placement) {
-    placement = await db.adPlacement.create({
-      data: {
-        key: placementKey,
-        labelFa: placementKey,
-        descriptionFa: "جایگاه تبلیغاتی تعریف‌شده توسط کاربر.",
-        kind: "banner_inline",
-        active: true,
-        sortOrder: 1000,
-      },
-    });
+    throw new AuthError("جایگاه تبلیغاتی انتخاب‌شده معتبر نیست.", 400);
   }
   let imagePath: string | null = null;
   if (input.imageBuffer && input.imageBuffer.byteLength > 0) {
@@ -333,14 +326,24 @@ export async function adminApproveAd(input: {
 }): Promise<AdView> {
   const ad = await db.adCampaign.findUnique({ where: { id: input.id } });
   if (!ad) throw new AuthError("تبلیغ یافت نشد.", 404);
-  const updated = await db.adCampaign.update({
-    where: { id: input.id },
+  // ROOT-CAUSE FIX (audit AD2 — state machine): approval is a real state
+  // transition, gated atomically. Previously ANY state (running/completed/
+  // already-approved) could be flipped back to "approved" and every repeat
+  // call re-sent the owner notification.
+  const updated = await db.adCampaign.updateMany({
+    where: { id: input.id, status: { in: ["pending", "rejected"] } },
     data: {
       status: "approved",
       reviewedBy: input.adminId,
       reviewedAt: new Date(),
     },
   });
+  if (updated.count === 0) {
+    // Already approved or in a terminal/running state — idempotent no-op.
+    const fresh = await db.adCampaign.findUniqueOrThrow({ where: { id: input.id } });
+    return toAdView(fresh);
+  }
+  const approved = await db.adCampaign.findUniqueOrThrow({ where: { id: input.id } });
   await audit({
     userId: ad.ownerId,
     actor: "admin",
@@ -360,7 +363,7 @@ export async function adminApproveAd(input: {
       link: "/dashboard/advertising",
     },
   });
-  return toAdView(updated);
+  return toAdView(approved);
 }
 
 export async function adminRejectAd(input: {
@@ -371,8 +374,9 @@ export async function adminRejectAd(input: {
 }): Promise<AdView> {
   const ad = await db.adCampaign.findUnique({ where: { id: input.id } });
   if (!ad) throw new AuthError("تبلیغ یافت نشد.", 404);
-  const updated = await db.adCampaign.update({
-    where: { id: input.id },
+  // Same transition guard as approve (audit AD2).
+  const updated = await db.adCampaign.updateMany({
+    where: { id: input.id, status: { in: ["pending", "approved"] } },
     data: {
       status: "rejected",
       reviewedBy: input.adminId,
@@ -380,6 +384,11 @@ export async function adminRejectAd(input: {
       adminNotes: input.reason ?? null,
     },
   });
+  if (updated.count === 0) {
+    const fresh = await db.adCampaign.findUniqueOrThrow({ where: { id: input.id } });
+    return toAdView(fresh);
+  }
+  const rejected = await db.adCampaign.findUniqueOrThrow({ where: { id: input.id } });
   await audit({
     userId: ad.ownerId,
     actor: "admin",
@@ -398,7 +407,7 @@ export async function adminRejectAd(input: {
       link: "/dashboard/advertising",
     },
   });
-  return toAdView(updated);
+  return toAdView(rejected);
 }
 
 // ---------------------------------------------------------------------

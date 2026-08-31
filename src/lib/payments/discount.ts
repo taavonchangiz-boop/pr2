@@ -95,22 +95,59 @@ export async function recordUsage(input: {
 }): Promise<{ ok: boolean; errorFa?: string }> {
   try {
     const result = await db.$transaction(async (tx) => {
-      // Try insert DiscountUsage with @@unique([discountId, userId]) — if exists,
-      // it means the user has already used this code, which is rejected upstream.
-      const usage = await tx.discountUsage.create({
+      // Re-validate INSIDE the transaction (audit §16): the previous
+      // implementation trusted a pre-transaction validateAndApply() read,
+      // so concurrent redemptions could drive `uses` past `maxUses`.
+      const discount = await tx.discount.findUnique({
+        where: { id: input.discountId },
+      });
+      if (!discount || !discount.active) {
+        return { ok: false as const, errorFa: "کد تخفیف یافت نشد یا غیرفعال است." };
+      }
+      if (discount.expiresAt && discount.expiresAt.getTime() < Date.now()) {
+        return { ok: false as const, errorFa: "کد تخفیف منقضی شده است." };
+      }
+
+      // ATOMIC maxUses enforcement (audit §16 — "unique user usage به‌تنهایی
+      // سقف کلی maxUses را enforce نمی‌کند"): a conditional UPDATE whose
+      // predicate re-checks the cap at the database level in the same
+      // statement that increments. affected-rows 0 ⇒ the cap was reached
+      // concurrently. The predicate is portable across SQLite/MariaDB.
+      // Only the cuid `input.discountId` is interpolated (bound parameter)
+      // — table/column identifiers are Prisma-mapped constants.
+      //
+      // ORDER OF CHECKS (both must leave NO writes behind on rejection):
+      //   1. per-user count (read-only) — reject BEFORE any write;
+      //   2. conditional uses-increment (single atomic write) — reject
+      //      writes nothing;
+      //   3. usage INSERT — a concurrent same-user redemption loses the
+      //      UNIQUE([discountId,userId]) race and its THROWN error rolls
+      //      back the whole transaction, including its increment.
+      const userUsages = await tx.discountUsage.count({
+        where: { discountId: input.discountId, userId: input.userId },
+      });
+      if (discount.perUserLimit > 0 && userUsages >= discount.perUserLimit) {
+        return { ok: false as const, errorFa: "سقف استفاده از این کد برای شما تکمیل شده است." };
+      }
+
+      const incremented = await tx.$executeRawUnsafe(
+        `UPDATE "Discount" SET "uses" = "uses" + 1 WHERE "id" = ? AND ("maxUses" = 0 OR "uses" < "maxUses")`,
+        input.discountId,
+      );
+      if (incremented === 0) {
+        return { ok: false as const, errorFa: "سقف استفاده از این کد تکمیل شده است." };
+      }
+
+      await tx.discountUsage.create({
         data: {
           discountId: input.discountId,
           userId: input.userId,
           orderId: input.orderId,
         },
       });
-      // Atomic increment — Prisma update on row by id.
-      await tx.discount.update({
-        where: { id: input.discountId },
-        data: { uses: { increment: 1 } },
-      });
-      return usage;
+      return { ok: true as const };
     });
+    if (!result.ok) return result;
     await audit({
       userId: input.userId,
       actor: input.adminId ? "admin" : "user",
@@ -118,12 +155,14 @@ export async function recordUsage(input: {
       targetType: "discount",
       targetId: input.discountId,
       ip: input.ip,
-      meta: { orderId: input.orderId, adminId: input.adminId, usageId: result.id },
+      meta: { orderId: input.orderId, adminId: input.adminId },
     });
     return { ok: true };
   } catch (err) {
     const msg = (err as { code?: string; message?: string })?.message ?? "";
     if (/unique|constraint|UNIQUE/i.test(msg)) {
+      // Race lost on the per-user usage insert — the increment above is
+      // rolled back with the transaction, so `uses` stays consistent.
       return { ok: false, errorFa: "شما قبلاً از این کد تخفیف استفاده کرده‌اید." };
     }
     throw err;

@@ -440,19 +440,41 @@ export async function createOrderForSubscription(input: {
     };
   }
   const descriptionFa = `اشتراک ${plan.nameFa} — ${toPersianDigits(plan.intervalMonths)} ماهه`;
-  const order = await db.order.create({
-    data: {
-      userId: input.userId,
-      kind: "subscription",
-      amountRials: plan.priceRials,
-      planId: plan.id,
-      descriptionFa,
-      status: "pending",
-      provider: input.provider ?? null,
-      idempotencyKey: input.idempotencyKey,
-      metadata: JSON.stringify(input.metadata ?? {}),
-    },
-  });
+  let order;
+  try {
+    order = await db.order.create({
+      data: {
+        userId: input.userId,
+        kind: "subscription",
+        amountRials: plan.priceRials,
+        planId: plan.id,
+        descriptionFa,
+        status: "pending",
+        provider: input.provider ?? null,
+        idempotencyKey: input.idempotencyKey,
+        metadata: JSON.stringify(input.metadata ?? {}),
+      },
+    });
+  } catch (err) {
+    // Concurrent create with the same idempotencyKey: return the existing
+    // order instead of surfacing a raw P2002 500 (audit §13).
+    const msg = (err as { code?: string; message?: string })?.message ?? "";
+    if (!/unique|UNIQUE|constraint/i.test(msg)) throw err;
+    const existingAfterRace = await db.order.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+    });
+    if (!existingAfterRace || existingAfterRace.userId !== input.userId) {
+      throw new AuthError("کلید یکتا تکراری است.", 409);
+    }
+    return {
+      order: {
+        id: existingAfterRace.id,
+        amountRials: existingAfterRace.amountRials,
+        status: existingAfterRace.status,
+        descriptionFa: existingAfterRace.descriptionFa,
+      },
+    };
+  }
   return {
     order: {
       id: order.id,
@@ -494,17 +516,39 @@ export async function createWalletCreditOrder(input: {
     };
   }
   const descriptionFa = input.descriptionFa ?? "شارژ کیف پول";
-  const order = await db.order.create({
-    data: {
-      userId: input.userId,
-      kind: "wallet_credit",
-      amountRials: input.amountRials,
-      descriptionFa,
-      status: "pending",
-      provider: input.provider ?? null,
-      idempotencyKey: input.idempotencyKey,
-    },
-  });
+  let order;
+  try {
+    order = await db.order.create({
+      data: {
+        userId: input.userId,
+        kind: "wallet_credit",
+        amountRials: input.amountRials,
+        descriptionFa,
+        status: "pending",
+        provider: input.provider ?? null,
+        idempotencyKey: input.idempotencyKey,
+      },
+    });
+  } catch (err) {
+    // Concurrent create with the same idempotencyKey: return the existing
+    // order instead of surfacing a raw P2002 500 (audit §13).
+    const msg = (err as { code?: string; message?: string })?.message ?? "";
+    if (!/unique|UNIQUE|constraint/i.test(msg)) throw err;
+    const existingAfterRace = await db.order.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+    });
+    if (!existingAfterRace || existingAfterRace.userId !== input.userId) {
+      throw new AuthError("کلید یکتا تکراری است.", 409);
+    }
+    return {
+      order: {
+        id: existingAfterRace.id,
+        amountRials: existingAfterRace.amountRials,
+        status: existingAfterRace.status,
+        descriptionFa: existingAfterRace.descriptionFa,
+      },
+    };
+  }
   return {
     order: {
       id: order.id,
@@ -516,14 +560,34 @@ export async function createWalletCreditOrder(input: {
 }
 
 // ---------------------------------------------------------------------
-// activateSubscription — atomic post-payment subscription activation.
-// Referral reward is applied here, ONCE per referred user.
+// activateSubscription — atomic post-payment fulfillment.
+//
+// ROOT-CAUSE REDESIGN (audit §4/§12/§15): this function is the SINGLE
+// OWNER of every financial side effect that follows a successful
+// payment:
+//   * order status claim  (pending/awaiting_payment/awaiting_review → paid)
+//   * LedgerEntry         (ledger:payment:<orderId>)
+//   * WalletTxn credit    (wallet:payment:<orderId>)
+//   * Subscription activation / RENEWAL EXTENSION
+//   * First-paid-order referral reward
+//
+// All of the above happen inside ONE $transaction and are keyed by
+// deterministic orderId-derived idempotency keys, so:
+//   * calling this function twice can never double-credit (upserts
+//     no-op on the existing keys);
+//   * an order that was already marked paid by a previous finalize
+//     step (bank/bale legacy path or a crash between steps) is HEALED:
+//     the upserts still run and no-op if the effects already exist;
+//   * orders in non-payable states (expired/failed/rejected/cancelled)
+//     are rejected — approving them can no longer fake success.
 // ---------------------------------------------------------------------
+const PAYABLE_STATUSES = ["pending", "awaiting_payment", "awaiting_review"];
+
 export async function activateSubscription(input: {
   orderId: string;
   paidRials: number;
   idempotencyKey: string;
-}): Promise<{ subscriptionId: string; endsAt: Date; referralRewardRials: number }> {
+}): Promise<{ subscriptionId: string; endsAt: Date; referralRewardRials: number; credited: boolean }> {
   // HARD AMOUNT CHECK: paidRials must equal the order's stored amount.
   const order = await db.order.findUnique({
     where: { id: input.orderId },
@@ -536,37 +600,36 @@ export async function activateSubscription(input: {
     throw new AuthError("نوع سفارش برای فعال‌سازی اشتراک معتبر نیست.", 400);
   }
 
-  // For wallet_credit kind, we don't activate a subscription — just credit the wallet.
-  // The caller (verifyAndFinalize) is responsible for the WalletTxn + LedgerEntry.
-  // This helper is only meaningful for subscription activation, but stays neutral.
-
   const result = await db.$transaction(async (tx) => {
-    // Lock the order row by attempting a conditional update.
-    // If status is already "paid", this returns 0 — meaning the order is
-    // already paid (idempotent re-entry). We then return the existing
-    // subscription's id.
-    const updated = await tx.order.updateMany({
-      where: { id: order.id, status: { in: ["awaiting_review", "awaiting_payment", "pending"] } },
+    // CAS: claim the order into `paid`. If the claim loses, the order
+    // MUST already be paid — anything else is a non-payable state and
+    // MUST fail loudly (previously this silently faked success).
+    const claimed = await tx.order.updateMany({
+      where: { id: order.id, status: { in: PAYABLE_STATUSES } },
       data: { status: "paid" },
     });
-    if (updated.count === 0) {
-      // Already paid — idempotent re-entry. Look up the existing subscription.
-      const existingSub = await tx.subscription.findFirst({
-        where: { userId: order.userId },
-        orderBy: { createdAt: "desc" },
+    if (claimed.count === 0) {
+      const fresh = await tx.order.findUnique({
+        where: { id: order.id },
+        select: { status: true },
       });
-      if (existingSub) {
-        return { subscriptionId: existingSub.id, endsAt: existingSub.endsAt, referralRewardRials: 0 };
+      if (!fresh || fresh.status !== "paid") {
+        throw new AuthError(
+          "این سفارش در وضعیت قابل پرداختی نیست و قابل تأیید نیست.",
+          400,
+        );
       }
-      // No sub — likely wallet_credit kind. Idempotent.
-      return { subscriptionId: "", endsAt: new Date(0), referralRewardRials: 0 };
+      // Idempotent re-entry on an already-paid order: fall through and
+      // re-run the (no-op) upserts below — this heals legacy rows that
+      // were marked paid without ever receiving their financial
+      // effects, and can never double-credit because the upserts are
+      // keyed by deterministic orderId-derived keys.
     }
 
-    // LedgerEntry — append-only.
+    // LedgerEntry — append-only. Keyed per order → per-order uniqueness.
     const ledgerIdemKey = `ledger:payment:${order.id}`;
     const walletIdemKey = `wallet:payment:${order.id}`;
 
-    // Ledger
     await tx.ledgerEntry.upsert({
       where: { idempotencyKey: ledgerIdemKey },
       create: {
@@ -580,10 +643,9 @@ export async function activateSubscription(input: {
       update: {},
     });
 
-    // WalletTxn credit (balanceAfter computed below from running total)
-    // For subscription orders, the credit goes to wallet for ledger symmetry;
-    // the user's balance is the sum of walletTxn amounts. The amount is +amountRials.
-    // Compute balanceAfter as current SUM + new amount.
+    // WalletTxn credit (balanceAfter computed from the running total
+    // inside this transaction — serialized by the SQLite/InnoDB writer
+    // at this point because the CAS above already took the write lock).
     const prevTxns = await tx.walletTxn.findMany({
       where: { userId: order.userId },
       select: { amountRials: true, direction: true },
@@ -594,21 +656,25 @@ export async function activateSubscription(input: {
     }
     const balanceAfter = runningBalance + order.amountRials;
 
-    await tx.walletTxn.upsert({
+    const existingWalletTxn = await tx.walletTxn.findUnique({
       where: { idempotencyKey: walletIdemKey },
-      create: {
-        userId: order.userId,
-        orderId: order.id,
-        amountRials: order.amountRials,
-        direction: "credit",
-        reason: "payment",
-        balanceAfter,
-        idempotencyKey: walletIdemKey,
-      },
-      update: {},
+      select: { id: true },
     });
+    if (!existingWalletTxn) {
+      await tx.walletTxn.create({
+        data: {
+          userId: order.userId,
+          orderId: order.id,
+          amountRials: order.amountRials,
+          direction: "credit",
+          reason: "payment",
+          balanceAfter,
+          idempotencyKey: walletIdemKey,
+        },
+      });
+    }
 
-    // Subscription activation (only for kind === subscription)
+    // Subscription activation / renewal (only for kind === subscription)
     let subscriptionId = "";
     let endsAt = new Date(0);
     if (order.kind === "subscription" && order.planId) {
@@ -617,13 +683,17 @@ export async function activateSubscription(input: {
         throw new AuthError("طرح مرتبط با سفارش یافت نشد.", 500);
       }
       const now = new Date();
-      const endsAtDate = new Date(now);
-      // add intervalMonths
-      endsAtDate.setMonth(endsAtDate.getMonth() + plan.intervalMonths);
-      // Dedup: look up the most-recent Subscription by (userId, planId).
-      // The subscription schema has no idempotencyKey column, so we
-      // gate on the order's paid status (which is already checked above)
-      // AND on the absence of a sub created in this same transaction.
+      const addInterval = (from: Date): Date => {
+        const d = new Date(from);
+        d.setMonth(d.getMonth() + plan.intervalMonths);
+        return d;
+      };
+      // Dedup/renewal: look up the most-recent Subscription by (userId, planId).
+      //  * No prior subscription  → create a new active one.
+      //  * Prior subscription     → RENEW: extend endsAt from
+      //    max(existing.endsAt, now) by the plan interval and reactivate.
+      //    (Previously a repeat payment returned the old row unchanged —
+      //    the user paid again and received nothing.)
       const existing = await tx.subscription.findFirst({
         where: { userId: order.userId, planId: plan.id },
         orderBy: { createdAt: "desc" },
@@ -635,27 +705,34 @@ export async function activateSubscription(input: {
             planId: plan.id,
             status: "active",
             startedAt: now,
-            endsAt: endsAtDate,
+            endsAt: addInterval(now),
             usedQuota: "{}",
           },
         });
         subscriptionId = created.id;
-        endsAt = endsAtDate;
+        endsAt = created.endsAt;
       } else {
+        const base = existing.endsAt.getTime() > now.getTime() ? existing.endsAt : now;
+        const newEndsAt = addInterval(base);
+        await tx.subscription.update({
+          where: { id: existing.id },
+          data: { status: "active", endsAt: newEndsAt },
+        });
         subscriptionId = existing.id;
-        endsAt = existing.endsAt;
+        endsAt = newEndsAt;
       }
     }
 
     // Referral reward — only for the FIRST paid order by this user,
-    // and only if the user was referred by someone.
+    // and only if the user was referred by someone. A UNIQUE violation
+    // on ReferralReward.referredId (reward already granted elsewhere)
+    // must NOT abort the whole activation transaction.
     let referralRewardRials = 0;
     const user = await tx.user.findUnique({
       where: { id: order.userId },
       select: { id: true, referredById: true },
     });
     if (user && user.referredById && user.referredById !== user.id) {
-      // Check no prior referral reward exists for this user.
       const existingReward = await tx.referralReward.findUnique({
         where: { referredId: user.id },
       });
@@ -668,7 +745,6 @@ export async function activateSubscription(input: {
           const refIdemKey = `referral:reward:${user.id}`;
           const refWalletIdemKey = `wallet:referral:${user.id}`;
           const refLedgerIdemKey = `ledger:referral:${user.id}`;
-          // Wallet balance
           const prevR = await tx.walletTxn.findMany({
             where: { userId: user.referredById },
             select: { amountRials: true, direction: true },
@@ -678,40 +754,48 @@ export async function activateSubscription(input: {
             runningR += t.direction === "credit" ? t.amountRials : -t.amountRials;
           }
           const balAfterR = runningR + referralRewardRials;
-          await tx.referralReward.upsert({
-            where: { idempotencyKey: refIdemKey },
-            create: {
-              referrerId: user.referredById,
-              referredId: user.id,
-              amountRials: referralRewardRials,
-              status: "paid",
-              idempotencyKey: refIdemKey,
-            },
-            update: {},
-          });
-          await tx.walletTxn.upsert({
-            where: { idempotencyKey: refWalletIdemKey },
-            create: {
-              userId: user.referredById,
-              amountRials: referralRewardRials,
-              direction: "credit",
-              reason: "referral_reward",
-              balanceAfter: balAfterR,
-              idempotencyKey: refWalletIdemKey,
-            },
-            update: {},
-          });
-          await tx.ledgerEntry.upsert({
-            where: { idempotencyKey: refLedgerIdemKey },
-            create: {
-              userId: user.referredById,
-              eventType: "referral_reward",
-              amountRials: referralRewardRials,
-              currency: "IRR",
-              idempotencyKey: refLedgerIdemKey,
-            },
-            update: {},
-          });
+          try {
+            await tx.referralReward.upsert({
+              where: { idempotencyKey: refIdemKey },
+              create: {
+                referrerId: user.referredById,
+                referredId: user.id,
+                amountRials: referralRewardRials,
+                status: "paid",
+                idempotencyKey: refIdemKey,
+              },
+              update: {},
+            });
+            await tx.walletTxn.upsert({
+              where: { idempotencyKey: refWalletIdemKey },
+              create: {
+                userId: user.referredById,
+                amountRials: referralRewardRials,
+                direction: "credit",
+                reason: "referral_reward",
+                balanceAfter: balAfterR,
+                idempotencyKey: refWalletIdemKey,
+              },
+              update: {},
+            });
+            await tx.ledgerEntry.upsert({
+              where: { idempotencyKey: refLedgerIdemKey },
+              create: {
+                userId: user.referredById,
+                eventType: "referral_reward",
+                amountRials: referralRewardRials,
+                currency: "IRR",
+                idempotencyKey: refLedgerIdemKey,
+              },
+              update: {},
+            });
+          } catch (err) {
+            // UNIQUE on referredId → reward already granted concurrently.
+            // Treat as already-rewarded; never abort activation.
+            const msg = (err as { code?: string; message?: string })?.message ?? "";
+            if (!/unique|UNIQUE|constraint/i.test(msg)) throw err;
+            referralRewardRials = 0;
+          }
         }
       }
     }
@@ -719,7 +803,7 @@ export async function activateSubscription(input: {
     return { subscriptionId, endsAt, referralRewardRials };
   });
 
-  return result;
+  return { ...result, credited: true };
 }
 
 // ---------------------------------------------------------------------
@@ -767,6 +851,25 @@ export async function getQuotaState(userId: string): Promise<QuotaState & { plan
   };
 }
 
+// CAS retry bounds for the usedQuota JSON compare-and-swap below.
+const QUOTA_CAS_RETRIES = 8;
+
+function readQuotaJson(raw: string | null | undefined): Record<string, number> {
+  return safeJsonParse<Record<string, number>>(raw ?? "{}", {});
+}
+
+/**
+ * Atomically increment a quota dimension on the active subscription.
+ *
+ * ROOT-CAUSE FIX (audit §18 — check-then-increment): the previous
+ * implementation did a read-modify-write of the whole usedQuota JSON
+ * with no transaction/lock, so N concurrent calls lost N-1 increments
+ * (quota overrun). This version uses an optimistic CAS loop:
+ * the UPDATE carries the exact previously-read JSON string as a WHERE
+ * condition; a concurrent writer changes that string, the affected-rows
+ * count is 0, and we re-read + retry. Works identically on SQLite and
+ * MariaDB (string equality predicate).
+ */
 export async function incrementQuotaUsage(input: {
   userId: string;
   dimension: QuotaDimension;
@@ -777,13 +880,61 @@ export async function incrementQuotaUsage(input: {
   }
   const sub = await getActiveSubscription(input.userId);
   if (!sub) return; // free plan — no enforcement, no row
-  const used = safeJsonParse<Record<string, number>>(sub.usedQuota, {});
-  const current = used[input.dimension] ?? 0;
-  used[input.dimension] = current + input.amount;
-  await db.subscription.update({
-    where: { id: sub.id },
-    data: { usedQuota: JSON.stringify(used) },
-  });
+  for (let attempt = 0; attempt < QUOTA_CAS_RETRIES; attempt++) {
+    const fresh = await db.subscription.findUnique({
+      where: { id: sub.id },
+      select: { usedQuota: true },
+    });
+    const prevRaw = fresh?.usedQuota ?? "{}";
+    const used = readQuotaJson(prevRaw);
+    used[input.dimension] = (used[input.dimension] ?? 0) + input.amount;
+    const updated = await db.subscription.updateMany({
+      where: { id: sub.id, usedQuota: prevRaw },
+      data: { usedQuota: JSON.stringify(used) },
+    });
+    if (updated.count === 1) return;
+  }
+  throw new AuthError("به‌روزرسانی سهمیه هم‌زمان ناموفق بود. دوباره تلاش کنید.", 409);
+}
+
+/**
+ * Atomically CHECK + RESERVE quota in one CAS loop (audit §18).
+ * Returns true when the amount was reserved, false when the limit would
+ * be exceeded. Reserving happens BEFORE the metered operation so that
+ * concurrent bursts cannot all pass a stale check (TOCTOU); failed
+ * operations keep the reservation by design (documented semantics:
+ * fail-closed against quota overrun).
+ */
+export async function consumeQuota(input: {
+  userId: string;
+  dimension: QuotaDimension;
+  amount: number;
+}): Promise<boolean> {
+  if (!Number.isInteger(input.amount) || input.amount <= 0) {
+    throw new AuthError("مقدار افزایش نامعتبر است.", 400);
+  }
+  const sub = await getActiveSubscription(input.userId);
+  if (!sub) return true; // free plan — no enforcement row; allowed
+  const planQuota = safeJsonParse<PlanQuota>(sub.plan.quota, {});
+  const limit = planQuota[input.dimension] ?? 0;
+  if (limit <= 0) return true; // 0 = unlimited
+  for (let attempt = 0; attempt < QUOTA_CAS_RETRIES; attempt++) {
+    const fresh = await db.subscription.findUnique({
+      where: { id: sub.id },
+      select: { usedQuota: true },
+    });
+    const prevRaw = fresh?.usedQuota ?? "{}";
+    const used = readQuotaJson(prevRaw);
+    const current = used[input.dimension] ?? 0;
+    if (current + input.amount > limit) return false;
+    used[input.dimension] = current + input.amount;
+    const updated = await db.subscription.updateMany({
+      where: { id: sub.id, usedQuota: prevRaw },
+      data: { usedQuota: JSON.stringify(used) },
+    });
+    if (updated.count === 1) return true;
+  }
+  throw new AuthError("به‌روزرسانی سهمیه هم‌زمان ناموفق بود. دوباره تلاش کنید.", 409);
 }
 
 export async function requireQuota(input: {

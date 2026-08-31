@@ -87,10 +87,24 @@ export async function POST(req: Request, { params }: Params) {
     await db.order.update({
       where: { id: order.id },
       data: {
-        status: "rejected",
         metadata: JSON.stringify(nextMeta),
       },
     });
+
+    // ROOT-CAUSE FIX (audit TOCTOU): the paid-check above is a plain read;
+    // an approve completing between that read and this write used to flip a
+    // fully-fulfilled order to rejected. The conditional update re-checks
+    // atomically and refuses to touch paid orders.
+    const rejected = await db.order.updateMany({
+      where: { id: order.id, status: { not: "paid" } },
+      data: { status: "rejected" },
+    });
+    if (rejected.count === 0) {
+      return NextResponse.json(
+        { errorFa: "سفارش قبلاً پرداخت شده و قابل رد نیست." },
+        { status: 400 },
+      );
+    }
 
     // Mark the card receipt rejected, if present.
     if (order.cardReceipt) {
@@ -139,7 +153,7 @@ export async function POST(req: Request, { params }: Params) {
     if (e instanceof AuthError) {
       return NextResponse.json({ errorFa: e.message }, { status: e.status });
     }
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    console.error("admin order reject failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ errorFa: "خطای داخلی در رد سفارش." }, { status: 500 });
   }
 }

@@ -167,7 +167,8 @@ export async function POST(req: Request, { params }: Params) {
     if (e instanceof AuthError) {
       return NextResponse.json({ errorFa: e.message }, { status: e.status });
     }
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    // Generic message — never leak Prisma/driver internals to the client.
+    console.error("admin order approve failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ errorFa: "خطای داخلی در تأیید سفارش." }, { status: 500 });
   }
 }

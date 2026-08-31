@@ -325,10 +325,17 @@ export async function bankVerifyAndFinalize(input: {
 
     const traceNo = json.TraceNo ?? json.RefId ?? null;
 
-    // Atomic finalize
     const idemKey = `bank:verify:${input.order.id}:${input.authority}`;
+    // Atomic finalize — claim via BankGatewayRef.paidAt CAS (idempotency gate).
+    // ROOT-CAUSE FIX (audit §12/§15): the order row is NOT marked paid here.
+    // The old code set order.status="paid" inside this transaction and THEN
+    // called activateSubscription, whose payable-status CAS saw "paid" and
+    // skipped ALL financial effects (no wallet credit, no ledger, no
+    // subscription, no referral) — the user was charged real money and
+    // received nothing. Now activateSubscription is the single owner of the
+    // order→paid claim plus every financial side effect, in one transaction.
+    let firstFinalize = false;
     await db.$transaction(async (tx) => {
-      // Update BankGatewayRef (set paidAt + traceNo) only if not already paid
       const updated = await tx.bankGatewayRef.updateMany({
         where: { authority: input.authority, paidAt: null },
         data: {
@@ -338,38 +345,40 @@ export async function bankVerifyAndFinalize(input: {
           rawResponse: JSON.stringify(sanitizeRaw(json)),
         },
       });
-      if (updated.count === 0) return; // idempotent re-entry
-      await tx.order.update({
-        where: { id: input.order.id },
-        data: { status: "paid" },
-      });
+      firstFinalize = updated.count === 1;
     });
 
-    // activateSubscription handles the wallet/ledger/referral atomically
+    // Runs on first finalize AND on idempotent re-entry (heals any
+    // legacy/crashed state where the ref was marked paid without the
+    // financial effects; internally idempotent — no double credit).
     await activateSubscription({
       orderId: input.order.id,
       paidRials: input.order.amountRials,
       idempotencyKey: idemKey,
     });
 
-    await db.notification.create({
-      data: {
+    // Notify + audit only on the first finalize (no duplicate spam on
+    // repeated gateway callbacks).
+    if (firstFinalize) {
+      await db.notification.create({
+        data: {
+          userId: input.order.userId,
+          category: "payment",
+          titleFa: "پرداخت موفق",
+          bodyFa: `پرداخت ${formatRials(input.order.amountRials)} با کد پیگیری ${traceNo ?? input.authority.slice(0, 8)} تأیید شد.`,
+          link: "/dashboard/wallet",
+        },
+      });
+      await audit({
         userId: input.order.userId,
-        category: "payment",
-        titleFa: "پرداخت موفق",
-        bodyFa: `پرداخت ${formatRials(input.order.amountRials)} با کد پیگیری ${traceNo ?? input.authority.slice(0, 8)} تأیید شد.`,
-        link: "/dashboard/wallet",
-      },
-    });
-    await audit({
-      userId: input.order.userId,
-      actor: "provider",
-      action: "bank_payment_paid",
-      targetType: "order",
-      targetId: input.order.id,
-      ip: input.ip,
-      meta: { amountRials: input.order.amountRials, authority: input.authority, traceNo },
-    });
+        actor: "provider",
+        action: "bank_payment_paid",
+        targetType: "order",
+        targetId: input.order.id,
+        ip: input.ip,
+        meta: { amountRials: input.order.amountRials, authority: input.authority, traceNo },
+      });
+    }
     return {
       ok: true,
       paidRials: input.order.amountRials,
