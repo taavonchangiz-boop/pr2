@@ -2,7 +2,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
-import { hashPassword, newReferralCode, clientIp, audit, createSession } from "@/lib/server/auth";
+import { hashPassword, newReferralCode, clientIp, audit, createSession, claimFirstAdmin } from "@/lib/server/auth";
 import { isValidEmail, isValidIranMobile, normalizeMobile } from "@/lib/persian";
 import { rateLimit } from "@/lib/security/cache";
 import { ensurePlansSeeded } from "@/lib/payments/plans";
@@ -49,17 +49,19 @@ export async function POST(req: Request) {
   if (referralCode) {
     const ref = await db.user.findUnique({ where: { referralCode: referralCode.toUpperCase() }, select: { id: true } });
     if (!ref) return NextResponse.json({ errorFa: "کد معرف نامعتبر است." }, { status: 400 });
-    if (ref.id !== referredById) referredById = ref.id;
+    referredById = ref.id;
   }
 
   const passwordHash = await hashPassword(password);
   const code = await newReferralCode();
-  // FIRST-ADMIN RULE: the very first user to register is promoted to admin.
-  // Every subsequent registrant is created as a regular user ("user").
-  // This guarantees a single, deterministic bootstrap admin with no manual DB edit.
+  // FIRST-ADMIN RULE (audit §8 — race-safe): the user is ALWAYS created
+  // unprivileged first. The first registration to win the atomic
+  // SystemSetting bootstrap claim (database-level UNIQUE, safe across
+  // concurrent requests AND multiple app instances) is promoted to
+  // admin+superAdmin afterwards. The previous count-then-create pattern
+  // allowed two parallel registrations to BOTH become super-admin.
   const userCount = await db.user.count();
-  const isFirstAdmin = userCount === 0;
-  const role = isFirstAdmin ? "admin" : "user";
+  const possiblyFirst = userCount === 0;
 
   // Make sure the FREE plan exists before we try to attach a subscription to it.
   // (plans.ts auto-seeds on import, but we call explicitly to be safe.)
@@ -69,7 +71,7 @@ export async function POST(req: Request) {
   const endsAt = new Date();
   endsAt.setMonth(endsAt.getMonth() + 1); // 1-month rolling free subscription.
 
-  const user = await db.user.create({
+  const created = await db.user.create({
     data: {
       firstName, lastName,
       email: email.toLowerCase(),
@@ -79,11 +81,20 @@ export async function POST(req: Request) {
       businessName,
       referralCode: code,
       referredById: referredById ?? null,
-      role,
-      isSuperAdmin: isFirstAdmin,
+      role: "user",
+      isSuperAdmin: false,
     },
   });
-  await db.profile.create({ data: { userId: user.id } });
+  let role = "user";
+  if (possiblyFirst && (await claimFirstAdmin(created.id))) {
+    const promoted = await db.user.update({
+      where: { id: created.id },
+      data: { role: "admin", isSuperAdmin: true },
+    });
+    role = promoted.role;
+  }
+  const user = { ...created, role };
+  await db.profile.create({ data: { userId: created.id } });
 
   // AUTO-ACTIVATE FREE PLAN on signup — the user gets the free plan
   // IMMEDIATELY, NO checkout step. The free plan is "locked-by-default":
@@ -104,7 +115,7 @@ export async function POST(req: Request) {
     });
   }
 
-  await audit({ actor: "user", action: isFirstAdmin ? "register_first_admin" : "register", targetType: "user", targetId: user.id, ip, meta: { email, mobile: normMobile, role, freePlanActivated: Boolean(freePlan) } });
+  await audit({ actor: "user", action: role === "admin" ? "register_first_admin" : "register", targetType: "user", targetId: user.id, ip, meta: { email, mobile: normMobile, role, freePlanActivated: Boolean(freePlan) } });
   // Create a session so the freshly-registered user is immediately logged in.
   await createSession(user.id, ip, req.headers.get("user-agent"));
   return NextResponse.json({ ok: true, userId: user.id, user: { id: user.id, firstName, role: user.role } });

@@ -85,6 +85,15 @@ export async function POST(
     data: { passwordHash, updatedAt: new Date() },
   });
 
+  // ROOT-CAUSE FIX (audit §10 — privilege/state changes): a stolen live
+  // session survived the password reset, so "locking the account out" by
+  // resetting its password did nothing against session theft. All of the
+  // target user's sessions are now revoked.
+  await db.session.updateMany({
+    where: { userId: id, revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
+
   await audit({
     userId: admin.id,
     actor: "admin",

@@ -4,8 +4,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
-import { hashPassword, newReferralCode, clientIp, audit } from "@/lib/server/auth";
-import { createSession } from "@/lib/server/auth";
+import { hashPassword, newReferralCode, clientIp, audit, createSession, claimFirstAdmin } from "@/lib/server/auth";
 import { hashToken } from "@/lib/security/crypto";
 import { isValidEmail, isValidIranMobile, normalizeMobile } from "@/lib/persian";
 import { rateLimit } from "@/lib/security/cache";
@@ -62,11 +61,14 @@ export async function POST(req: Request) {
 
   const passwordHash = await hashPassword(password);
   const code = await newReferralCode();
-  // FIRST-ADMIN RULE: the very first user to register (incl. mobile-first) is
-  // promoted to admin; every subsequent registrant is a regular user.
+  // FIRST-ADMIN RULE (audit §8 — race-safe, unified with /api/auth/register):
+  // the user is always created unprivileged; the atomic SystemSetting
+  // bootstrap claim decides who becomes admin. Previously this route used
+  // an unsafe count-then-create AND set role=admin WITHOUT isSuperAdmin,
+  // diverging from the email register route.
   const userCount = await db.user.count();
-  const role = userCount === 0 ? "admin" : "user";
-  const user = await db.user.create({
+  const possiblyFirst = userCount === 0;
+  const created = await db.user.create({
     data: {
       firstName, lastName,
       email: email.toLowerCase(),
@@ -76,11 +78,20 @@ export async function POST(req: Request) {
       businessName,
       referralCode: code,
       referredById: referredById ?? null,
-      role,
+      role: "user",
+      isSuperAdmin: false,
     },
   });
-  await db.profile.create({ data: { userId: user.id } });
-  await createSession(user.id, ip, req.headers.get("user-agent"));
-  await audit({ actor: "user", action: userCount === 0 ? "register_first_admin" : "register_otp", targetType: "user", targetId: user.id, ip, meta: { email, mobile, role } });
-  return NextResponse.json({ ok: true, user: { id: user.id, firstName, role: user.role } });
+  let role = "user";
+  if (possiblyFirst && (await claimFirstAdmin(created.id))) {
+    const promoted = await db.user.update({
+      where: { id: created.id },
+      data: { role: "admin", isSuperAdmin: true },
+    });
+    role = promoted.role;
+  }
+  await db.profile.create({ data: { userId: created.id } });
+  await createSession(created.id, ip, req.headers.get("user-agent"));
+  await audit({ actor: "user", action: role === "admin" ? "register_first_admin" : "register_otp", targetType: "user", targetId: created.id, ip, meta: { email, mobile, role } });
+  return NextResponse.json({ ok: true, user: { id: created.id, firstName, role } });
 }

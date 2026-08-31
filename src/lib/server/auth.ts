@@ -5,7 +5,7 @@ import { cookies } from "next/headers";
 import { db } from "@/lib/db";
 import {
   signJwt, verifyJwt, hashToken, hashOtp, hashPassword, verifyPassword,
-  randomToken, randomNumericCode,
+  randomToken, randomNumericCode, constantTimeEqual,
 } from "@/lib/security/crypto";
 import { rateLimit } from "@/lib/security/cache";
 import { normalizeMobile, isValidIranMobile } from "@/lib/persian";
@@ -75,7 +75,7 @@ export async function getCurrentUser(): Promise<AuthUser | null> {
   const session = await db.session.findUnique({ where: { id: payload.sid } });
   if (!session || (session.expiresAt && session.expiresAt.getTime() < Date.now()) || session.revokedAt) return null;
   // constant-time compare cookie JWT hash vs stored hash (rotation detection)
-  if (session.tokenHash !== hashToken(token)) return null;
+  if (!constantTimeEqual(session.tokenHash, hashToken(token))) return null;
   const user = await db.user.findUnique({ where: { id: payload.sub } });
   if (!user || user.status !== "active") {
     if (user) {
@@ -187,16 +187,49 @@ export async function verifyOtp(mobileRaw: string, codeRaw: string, purpose: "lo
   });
   if (!candidate) return { ok: false, errorFa: "کد معتبر یافت نشد یا منقضی شده است." };
 
-  if (candidate.attempts >= OTP_MAX_ATTEMPTS) {
-    await db.otp.update({ where: { id: candidate.id }, data: { expiresAt: new Date() } });
-    return { ok: false, errorFa: "تعداد تلاش بیش از حد مجاز بود. کد جدید درخواست کنید." };
-  }
-  await db.otp.update({ where: { id: candidate.id }, data: { attempts: candidate.attempts + 1 } });
-
   const expectedHash = hashOtp(code);
-  if (expectedHash !== candidate.codeHash) return { ok: false, errorFa: "کد نادرست است." };
+  const codeMatches = expectedHash === candidate.codeHash;
 
-  await db.otp.update({ where: { id: candidate.id }, data: { consumedAt: new Date() } });
+  // ROOT-CAUSE FIX (audit §9 — concurrent verification race): the previous
+  // implementation read `attempts`, wrote `attempts + 1` from that stale
+  // value, then consumed via a second unconditional update — two parallel
+  // requests with the same code could BOTH consume one OTP. Now every
+  // state change is a single conditional atomic UPDATE:
+  //   * wrong code  → attempts incremented only while attempts < MAX and
+  //     still unconsumed (count 0 ⇒ exhausted/consumed ⇒ dead);
+  //   * right code  → consumed only while still unconsumed and under the
+  //     attempt cap (count 1 ⇒ this request and ONLY this request won).
+  if (!codeMatches) {
+    const bumped = await db.otp.updateMany({
+      where: {
+        id: candidate.id,
+        consumedAt: null,
+        attempts: { lt: OTP_MAX_ATTEMPTS },
+      },
+      data: { attempts: { increment: 1 } },
+    });
+    if (bumped.count === 0) {
+      // Attempt cap reached (or consumed concurrently) — kill the code.
+      await db.otp.updateMany({
+        where: { id: candidate.id, consumedAt: null },
+        data: { expiresAt: new Date() },
+      });
+      return { ok: false, errorFa: "تعداد تلاش بیش از حد مجاز بود. کد جدید درخواست کنید." };
+    }
+    return { ok: false, errorFa: "کد نادرست است." };
+  }
+
+  const consumed = await db.otp.updateMany({
+    where: {
+      id: candidate.id,
+      consumedAt: null,
+      attempts: { lt: OTP_MAX_ATTEMPTS },
+    },
+    data: { consumedAt: new Date() },
+  });
+  if (consumed.count === 0) {
+    return { ok: false, errorFa: "کد قبلاً مصرف شده یا منقضی شده است. کد جدید درخواست کنید." };
+  }
   return { ok: true, userId: candidate.userId ?? undefined };
 }
 
@@ -223,6 +256,31 @@ export async function newReferralCode(): Promise<string> {
   return randomToken(6).toUpperCase();
 }
 
+// ---------------------------------------------------------------------
+// First-admin bootstrap (audit §8 — first-admin race)
+// ---------------------------------------------------------------------
+// The "count users == 0 → create privileged user" pattern is unsafe
+// under concurrent registration: two parallel requests both count 0 and
+// BOTH become super-admin. An in-memory mutex is not sufficient for a
+// distributed deployment. The fix is a DATABASE-LEVEL atomic claim: the
+// FIRST registrar to successfully INSERT the singleton SystemSetting row
+// (primary key `key`, UNIQUE) wins; every loser's INSERT violates the
+// constraint and stays a regular user. Works identically on SQLite and
+// MariaDB, across any number of app instances.
+export const BOOTSTRAP_ADMIN_SETTING_KEY = "bootstrap_admin_claimed";
+
+export async function claimFirstAdmin(userId: string): Promise<boolean> {
+  try {
+    await db.systemSetting.create({
+      data: { key: BOOTSTRAP_ADMIN_SETTING_KEY, value: userId },
+    });
+    return true;
+  } catch {
+    // Unique violation — the bootstrap claim was already taken.
+    return false;
+  }
+}
+
 export async function audit(opts: {
   userId?: string | null;
   actor: string;
@@ -244,8 +302,11 @@ export async function audit(opts: {
         meta: JSON.stringify(opts.meta ?? {}),
       },
     });
-  } catch {
-    // audit never throws
+  } catch (err) {
+    // Audit must never break the main flow, but a lost audit row for a
+    // security/financial action must at least be VISIBLE to operators
+    // (audit §31 — silent failure). Never swallow without a trace.
+    console.error("audit write failed:", err instanceof Error ? err.message : err);
   }
 }
 
