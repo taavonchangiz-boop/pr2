@@ -27,7 +27,8 @@ export async function GET() {
       quota,
     });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    const msg = e instanceof Error ? e.message : "خطا در دریافت اشتراک‌ها.";
+    console.error("subscriptions failed:", msg);
+    return NextResponse.json({ errorFa: "خطا در دریافت اشتراک‌ها." }, { status: 500 });
   }
 }

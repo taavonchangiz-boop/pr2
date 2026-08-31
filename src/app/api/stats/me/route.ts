@@ -149,6 +149,7 @@ export async function GET() {
       usage,
     });
   } catch (e) {
-    return NextResponse.json({ errorFa: "خطا در محاسبهٔ آمار.", detail: String(e) }, { status: 500 });
+    console.error("stats me failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ errorFa: "خطا در محاسبهٔ آمار." }, { status: 500 });
   }
 }

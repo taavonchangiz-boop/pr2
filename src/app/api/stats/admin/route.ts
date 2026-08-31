@@ -154,6 +154,7 @@ export async function GET() {
       generatedAt: new Date().toISOString(),
     });
   } catch (e) {
-    return NextResponse.json({ errorFa: "خطا در محاسبهٔ آمار مدیریت.", detail: String(e) }, { status: 500 });
+    console.error("stats admin failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ errorFa: "خطا در محاسبهٔ آمار مدیریت." }, { status: 500 });
   }
 }

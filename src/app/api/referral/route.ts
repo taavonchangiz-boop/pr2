@@ -12,7 +12,8 @@ export async function GET() {
     const stats = await getMyReferralStats(user.id);
     return NextResponse.json({ ...stats, policyFa: describeRewardPolicyFa() });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    const msg = e instanceof Error ? e.message : "خطا در دریافت اطلاعات معرفی.";
+    console.error("referral failed:", msg);
+    return NextResponse.json({ errorFa: "خطا در دریافت اطلاعات معرفی." }, { status: 500 });
   }
 }

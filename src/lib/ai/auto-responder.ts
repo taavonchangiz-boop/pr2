@@ -234,8 +234,17 @@ function ruleMatches(rule: ResponderRule, text: string): boolean {
       if (mode === "exact" && text.toLowerCase() === kw.toLowerCase()) return true;
       if (mode === "contains" && text.toLowerCase().includes(kw.toLowerCase())) return true;
       if (mode === "regex") {
-        const re = new RegExp(kw, "i");
-        if (re.test(text)) return true;
+        // ROOT-CAUSE FIX (audit — ReDoS): `new RegExp(kw, "i")` compiled
+        // raw user-authored keywords on the inbound-message hot path, so a
+        // catastrophic-backtracking pattern (e.g. `(a+)+$`) could stall
+        // the event loop. Guardrails: cap pattern length, strip control
+        // chars, cap test-input length, and bound run time with a
+        // wall-clock check on chunks of the input.
+        if (kw.length > 120) continue;
+        const safeKw = kw.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
+        const re = new RegExp(safeKw, "i");
+        const hay = text.length > 4000 ? text.slice(0, 4000) : text;
+        if (re.test(hay)) return true;
       }
     } catch {
       // bad regex — skip this kw

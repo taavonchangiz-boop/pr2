@@ -847,8 +847,10 @@ export async function replyTicketWithAttachments(input: {
     try {
       await db.ticketReply.delete({ where: { id: reply.id } });
     } catch { /* ignore */ }
-    const message = err instanceof Error ? err.message : "ذخیره فایل ناموفق بود.";
-    return { ok: false, errorFa: message };
+    // Generic client message — filesystem error text can leak absolute
+    // paths (audit §34). Log server-side instead.
+    console.error("ticket attachment save failed:", err instanceof Error ? err.message : err);
+    return { ok: false, errorFa: "ذخیره فایل ناموفق بود. لطفاً دوباره تلاش کنید." };
   }
 
   // Update ticket status

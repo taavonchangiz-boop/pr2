@@ -2,6 +2,7 @@
 // GET list mine, POST create store (encrypt + testConnection before save)
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { rateLimit } from "@/lib/security/cache";
 import { requireUser, clientIp, AuthError } from "@/lib/server/auth";
 import { listMyStores, createStore } from "@/lib/providers/woo";
 
@@ -26,6 +27,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   const ip = clientIp(req);
+  // SSRF amplification guard (audit WO1): throttle store creation probes.
+  const rlWoo = await rateLimit({ key: `woo:create:${user.id}`, limit: 5, windowMs: 60 * 60 * 1000 });
+  if (!rlWoo.ok) return NextResponse.json({ errorFa: "تعداد ثبت فروشگاه بیش از حد مجاز است." }, { status: 429 });
   let body: unknown;
   try { body = await req.json(); } catch {
     return NextResponse.json({ errorFa: "بدنه درخواست نامعتبر است." }, { status: 400 });

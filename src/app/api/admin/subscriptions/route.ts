@@ -11,8 +11,8 @@ export async function GET(req: Request) {
   }
   void user;
   const url = new URL(req.url);
-  const page = Math.max(1, Number(url.searchParams.get("page") ?? "1"));
-  const pageSize = Math.min(50, Math.max(1, Number(url.searchParams.get("pageSize") ?? "20")));
+  const page = Math.max(1, Number(url.searchParams.get("page") ?? "1") || 1);
+  const pageSize = Math.min(50, Math.max(1, Number(url.searchParams.get("pageSize") ?? "20") || 20));
   const status = url.searchParams.get("status") ?? undefined;
   const [rows, total] = await Promise.all([
     db.subscription.findMany({

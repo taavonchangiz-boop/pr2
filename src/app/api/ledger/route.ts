@@ -18,7 +18,8 @@ export async function GET(req: Request) {
     });
     return NextResponse.json(items);
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    const msg = e instanceof Error ? e.message : "خطا در دریافت دفتر عملیات.";
+    console.error("ledger failed:", msg);
+    return NextResponse.json({ errorFa: "خطا در دریافت دفتر عملیات." }, { status: 500 });
   }
 }

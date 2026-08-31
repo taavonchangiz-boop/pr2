@@ -14,6 +14,7 @@
 // Returns { ok: true, reply: TicketReplyView } with `attachments` populated.
 // =====================================================================
 import { NextResponse } from "next/server";
+import { rateLimit } from "@/lib/security/cache";
 import { requireUser, clientIp, AuthError } from "@/lib/server/auth";
 import {
   replyTicketWithAttachments,

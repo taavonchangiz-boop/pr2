@@ -72,6 +72,7 @@ export async function GET() {
       planFeatures: parsePlanFeatures(sub.plan.features) as PlanFeatures,
     });
   } catch (e) {
-    return NextResponse.json({ errorFa: "خطا در خواندن مصرف پلن.", detail: String(e) }, { status: 500 });
+    console.error("usage failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ errorFa: "خطا در خواندن مصرف پلن." }, { status: 500 });
   }
 }

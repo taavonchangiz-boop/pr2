@@ -18,7 +18,8 @@ export async function GET(req: Request) {
     ]);
     return NextResponse.json({ balance, history });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    const msg = e instanceof Error ? e.message : "خطا در دریافت کیف پول.";
+    console.error("wallet failed:", msg);
+    return NextResponse.json({ errorFa: "خطا در دریافت کیف پول." }, { status: 500 });
   }
 }

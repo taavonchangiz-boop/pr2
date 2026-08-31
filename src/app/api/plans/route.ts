@@ -7,7 +7,8 @@ export async function GET() {
     const plans = await listPublicPlans();
     return NextResponse.json({ items: plans });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    const msg = e instanceof Error ? e.message : "خطا در دریافت پلن‌ها.";
+    console.error("plans failed:", msg);
+    return NextResponse.json({ errorFa: "خطا در دریافت پلن‌ها." }, { status: 500 });
   }
 }

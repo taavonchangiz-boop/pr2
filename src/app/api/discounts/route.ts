@@ -32,7 +32,8 @@ export async function GET(req: Request) {
     void ok;
     return NextResponse.json({ ok: true, ...rest });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    const msg = e instanceof Error ? e.message : "خطا در بررسی کد تخفیف.";
+    console.error("discounts failed:", msg);
+    return NextResponse.json({ errorFa: "خطا در بررسی کد تخفیف." }, { status: 500 });
   }
 }

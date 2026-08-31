@@ -1,13 +1,14 @@
 // POSTYAR — POST /api/ads — create an ad draft; GET /api/ads — list mine
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import { rateLimit } from "@/lib/security/cache";
 import { requireUser, clientIp, AuthError } from "@/lib/server/auth";
 import { createAdDraft, listMyAds } from "@/lib/payments/advertising";
 
 const CreateSchema = z.object({
   title: z.string().min(3, "عنوان حداقل ۳ نویسه باشد.").max(200),
   descriptionFa: z.string().max(1000).optional(),
-  link: z.string().max(500).optional(),
+  link: z.string().max(500).refine((v) => !v || /^https?:\/\//i.test(v), "لینک باید با http(s) شروع شود.").optional().optional(),
   imageBase64: z.string().optional(),
   placement: z.string().max(40).optional(),
   startAt: z.string().optional(),
@@ -30,6 +31,9 @@ export async function POST(req: Request) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   const ip = clientIp(req);
+  // CPU guard (audit): image re-encoding via sharp is expensive.
+  const rlAds = await rateLimit({ key: `ads:create:${user.id}`, limit: 10, windowMs: 60 * 60 * 1000 });
+  if (!rlAds.ok) return NextResponse.json({ errorFa: "تعداد ساخت تبلیغ بیش از حد مجاز است." }, { status: 429 });
 
   let body: unknown;
   try { body = await req.json(); } catch {

@@ -4,12 +4,14 @@
 // Impressions are incremented fire-and-forget (the lib swallows errors). We
 // do NOT block the response on the increment.
 import { NextResponse } from "next/server";
+import { rateLimit } from "@/lib/security/cache";
+import { clientIp } from "@/lib/server/auth";
 import { db } from "@/lib/db";
 import { incrementImpression } from "@/lib/payments/advertising";
 
 type Params = { params: Promise<{ placement: string }> };
 
-export async function GET(_req: Request, { params }: Params) {
+export async function GET(req: Request, { params }: Params) {
   const { placement } = await params;
   if (!placement || placement.length > 60) {
     return NextResponse.json({ campaigns: [] });
@@ -36,7 +38,12 @@ export async function GET(_req: Request, { params }: Params) {
     take: isSlider ? 1 : 10,
   });
   // Fire-and-forget impressions. The lib already swallows errors so this is safe.
+  // ROOT-CAUSE FIX (audit — metric inflation): impressions are throttled
+  // per IP+placement so scripted GET loops cannot inflate counters.
+  const ip = clientIp(req);
   for (const r of rows) {
+    const rl = await rateLimit({ key: `ad:imp:${r.id}:${ip}`, limit: 10, windowMs: 60 * 60 * 1000 });
+    if (!rl.ok) continue;
     void incrementImpression(r.id);
   }
   return NextResponse.json({
