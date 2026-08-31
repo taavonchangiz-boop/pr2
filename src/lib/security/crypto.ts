@@ -168,6 +168,31 @@ export function verifyJwt(token: string): JwtPayload | null {
 }
 
 // ---------------------------------------------------------------------
+// Signed short-lived media URLs (audit §21 — provider media access)
+// ---------------------------------------------------------------------
+// Providers (Telegram/Bale) fetch published media by URL. The media
+// route is session-gated (as it must stay), so the worker embeds a
+// short-lived HMAC token scoped to ONE media id: `?exp=<unix>&sig=<hmac>`.
+// The token is NOT permanent, NOT guessable, expires quickly, and grants
+// read access to that single media record only.
+export function signMediaUrlToken(mediaId: string, ttlSec: number = 10 * 60): {
+  exp: number;
+  sig: string;
+} {
+  const exp = Math.floor(Date.now() / 1000) + Math.max(30, ttlSec);
+  const sig = hmacSign("media-url", `${mediaId}:${exp}`);
+  return { exp, sig };
+}
+
+export function verifyMediaUrlToken(mediaId: string, exp: string | null, sig: string | null): boolean {
+  if (!exp || !sig) return false;
+  const expNum = Number.parseInt(exp, 10);
+  if (!Number.isFinite(expNum)) return false;
+  if (expNum * 1000 < Date.now()) return false;
+  return hmacVerify("media-url", `${mediaId}:${expNum}`, sig);
+}
+
+// ---------------------------------------------------------------------
 // CryptoJS-backed helpers (used by client where Node crypto not available)
 // ---------------------------------------------------------------------
 export function sha256Hex(input: string): string {

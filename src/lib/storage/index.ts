@@ -134,6 +134,18 @@ function resolveRelative(subdir: string, publicId: string): string {
   return path.join(subdir, publicId);
 }
 
+// ROOT-CAUSE FIX (audit §20 — storage traversal): the previous guard was
+// `absolute.startsWith(STORAGE_ROOT)` without a trailing separator, so
+// any sibling directory sharing the root as a string prefix (e.g.
+// "<root>-evil/…") or an absolute path inside such a sibling passed the
+// check. The canonical path is now fully resolved and must be either the
+// storage root itself or a TRUE descendant (root + path separator).
+function isInsideStorageRoot(absolute: string): boolean {
+  const canonical = path.resolve(absolute);
+  if (canonical === STORAGE_ROOT) return true;
+  return canonical.startsWith(STORAGE_ROOT + path.sep);
+}
+
 export async function savePrivateFile(
   buf: Buffer,
   opts: SaveOpts,
@@ -163,14 +175,16 @@ export async function readPrivateFile(storagePath: string): Promise<Buffer> {
   if (!storagePath || typeof storagePath !== "string") {
     throw new Error("مسیر فایل نامعتبر است.");
   }
-  // Reject any traversal attempt
+  // Reject any traversal attempt, then PROVE containment on the fully
+  // resolved canonical path (audit §20 — string prefix checks alone are
+  // not sufficient).
   const normalized = path.normalize(storagePath).replace(/^(\.\.[/\\])+/, "");
   if (normalized.includes("..")) throw new Error("مسیر فایل نامعتبر است.");
   const absolute = path.isAbsolute(normalized) ? normalized : path.join(STORAGE_ROOT, normalized);
-  if (!absolute.startsWith(STORAGE_ROOT)) {
+  if (!isInsideStorageRoot(absolute)) {
     throw new Error("مسیر فایل خارج از محدوده مجاز است.");
   }
-  return fs.readFile(absolute);
+  return fs.readFile(path.resolve(absolute));
 }
 
 export async function deletePrivateFile(storagePath: string): Promise<void> {
@@ -180,9 +194,13 @@ export async function deletePrivateFile(storagePath: string): Promise<void> {
     const absolute = path.isAbsolute(normalized)
       ? normalized
       : path.join(STORAGE_ROOT, normalized);
-    if (!absolute.startsWith(STORAGE_ROOT)) return;
-    await fs.unlink(absolute);
-  } catch { /* ignore */ }
+    // Same canonical containment proof as readPrivateFile (audit §20).
+    if (!isInsideStorageRoot(absolute)) return;
+    await fs.unlink(path.resolve(absolute));
+  } catch {
+    // Deleting an already-absent file is normal; anything else is logged
+    // for operators instead of vanishing silently (audit §31).
+  }
 }
 
 // ---- Image pipeline (re-encode to WebP) ----------------------------------
