@@ -91,8 +91,14 @@ export async function POST(
       windowMs: RATE_LIMIT_WINDOW_MS,
     });
     if (!rl.ok) {
-      // Wait out the remainder of the window — 1 sec.
-      await new Promise<void>((res) => setTimeout(res, RATE_LIMIT_WINDOW_MS));
+      // ROOT-CAUSE FIX (audit — slowloris): the previous handling SLEPT
+      // inside the request for the whole window, letting one broadcast
+      // pin a Node worker for up to ~100s. Reject with 429 instead; the
+      // client can retry with backoff.
+      return NextResponse.json(
+        { errorFa: "تعداد ارسال بیش از حد مجاز است. چند لحظه بعد تلاش کنید." },
+        { status: 429 },
+      );
     }
     const result = await provider.publishMessage({
       botToken,

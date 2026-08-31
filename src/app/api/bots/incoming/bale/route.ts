@@ -16,7 +16,6 @@
 //   5. Idempotent on update_id.
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { cache } from "@/lib/security/cache";
 import { constantTimeEqual } from "@/lib/security/crypto";
 import {
   verifyWebhookSig,
@@ -25,6 +24,7 @@ import {
 import { executeWorkflow, processBaleUpdate } from "@/lib/bots/workflow";
 import { audit } from "@/lib/server/auth";
 import type { BotWorkflow } from "@prisma/client";
+import { webhookRequestGuard, claimUpdateOnce } from "@/lib/bots/webhook-guard";
 
 interface BaleUpdate {
   update_id: number;
@@ -62,6 +62,11 @@ interface BaleUpdate {
 }
 
 export async function POST(req: Request) {
+  // Hardening (audit W1): per-IP rate limit + body size cap BEFORE any
+  // DB/HMAC work (same rationale as the Telegram webhook).
+  const guard = await webhookRequestGuard(req);
+  if (guard) return guard;
+
   const url = new URL(req.url);
   const bid = url.searchParams.get("bid") ?? "";
   const sig = url.searchParams.get("sig") ?? "";
@@ -101,14 +106,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, errorFa: "بدنه وب‌هوک نامعتبر است." }, { status: 400 });
   }
 
-  // Idempotency at the handler level.
+  // Idempotency at the handler level (atomic claim — audit W2).
   const updateId = update.update_id;
-  const dedupKey = `bot:upd:${bot.id}:${bot.provider}:${String(updateId)}`;
-  const dupFlag = await cache.get<boolean>(dedupKey);
-  if (dupFlag === true) {
+  const firstDelivery = await claimUpdateOnce(bot.id, bot.provider, String(updateId));
+  if (!firstDelivery) {
     return NextResponse.json({ ok: true, duplicate: true });
   }
-  await cache.set(dedupKey, true, 24 * 60 * 60 * 1000);
 
   // Payment branch — delegate to processBaleUpdate.
   if (update.pre_checkout_query || update.message?.successful_payment) {

@@ -138,9 +138,11 @@ export async function POST(req: Request) {
     });
     return NextResponse.json({ ok: true, bot: { ...bot, tokenPreview: maskToken(botToken) } }, { status: 201 });
   } catch (err) {
-    return NextResponse.json(
-      { errorFa: (err as Error)?.message ?? "ایجاد ربات ناموفق بود." },
-      { status: 400 },
-    );
+    // Generic client message; raw provider/Prisma text stays server-side.
+    console.error("bot create failed:", err instanceof Error ? err.message : err);
+    const msg = err instanceof Error && err.name === "AuthError"
+      ? err.message
+      : "ایجاد ربات ناموفق بود.";
+    return NextResponse.json({ errorFa: msg }, { status: 400 });
   }
 }

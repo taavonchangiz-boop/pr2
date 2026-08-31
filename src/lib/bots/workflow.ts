@@ -24,7 +24,7 @@
 // =====================================================================
 import { db } from "@/lib/db";
 import { cache } from "@/lib/security/cache";
-import { decryptString } from "@/lib/security/crypto";
+import { decryptString, hashToken } from "@/lib/security/crypto";
 import { audit, safeJsonParse, AuthError } from "@/lib/server/auth";
 import { sanitizeRaw } from "@/lib/providers/util";
 import { getDestinationProvider, isValidProviderName } from "@/lib/providers";
@@ -600,7 +600,7 @@ async function performAction(
       if (!prompt) {
         return { outboundText: "پرامپت خالی است." };
       }
-      const idemKey = `bot:ai:${args.linkedUserId}:${args.ctx.bot.id}:${args.ctx.workflow.id}:${prompt.slice(0, 64)}`;
+      const idemKey = `bot:ai:${args.linkedUserId}:${args.ctx.bot.id}:${args.ctx.workflow.id}:${hashToken(prompt).slice(0, 32)}`;
       try {
         const r = await dispatchAi({
           userId: args.linkedUserId,

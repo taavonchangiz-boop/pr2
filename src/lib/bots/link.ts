@@ -79,7 +79,7 @@ function buildPayload(botId: string, userId: string | null, expiresAt: Date, non
 // ---------------------------------------------------------------------
 // generateLinkCode — issues a fresh single-use code
 // ---------------------------------------------------------------------
-export async function generateLinkCode(input: {
+async function generateLinkCodeImpl(input: {
   botId: string;
   userId: string;
 }): Promise<{ code: string; expiresAt: Date; linkCodeId: string }> {
@@ -136,10 +136,36 @@ export async function generateLinkCode(input: {
     // Hash collision (extremely unlikely) → retry once
     const msg = (err as { code?: string; message?: string })?.message ?? "";
     if (/unique|UNIQUE|constraint/i.test(msg)) {
-      return generateLinkCode(input);
+      return generateLinkCodeImpl(input);
     }
     throw err;
   }
+}
+
+/**
+ * Public entry with a BOUNDED retry (audit L1): hash collisions retry at
+ * most 3 times. The previous implementation recursed without any depth
+ * cap — an unexpected repeated-unique failure could recurse unboundedly.
+ */
+export async function generateLinkCode(input: {
+  userId: string;
+  botId: string;
+  destinationId?: string;
+}): Promise<{ code: string; expiresAt: Date; linkCodeId: string }> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await generateLinkCodeImpl(input);
+    } catch (err) {
+      const msg = (err as { code?: string; message?: string })?.message ?? "";
+      if (/unique|UNIQUE|constraint/i.test(msg)) {
+        lastErr = err;
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr ?? new Error("کد اتصال قابل تولید نیست.");
 }
 
 // ---------------------------------------------------------------------

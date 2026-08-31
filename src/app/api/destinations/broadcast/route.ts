@@ -74,7 +74,14 @@ export async function POST(req: Request) {
       windowMs: RATE_LIMIT_WINDOW_MS,
     });
     if (!rl.ok) {
-      await new Promise<void>((res) => setTimeout(res, RATE_LIMIT_WINDOW_MS));
+      // ROOT-CAUSE FIX (audit — slowloris): the previous rate-limit
+      // handling SLEPT for the whole window inside the request, letting a
+      // single broadcast hold a Node worker for ~100s. Reject with 429
+      // instead (same as the inbox reply route).
+      return NextResponse.json(
+        { errorFa: "تعداد ارسال گروهی بیش از حد مجاز است. چند لحظه بعد تلاش کنید." },
+        { status: 429 },
+      );
     }
     if (!isValidProviderName(d.provider)) {
       failed++;

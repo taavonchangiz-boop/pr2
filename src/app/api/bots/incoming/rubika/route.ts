@@ -18,10 +18,10 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
-import { cache } from "@/lib/security/cache";
 import { decryptString } from "@/lib/security/crypto";
 import { requireCronSecret } from "@/lib/server/cron-secret";
 import { audit } from "@/lib/server/auth";
+import { claimUpdateOnce } from "@/lib/bots/webhook-guard";
 import { executeWorkflow } from "@/lib/bots/workflow";
 import type { BotWorkflow } from "@prisma/client";
 
@@ -129,11 +129,15 @@ export async function POST(req: Request) {
     const uid = typeof update.update_id === "number" ? update.update_id :
       typeof update.update_id === "string" ? Number(update.update_id) : 0;
     if (Number.isFinite(uid) && uid > lastUpdateId) lastUpdateId = uid;
-    // Idempotency
-    const dedupKey = `bot:upd:${bot.id}:rubika:${String(uid || "")}`;
-    const dupFlag = await cache.get<boolean>(dedupKey);
-    if (dupFlag === true) continue;
-    await cache.set(dedupKey, true, 24 * 60 * 60 * 1000);
+    // Idempotency (atomic claim — audit W2). Updates without a usable
+    // update_id are NOT deduped onto one shared key anymore (audit W3 —
+    // they used to collapse onto a single key and be silently dropped).
+    if (!Number.isFinite(uid) || uid === 0) {
+      // no dedup key available — process without dedup
+    } else {
+      const firstDelivery = await claimUpdateOnce(bot.id, "rubika", String(uid));
+      if (!firstDelivery) continue;
+    }
 
     // Extract chat + text
     let chatId = "";

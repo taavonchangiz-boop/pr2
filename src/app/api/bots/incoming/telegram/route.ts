@@ -17,7 +17,6 @@
 //      `_update_id` for forensic recovery).
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { cache } from "@/lib/security/cache";
 import {
   hmacSign,
   constantTimeEqual,
@@ -27,6 +26,7 @@ import {
   verifyTelegramSecretToken,
   computeWebhookBodySignature,
 } from "@/lib/bots/register-webhook";
+import { webhookRequestGuard, claimUpdateOnce } from "@/lib/bots/webhook-guard";
 import { executeWorkflow } from "@/lib/bots/workflow";
 import { audit } from "@/lib/server/auth";
 import type { Bot, BotWorkflow } from "@prisma/client";
@@ -54,6 +54,12 @@ interface TgUpdate {
 }
 
 export async function POST(req: Request) {
+  // Hardening (audit W1): per-IP rate limit + body size cap BEFORE any
+  // DB/HMAC work — the webhook URL is public and its identifiers are not
+  // secrets from someone who has seen it.
+  const guard = await webhookRequestGuard(req);
+  if (guard) return guard;
+
   const url = new URL(req.url);
   const bid = url.searchParams.get("bid") ?? "";
   const sig = url.searchParams.get("sig") ?? "";
@@ -112,16 +118,16 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, errorFa: "بدنه وب‌هوک نامعتبر است." }, { status: 400 });
   }
 
-  // Idempotency at the handler level (24h cache). The workflow engine
-  // ALSO has its own dedup — but we check early to skip workflow loading.
+  // Idempotency at the handler level (24h, ATOMIC claim — audit W2).
+  // The workflow engine ALSO has its own dedup — but we check early to
+  // skip workflow loading. The old get-then-set dedup allowed two
+  // concurrent deliveries of the same update_id to both run workflows.
   const updateId = update.update_id;
-  const dedupKey = `bot:upd:${bot.id}:${bot.provider}:${String(updateId)}`;
-  const dupFlag = await cache.get<boolean>(dedupKey);
-  if (dupFlag === true) {
+  const firstDelivery = await claimUpdateOnce(bot.id, bot.provider, String(updateId));
+  if (!firstDelivery) {
     // Already processed — ack 200 so Telegram doesn't retry.
     return NextResponse.json({ ok: true, duplicate: true });
   }
-  await cache.set(dedupKey, true, 24 * 60 * 60 * 1000);
 
   // Extract chat id + incoming text
   let chatId = "";
