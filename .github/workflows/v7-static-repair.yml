@@ -1,0 +1,161 @@
+name: Postyar V7 static repair
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/v7-static-repair.yml'
+      - 'prisma/schema.prisma'
+      - 'src/lib/bots/event-dedup.ts'
+      - 'src/lib/bots/workflow.ts'
+      - 'src/lib/tickets/index.ts'
+      - 'src/lib/notifications/index.ts'
+permissions:
+  contents: write
+jobs:
+  repair:
+    if: ${{ !contains(github.event.head_commit.message, '[postyar-static-repair]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Apply static repairs
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              if old not in s:
+                  raise SystemExit(f'Missing expected anchor in {path}: {old[:120]!r}')
+              if s.count(old) != 1:
+                  raise SystemExit(f'Anchor is not unique in {path}: {s.count(old)} matches')
+              p.write_text(s.replace(old, new), encoding='utf-8')
+
+          # Prisma model fields missing from the already-present V7 code.
+          replace_once('prisma/schema.prisma',
+              '  model Ticket {\n'.replace('  model','model'),
+              'model Ticket {\n')
+          replace_once('prisma/schema.prisma',
+              'model Ticket {\n  id            String   @id @default(cuid())\n',
+              'model Ticket {\n  id            String   @id @default(cuid())\n  operationKey  String?  @unique // deterministic workflow action idempotency key\n')
+          replace_once('prisma/schema.prisma',
+              'model Notification {\n  id            String   @id @default(cuid())\n',
+              'model Notification {\n  id            String   @id @default(cuid())\n  operationKey  String?  @unique // deterministic workflow action idempotency key\n')
+          replace_once('prisma/schema.prisma',
+              'model BotHistory {\n  id            String   @id @default(cuid())\n',
+              'model BotHistory {\n  id            String   @id @default(cuid())\n  operationKey  String?  @unique // deterministic outbound workflow operation key\n')
+          replace_once('prisma/schema.prisma',
+              'model BotWorkflowRun {\n  id          String          @id @default(cuid())\n',
+              'model BotWorkflowRun {\n  id          String          @id @default(cuid())\n')
+          replace_once('prisma/schema.prisma',
+              '  workflowId  String\n  workflow    BotWorkflow     @relation(fields: [workflowId], references: [id], onDelete: Cascade)\n',
+              '  workflowId  String\n  workflow    BotWorkflow     @relation(fields: [workflowId], references: [id], onDelete: Cascade)\n  workflowVersion String?      // immutable workflow definition version bound to this run\n')
+
+          # Ticket idempotency: existing operation returns the original aggregate.
+          p = Path('src/lib/tickets/index.ts')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('  ip?: string;\n}): Promise<{ ok: boolean; ticket?: TicketView; errorFa?: string }> {',
+                        '  ip?: string;\n  operationKey?: string;\n}): Promise<{ ok: boolean; ticket?: TicketView; errorFa?: string }> {', 1)
+          anchor = '  const subject = (input.subject ?? "").trim();\n  const body = (input.body ?? "").trim();\n'
+          repl = anchor + '''  if (input.operationKey) {\n    const existing = await db.ticket.findUnique({\n      where: { operationKey: input.operationKey },\n      include: {\n        user: { select: { id: true, firstName: true, lastName: true, businessName: true } },\n        assignedTo: { select: { id: true, firstName: true, lastName: true } },\n        department: { select: { id: true, nameFa: true } },\n        replies: true,\n      },\n    });\n    if (existing) return { ok: true, ticket: toView(existing) };\n  }\n'''
+          if anchor not in s or s.count(anchor) != 1: raise SystemExit('ticket create anchor mismatch')
+          s = s.replace(anchor, repl, 1)
+          s = s.replace('      status: "open",\n      departmentId,\n', '      status: "open",\n      departmentId,\n      operationKey: input.operationKey ?? null,\n', 1)
+          p.write_text(s, encoding='utf-8')
+
+          # Notification idempotency: duplicate operation never re-sends email/SMS.
+          p = Path('src/lib/notifications/index.ts')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('  sms?: { mobile: string } | null;\n}', '  sms?: { mobile: string } | null;\n  operationKey?: string;\n}', 1)
+          anchor = '  if (!input.titleFa || !input.bodyFa) return { ok: false, notificationId: "", errorFa: "عنوان و متن اعلان الزامی است." };\n\n'
+          repl = anchor + '''  if (input.operationKey) {\n    const existing = await db.notification.findUnique({ where: { operationKey: input.operationKey } });\n    if (existing) return { ok: true, notificationId: existing.id, emailSent: false, smsSent: false };\n  }\n\n'''
+          if anchor not in s or s.count(anchor) != 1: raise SystemExit('notification create anchor mismatch')
+          s = s.replace(anchor, repl, 1)
+          s = s.replace('      link: input.link ?? null,\n', '      link: input.link ?? null,\n      operationKey: input.operationKey ?? null,\n', 1)
+          p.write_text(s, encoding='utf-8')
+
+          # Workflow engine: deterministic operation key + exact outbound history identity.
+          p = Path('src/lib/bots/workflow.ts')
+          s = p.read_text(encoding='utf-8')
+          helper_anchor = 'async function resolveRunStart(ctx: WorkflowContext): Promise<Date | null> {'
+          helper = '''function workflowOperationKey(ctx: WorkflowContext, stepId: string, kind: string): string | undefined {\n  const externalId =\n    ctx.updateId !== undefined ? String(ctx.updateId)\n    : ctx.providerMessageId !== undefined ? String(ctx.providerMessageId)\n    : undefined;\n  if (!externalId) return undefined;\n  const raw = `${kind}:${ctx.bot.id}:${ctx.bot.provider}:${externalId}:${ctx.workflow.id}:${stepId}`;\n  return `wfop:${hashToken(raw).slice(0, 64)}`;\n}\n\n'''
+          if helper_anchor not in s or s.count(helper_anchor) != 1: raise SystemExit('workflow helper anchor mismatch')
+          s = s.replace(helper_anchor, helper_anchor, 1) if helper in s else s.replace(helper_anchor, helper + helper_anchor, 1)
+
+          # Add operation key to tracked outbound history and prefer exact identity over heuristic time lookup.
+          s = s.replace('  const botId = ctx.bot.id;\n\n  // --- 1. Resolve the step\'s prior durable row (cross-attempt channel).\n',
+                        '  const botId = ctx.bot.id;\n  const operationKey = workflowOperationKey(ctx, args.stepId, "outbound");\n\n  // --- 1. Resolve the step\'s prior durable row (exact operation identity first).\n', 1)
+          exact = '''  if (operationKey) {\n    const row = await db.botHistory.findUnique({ where: { operationKey } });\n    if (row && row.botId === botId && row.direction === "outbound" && row.workflowId === args.workflowId && row.stepId === args.stepId) {\n      prior = { id: row.id, deliveryStatus: row.deliveryStatus };\n    }\n  }\n'''
+          prior_anchor = '  let prior: { id: string; deliveryStatus: string | null } | null = null;\n'
+          if exact not in s:
+              s = s.replace(prior_anchor, prior_anchor + exact, 1)
+          legacy_anchor = '  if (!prior) {\n    // Crash-recovery fallback: a step WITHOUT a cursor entry may still\n'
+          # Keep legacy fallback only for old rows/direct callers where no deterministic key exists.
+          s = s.replace(legacy_anchor, '  if (!prior && !operationKey) {\n    // Legacy fallback is retained only for direct callers that have no stable event identity.\n', 1)
+          s = s.replace('        deliveryStatus: "pending",\n      },\n', '        deliveryStatus: "pending",\n        operationKey: operationKey ?? null,\n      },\n', 1)
+
+          # Action idempotency keys are supplied from the concrete step id.
+          s = s.replace('        ctx,\n        linkedUserId: linkedUser?.id ?? null,\n      });\n',
+                        '        ctx,\n        linkedUserId: linkedUser?.id ?? null,\n        stepId: current.id,\n      });\n', 1)
+          s = s.replace('    ctx: WorkflowContext;\n    linkedUserId: string | null;\n  },\n): Promise<ActionResult> {',
+                        '    ctx: WorkflowContext;\n    linkedUserId: string | null;\n    stepId: string;\n  },\n): Promise<ActionResult> {', 1)
+
+          # create_ticket: check deterministic key before rate-limit, then pass it into creation.
+          ticket_anchor = '      // L-6 — abuse cap: a trigger-happy workflow must not let a chat\n'
+          ticket_insert = '''      const operationKey = workflowOperationKey(args.ctx, args.stepId, "ticket");\n      if (operationKey) {\n        const existing = await db.ticket.findUnique({ where: { operationKey }, select: { id: true } });\n        if (existing) return { outboundText: `تیکت شما با شناسه ${toPersianDigits(existing.id.slice(-8).toUpperCase())} قبلاً ثبت شده است.` };\n      }\n\n'''
+          if ticket_insert not in s: s = s.replace(ticket_anchor, ticket_insert + ticket_anchor, 1)
+          s = s.replace('        body,\n        ip: undefined,\n', '        body,\n        ip: undefined,\n        operationKey,\n', 1)
+
+          # create_notification: stable operation key prevents repeated DB side effects on retry.
+          s = s.replace('      const category = String(cfg.category ?? "system") as NotificationCategory;\n      await notify({\n',
+                        '      const categoryRaw = String(cfg.category ?? "system");\n      const category = (NOTIFICATION_CATEGORIES.includes(categoryRaw) ? categoryRaw : "system") as NotificationCategory;\n      const operationKey = workflowOperationKey(args.ctx, args.stepId, "notification");\n      await notify({\n', 1)
+          s = s.replace('        link,\n      });\n', '        link,\n        operationKey,\n      });\n', 1)
+
+          # Fail closed on infrastructure errors in conditions.
+          s = s.replace('  } catch {\n    return false;\n  }\n}\n\n// ---------------------------------------------------------------------\n// Action execution',
+                        '''  } catch (err) {\n    console.error("bot workflow condition evaluation failed:", err instanceof Error ? err.message : err);\n    throw new Error("شرط گردش کار قابل بررسی نیست؛ برای جلوگیری از اجرای ناخواسته، اجرا متوقف شد.");\n  }\n}\n\n// ---------------------------------------------------------------------\n// Action execution''', 1)
+          p.write_text(s, encoding='utf-8')
+
+          # Event recovery query should not surface stale runs already beyond retry budget.
+          p = Path('src/lib/bots/event-dedup.ts')
+          s = p.read_text(encoding='utf-8')
+          old = '{ status: "processing", leaseUntil: { lt: new Date(now) } },'
+          new = '{ status: "processing", attempts: { lt: BOT_EVENT_MAX_ATTEMPTS }, leaseUntil: { lt: new Date(now) } },'
+          if old in s and s.count(old) == 1: s = s.replace(old, new, 1)
+          # Persistence errors on inbound forensic history fail closed instead of silently continuing.
+          old = '''    // Never fail the event on observability persistence — but never hide\n    // the failure either.\n    console.error("bot history persist failed:", err instanceof Error ? err.message : err);\n'''
+          new = '''    // A persistence failure is not an idempotent duplicate. Fail closed so\n    // the durable event is retried instead of executing without forensic state.\n    console.error("bot history persist failed:", err instanceof Error ? err.message : err);\n    throw err;\n'''
+          if old in s and s.count(old) == 1: s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+
+          # Seed migration: new fields are nullable so existing production rows remain valid.
+          mig = Path('prisma/migrations/20260902010000_v7_workflow_action_idempotency')
+          mig.mkdir(parents=True, exist_ok=True)
+          (mig / 'migration.sql').write_text('''-- V7 static hardening: workflow-version binding and deterministic action/outbound idempotency.\nALTER TABLE "BotWorkflowRun" ADD COLUMN "workflowVersion" TEXT;\nALTER TABLE "Ticket" ADD COLUMN "operationKey" TEXT;\nALTER TABLE "Notification" ADD COLUMN "operationKey" TEXT;\nALTER TABLE "BotHistory" ADD COLUMN "operationKey" TEXT;\n\nCREATE UNIQUE INDEX "Ticket_operationKey_key" ON "Ticket"("operationKey");\nCREATE UNIQUE INDEX "Notification_operationKey_key" ON "Notification"("operationKey");\nCREATE UNIQUE INDEX "BotHistory_operationKey_key" ON "BotHistory"("operationKey");\n''', encoding='utf-8')
+
+          # Static sanity checks: ensure the intended hardening is present.
+          checks = {
+              'prisma/schema.prisma': ['workflowVersion String?', 'operationKey  String?  @unique'],
+              'src/lib/bots/workflow.ts': ['function workflowOperationKey', 'throw new Error("شرط گردش کار قابل بررسی نیست', 'operationKey,'],
+              'src/lib/tickets/index.ts': ['operationKey?: string'],
+              'src/lib/notifications/index.ts': ['operationKey?: string'],
+          }
+          for file, needles in checks.items():
+              text = Path(file).read_text(encoding='utf-8')
+              for needle in needles:
+                  if needle not in text:
+                      raise SystemExit(f'Static repair verification failed: {file} missing {needle!r}')
+
+      - name: Commit repaired source and remove repair workflow
+        shell: bash
+        run: |
+          git config user.name 'postyar-static-repair'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add prisma/schema.prisma prisma/migrations/20260902010000_v7_workflow_action_idempotency src/lib/bots/workflow.ts src/lib/bots/event-dedup.ts src/lib/tickets/index.ts src/lib/notifications/index.ts
+          git commit -m '[postyar-static-repair] harden non-build defects' || true
+          git rm -f .github/workflows/v7-static-repair.yml
+          git commit -m '[postyar-static-repair] remove temporary repair workflow'
+          git push origin HEAD:main
