@@ -6,6 +6,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { requireUser, clientIp, audit, safeJsonParse, AuthError } from "@/lib/server/auth";
+import { requirePlanFeature } from "@/lib/payments/plans";
 import { formatJalaliDateTime } from "@/lib/persian";
 import type { AutoResponderConfig, AutoResponderRule } from "@/components/postyar/api";
 
@@ -72,6 +73,14 @@ export async function PATCH(req: Request) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   const ip = clientIp(req);
+  // P0.15/H-1 — auto-responder is a plan feature.
+  try {
+    await requirePlanFeature(user.id, "autoResponder");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    const msg = e instanceof AuthError ? e.message : "امکان پاسخگوی خودکار در پلن فعلی شما فعال نیست.";
+    return NextResponse.json({ errorFa: msg }, { status });
+  }
   let body: unknown;
   try { body = await req.json(); } catch {
     return NextResponse.json({ errorFa: "بدنه درخواست نامعتبر است." }, { status: 400 });

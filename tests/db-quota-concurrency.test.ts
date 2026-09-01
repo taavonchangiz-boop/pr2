@@ -63,6 +63,7 @@ describe("quota engine: getQuotaState + requireQuota + incrementQuotaUsage (DB-b
       priceRials: 200_000,
       intervalMonths: 1,
       active: true,
+      isPublic: true, // C-08: order creation tests exercise the public purchase path
     });
     planId = p.id;
   });

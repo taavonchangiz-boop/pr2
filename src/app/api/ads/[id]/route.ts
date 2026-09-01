@@ -67,9 +67,38 @@ export async function PATCH(req: Request, { params }: Params) {
   if (parsed.data.title) data.title = parsed.data.title.slice(0, 200);
   if (parsed.data.descriptionFa !== undefined) data.descriptionFa = parsed.data.descriptionFa.slice(0, 1000);
   if (parsed.data.link !== undefined) data.link = parsed.data.link.slice(0, 500);
-  if (parsed.data.placement) data.placement = parsed.data.placement.slice(0, 40);
-  if (parsed.data.startAt !== undefined) data.startAt = parsed.data.startAt ? new Date(parsed.data.startAt) : null;
-  if (parsed.data.endAt !== undefined) data.endAt = parsed.data.endAt ? new Date(parsed.data.endAt) : null;
+  // L-2/L-13: placement must reference a REAL admin-defined AdPlacement
+  // (create enforces this; update must too) and dates must be valid and
+  // ordered — otherwise Prisma/FK failures surface as raw 500s.
+  if (parsed.data.placement) {
+    const placementKey = parsed.data.placement.slice(0, 40);
+    const exists = await db.adPlacement.findUnique({ where: { key: placementKey }, select: { key: true } });
+    if (!exists) {
+      return NextResponse.json({ errorFa: "جایگاه تبلیغ معتبر نیست." }, { status: 400 });
+    }
+    data.placement = placementKey;
+  }
+  if (parsed.data.startAt !== undefined) {
+    if (!parsed.data.startAt) { data.startAt = null; }
+    else {
+      const d = new Date(parsed.data.startAt);
+      if (Number.isNaN(d.getTime())) return NextResponse.json({ errorFa: "تاریخ شروع نامعتبر است." }, { status: 400 });
+      data.startAt = d;
+    }
+  }
+  if (parsed.data.endAt !== undefined) {
+    if (!parsed.data.endAt) { data.endAt = null; }
+    else {
+      const d = new Date(parsed.data.endAt);
+      if (Number.isNaN(d.getTime())) return NextResponse.json({ errorFa: "تاریخ پایان نامعتبر است." }, { status: 400 });
+      data.endAt = d;
+    }
+  }
+  const startD = data.startAt !== undefined ? (data.startAt as Date | null) : ad.startAt;
+  const endD = data.endAt !== undefined ? (data.endAt as Date | null) : ad.endAt;
+  if (startD && endD && endD.getTime() < startD.getTime()) {
+    return NextResponse.json({ errorFa: "تاریخ پایان نمی‌تواند قبل از تاریخ شروع باشد." }, { status: 400 });
+  }
   // Image update handled separately by re-upload flow — skip for now
   if (Object.keys(data).length === 0) {
     return NextResponse.json({ errorFa: "هیچ فیلدی برای به‌روزرسانی ارسال نشده است." }, { status: 400 });

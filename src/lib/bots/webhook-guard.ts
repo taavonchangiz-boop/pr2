@@ -34,6 +34,46 @@ export async function webhookRequestGuard(req: Request): Promise<Response | null
 }
 
 /**
+ * M-5: the Content-Length pre-check alone is bypassable (chunked
+ * transfer-encoding or a lying length header). This reader enforces the
+ * same cap on the ACTUAL stream — the connection is dropped as soon as
+ * the accumulated bytes exceed WEBHOOK_MAX_BODY_BYTES, so no route ever
+ * materializes an oversized webhook body in memory.
+ */
+export async function readBoundedWebhookBody(req: Request): Promise<{ ok: true; text: string } | { ok: false; errorFa: string }> {
+  const reader = req.body?.getReader();
+  if (!reader) {
+    // No stream available (should not happen for POST) — fall back to text().
+    try {
+      return { ok: true, text: await req.text() };
+    } catch {
+      return { ok: false, errorFa: "خواندن بدنه درخواست ناموفق بود." };
+    }
+  }
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for (;;) {
+    let chunk: { done: boolean; value?: Uint8Array };
+    try {
+      chunk = await reader.read();
+    } catch {
+      return { ok: false, errorFa: "خواندن بدنه درخواست ناموفق بود." };
+    }
+    if (chunk.done) break;
+    if (chunk.value) {
+      received += chunk.value.byteLength;
+      if (received > WEBHOOK_MAX_BODY_BYTES) {
+        await reader.cancel().catch(() => undefined);
+        return { ok: false, errorFa: "بدنه وب‌هوک بیش از حد بزرگ است." };
+      }
+      chunks.push(chunk.value);
+    }
+  }
+  const parts = chunks.map((c) => Buffer.from(c));
+  return { ok: true, text: Buffer.concat(parts).toString("utf8") };
+}
+
+/**
  * Atomic first-delivery claim. Returns true when THIS call is the first
  * delivery of the update (and therefore should be processed); false when
  * the update was already claimed (duplicate delivery).

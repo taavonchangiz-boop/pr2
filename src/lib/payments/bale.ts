@@ -32,8 +32,9 @@ import { audit, AuthError } from "@/lib/server/auth";
 import { encryptString, decryptString, randomToken, constantTimeEqual } from "@/lib/security/crypto";
 import { formatRials, toPersianDigits } from "@/lib/persian";
 import { sanitizeRaw } from "@/lib/providers/util";
+import { fetchJsonWithLimit } from "@/lib/security/http";
 import type { PaymentProvider, OrderLike } from "@/lib/payments/engine";
-import { activateSubscription } from "@/lib/payments/plans";
+import { activateSubscription, PAYABLE_STATUSES } from "@/lib/payments/plans";
 import type { Bot } from "@prisma/client";
 
 // ---------------------------------------------------------------------
@@ -53,42 +54,36 @@ async function baleBotCall(botToken: string, method: string, body: Record<string
     return { ok: false, status: 401, errorFa: "توکن ربات تنظیم نشده است." };
   }
   const url = `${BALE_BOT_API_BASE}${botToken}/${method}`;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15_000);
-  try {
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    const text = await r.text();
-    let json: unknown = null;
-    try { json = JSON.parse(text); } catch { json = null; }
-    if (!r.ok) {
-      const j = (json ?? {}) as { description?: string; error_code?: number };
-      return {
-        ok: false,
-        status: r.status,
-        errorFa: normalizeBaleError(r.status, j.description),
-        raw: j,
-      };
+  // Bounded fetch (L-10): hard timeout + response-size cap — a hostile or
+  // misbehaving Bale endpoint cannot over-commit memory. The host is a
+  // fixed vendor endpoint, so the SSRF DNS-pinning layer is not required
+  // here (all user/admin-configurable URLs use pinnedFetchJson).
+  const parsed = await fetchJsonWithLimit<Record<string, unknown>>(url, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify(body),
+    timeoutMs: 15_000,
+    maxBytes: 1024 * 1024,
+  });
+  if (!parsed.ok) {
+    if (parsed.status) {
+      const desc = typeof (parsed as { errorText?: string }).errorText === "string"
+        ? (() => { try { return (JSON.parse((parsed as { errorText: string }).errorText) as { description?: string }).description; } catch { return undefined; } })()
+        : undefined;
+      return { ok: false, status: parsed.status, errorFa: normalizeBaleError(parsed.status, desc) };
     }
-    const j = (json ?? {}) as { ok?: boolean; result?: unknown; description?: string };
-    if (j.ok !== true) {
-      return {
-        ok: false,
-        status: r.status,
-        errorFa: j.description ?? "درخواست ناموفق بود.",
-        raw: j,
-      };
-    }
-    return { ok: true, status: r.status, result: j.result, raw: j };
-  } catch {
     return { ok: false, status: 0, errorFa: "اتصال به سرویس بله ناموفق بود." };
-  } finally {
-    clearTimeout(timeout);
   }
+  const j = parsed.data as { ok?: boolean; result?: unknown; description?: string };
+  if (j.ok !== true) {
+    return {
+      ok: false,
+      status: parsed.status,
+      errorFa: j.description ?? "درخواست ناموفق بود.",
+      raw: j,
+    };
+  }
+  return { ok: true, status: parsed.status, result: j.result, raw: j };
 }
 
 function normalizeBaleError(status: number, description?: string): string {
@@ -129,6 +124,21 @@ export async function baleCreatePaymentRequest(input: {
   providerRef?: string;
   errorFa?: string;
 }> {
+  // H-2: an order that already reached a terminal/paid state can never be
+  // re-invoiced — re-issuing an invoice for a PAID order would either
+  // regress its status (pre-fix behavior) or collect a second payment for
+  // one order. Callers surface the Persian message to the user.
+  {
+    const current = await db.order.findUnique({
+      where: { id: input.order.id },
+      select: { status: true },
+    });
+    if (!current) throw new AuthError("سفارش یافت نشد.", 404);
+    if (!PAYABLE_STATUSES.includes(current.status)) {
+      throw new AuthError("این سفارش قابل پرداخت نیست؛ سفارش تازه‌ای ایجاد کنید.", 400);
+    }
+  }
+
   // 32-byte random secret — stored encrypted, NOT in URL
   const secretToken = randomToken(32); // 64-hex-char string (32 bytes of entropy)
   // Persist BalePaymentRef with the secret encrypted BEFORE calling the API
@@ -184,9 +194,11 @@ export async function baleCreatePaymentRequest(input: {
     currency: "IRR",
   });
   if (!result.ok) {
-    // Mark order failed + audit
-    await db.order.update({
-      where: { id: input.order.id },
+    // CAS-guarded (H-2): only a still-payable order may move to failed —
+    // a duplicate workflow trigger must never regress an already-paid
+    // order's financial state.
+    await db.order.updateMany({
+      where: { id: input.order.id, status: { in: PAYABLE_STATUSES } },
       data: { status: "failed", provider: "bale" },
     });
     await audit({
@@ -199,9 +211,10 @@ export async function baleCreatePaymentRequest(input: {
     });
     return { ok: false, errorFa: result.errorFa };
   }
-  // Update order to awaiting_payment + providerRef (use the order id as ref)
-  await db.order.update({
-    where: { id: input.order.id },
+  // CAS-guarded (H-2): awaiting_payment is only entered from a payable
+  // state — never overwrite paid/awaiting_review/terminal states.
+  await db.order.updateMany({
+    where: { id: input.order.id, status: { in: PAYABLE_STATUSES } },
     data: { status: "awaiting_payment", provider: "bale", providerRef: input.order.id },
   });
 
@@ -393,8 +406,10 @@ export async function processBaleUpdate(bot: Bot, update: BaleUpdate): Promise<{
     // HARD AMOUNT CHECK
     const totalAmount = typeof sp.total_amount === "number" ? sp.total_amount : -1;
     if (totalAmount !== order.amountRials) {
-      await db.order.update({
-        where: { id: order.id },
+      // CAS-guarded: never regress an already-paid order on a mismatched
+      // (or replayed) provider callback.
+      await db.order.updateMany({
+        where: { id: order.id, status: { in: PAYABLE_STATUSES } },
         data: { status: "failed" },
       });
       await audit({

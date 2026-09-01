@@ -9,6 +9,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { requireUser, clientIp, audit, AuthError } from "@/lib/server/auth";
+import { requirePlanFeature, requireFeatureCapacity } from "@/lib/payments/plans";
 import { rateLimit } from "@/lib/security/cache";
 import { toGlassButtonView, assertOwnership } from "@/lib/destinations/helpers";
 
@@ -50,6 +51,18 @@ export async function POST(req: Request, { params }: Params) {
   const owns = await assertOwnership(id, user.id);
   if (!owns) {
     return NextResponse.json({ errorFa: "مقصد یافت نشد." }, { status: 404 });
+  }
+
+  // P0.15/H-1 — server-side feature gate at the action boundary: glass
+  // buttons are plan-gated (free plan has glassButtonsPerDest: 0).
+  try {
+    await requirePlanFeature(user.id, "glassButtons");
+    const perDest = await db.glassButton.count({ where: { destinationId: id } });
+    await requireFeatureCapacity(user.id, "glassButtons", "glassButtonsPerDest", perDest, "دکمه شیشه‌ای");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    const msg = e instanceof AuthError ? e.message : "امکان دکمه شیشه‌ای در پلن فعلی شما فعال نیست.";
+    return NextResponse.json({ errorFa: msg }, { status });
   }
 
   const rl = await rateLimit({

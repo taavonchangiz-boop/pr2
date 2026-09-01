@@ -26,8 +26,8 @@ import {
   verifyTelegramSecretToken,
   computeWebhookBodySignature,
 } from "@/lib/bots/register-webhook";
-import { webhookRequestGuard, claimUpdateOnce } from "@/lib/bots/webhook-guard";
-import { executeWorkflow } from "@/lib/bots/workflow";
+import { webhookRequestGuard, claimUpdateOnce, readBoundedWebhookBody } from "@/lib/bots/webhook-guard";
+import { executeWorkflow, persistInboundOnce } from "@/lib/bots/workflow";
 import { audit } from "@/lib/server/auth";
 import type { Bot, BotWorkflow } from "@prisma/client";
 
@@ -77,8 +77,13 @@ export async function POST(req: Request) {
   if (bot.provider !== "telegram") {
     return NextResponse.json({ ok: false, errorFa: "پروایدر ناهماهنگ است." }, { status: 400 });
   }
-  // Read raw body once — we need it for HMAC.
-  const rawBody = await req.text();
+  // Read raw body once — we need it for HMAC. Streamed read with a hard
+  // byte cap (M-5): a chunked/lying-length body cannot over-commit memory.
+  const bodyRead = await readBoundedWebhookBody(req);
+  if (!bodyRead.ok) {
+    return NextResponse.json({ ok: false, errorFa: bodyRead.errorFa }, { status: 413 });
+  }
+  const rawBody = bodyRead.text;
   // Compute body HMAC keyed by the decrypted webhookSecret.
   const bodySig = await computeWebhookBodySignature(bot, rawBody);
 
@@ -146,6 +151,11 @@ export async function POST(req: Request) {
     // Nothing we can do — but ack so Telegram doesn't retry.
     return NextResponse.json({ ok: true, noChat: true });
   }
+
+  // C-11/C-12: persist the inbound history row ONCE per event (the old
+  // code persisted it inside executeWorkflow — once per matched workflow —
+  // or here when nothing matched, producing duplicate/missing rows).
+  await persistInboundOnce(bot, chatId, incomingText, update, updateId);
 
   // If the incoming text starts with `POSTYAR-`, it's a link-code consumption
   // attempt — verify + consume.
@@ -215,24 +225,6 @@ export async function POST(req: Request) {
         },
       });
     }
-  }
-
-  // If no workflow matched, persist the inbound only (for inbox forensics).
-  if (!matchedAny) {
-    try {
-      await db.botHistory.create({
-        data: {
-          botId: bot.id,
-          direction: "inbound",
-          providerUserId: chatId,
-          text: incomingText.slice(0, 4000),
-          raw: JSON.stringify({
-            _update_id: String(updateId),
-            _payload: { message_id: update.message?.message_id ?? update.callback_query?.message?.message_id },
-          }),
-        },
-      });
-    } catch { /* ignore */ }
   }
 
   // Always 200 so Telegram doesn't retry.

@@ -175,6 +175,7 @@ export async function seedPlan(opts: Partial<{
   priceRials: number;
   intervalMonths: number;
   active: boolean;
+  isPublic: boolean;
 }> = {}): Promise<Plan> {
   const s = uniqSuffix();
   return db.plan.create({
@@ -186,7 +187,10 @@ export async function seedPlan(opts: Partial<{
       intervalMonths: opts.intervalMonths ?? 1,
       quota: JSON.stringify({ publishPerMonth: 10, aiPerMonth: 20, channels: 1, automation: 1 }),
       active: opts.active ?? true,
-      isPublic: false,
+      // C-08: tests default to a NON-public plan (hidden plans are the
+      // stricter case); tests that exercise the ordinary public purchase
+      // path must pass isPublic: true explicitly.
+      isPublic: opts.isPublic ?? false,
     },
   });
 }

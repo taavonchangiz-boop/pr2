@@ -7,6 +7,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { requireUser, clientIp, audit, AuthError, safeJsonParse } from "@/lib/server/auth";
+import { requireFeatureCapacity } from "@/lib/payments/plans";
 import { rateLimit } from "@/lib/security/cache";
 import { isContentStatus } from "@/lib/publishing/state";
 
@@ -93,6 +94,17 @@ export async function POST(req: Request) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   const ip = clientIp(req);
+
+  // P0.15/H-1 — server-side plan capacity: contentItems is a numeric plan
+  // limit; creation is refused when the user's stored content is at cap.
+  try {
+    const currentCount = await db.content.count({ where: { ownerId: user.id } });
+    await requireFeatureCapacity(user.id, "publish", "contentItems", currentCount, "محتوای ذخیره‌شده");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    const msg = e instanceof AuthError ? e.message : "سقف محتوای ذخیره‌شده در پلن فعلی شما تکمیل شده است.";
+    return NextResponse.json({ errorFa: msg }, { status });
+  }
 
   const rl = await rateLimit({ key: `content:create:${user.id}`, limit: 30, windowMs: 60 * 1000 });
   if (!rl.ok) {

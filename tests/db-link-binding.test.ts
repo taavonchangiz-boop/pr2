@@ -23,8 +23,8 @@ async function forgeValidCode(input: { botId: string; userId: string }): Promise
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
   const nonce = crypto.randomBytes(8).toString("hex").slice(0, 6).toUpperCase();
   const payload = `${input.botId}:${input.userId}:${expiresAt.toISOString()}:${nonce}`;
-  const expectedHmac = hmacSign("bot-link-code", payload).slice(0, 8).toUpperCase();
-  const suffix = base32Encode(Buffer.from(expectedHmac, "utf8"), 8);
+  const expectedHmac = hmacSign("bot-link-code", payload).slice(0, 12).toUpperCase();
+  const suffix = base32Encode(Buffer.from(expectedHmac, "utf8"), 12);
   const plaintext = `${LINK_CODE_PREFIX}${nonce}${suffix}`;
   await db.botLinkCode.create({
     data: { botId: input.botId, userId: input.userId, codeHash: hashToken(plaintext), expiresAt },

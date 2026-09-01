@@ -12,6 +12,7 @@
 import { db } from "@/lib/db";
 import { encryptString, decryptString } from "@/lib/security/crypto";
 import { assertSafeOutboundUrl, outboundUrlErrorFa } from "@/lib/security/net-guard";
+import { pinnedFetchJson } from "@/lib/security/http";
 import { audit } from "@/lib/server/auth";
 
 // ---------------------------------------------------------------------
@@ -116,51 +117,40 @@ async function wooFetch<T>(
     return { ok: false, errorFa: outboundUrlErrorFa(e) };
   }
   if (opts.qs) for (const [k, v] of Object.entries(opts.qs)) url.searchParams.set(k, String(v));
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20_000);
-  let res: Response;
-  try {
-    res = await fetch(url.toString(), {
-      method: opts.method ?? "GET",
-      headers: {
-        Authorization: basicAuthHeader(store.consumerKey, store.consumerSecret),
-        Accept: "application/json",
-        ...(opts.body ? { "Content-Type": "application/json" } : {}),
-      },
-      body: opts.body ? JSON.stringify(opts.body) : undefined,
-      signal: controller.signal,
-      // Never follow redirects — an attacker-controlled host could 302
-      // the request to an internal address after validation.
-      redirect: "error",
-    });
-  } catch {
-    clearTimeout(timer);
+  // C-06: the connection is PINNED to the validated public address (SNI
+  // keeps TLS bound to the real hostname) — a rebinding DNS answer can no
+  // longer re-point an approved store URL at an internal target between
+  // validation and connect. No redirects, hard timeout + size cap.
+  const parsed = await pinnedFetchJson<T>(url.toString(), {
+    method: opts.method ?? "GET",
+    headers: {
+      Authorization: basicAuthHeader(store.consumerKey, store.consumerSecret),
+      Accept: "application/json",
+      ...(opts.body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    timeoutMs: 20_000,
+    maxBytes: 2 * 1024 * 1024,
+    allowedPorts: [443],
+  });
+  if (!parsed.ok) {
+    if (parsed.status && parsed.errorText) {
+      try {
+        const j = JSON.parse(parsed.errorText) as { message?: string };
+        if (j.message && typeof j.message === "string" && j.message.length <= 200) {
+          return { ok: false, status: parsed.status, errorFa: `فراخوانی فروشگاه ناموفق بود: ${j.message}` };
+        }
+      } catch {
+        // not JSON — fall through to generic message
+      }
+    }
+    if (parsed.status) {
+      return { ok: false, status: parsed.status, errorFa: `فراخوانی فروشگاه ناموفق بود (کد ${parsed.status}).` };
+    }
     // Generic message only — raw error text is an SSRF/probing oracle.
     return { ok: false, errorFa: "ارتباط با فروشگاه ناموفق بود. آدرس فروشگاه را بررسی کنید." };
   }
-  clearTimeout(timer);
-  if (!res.ok) {
-    let msg = `کد HTTP ${res.status}`;
-    try {
-      const j = (await res.json()) as { message?: string };
-      if (j.message && typeof j.message === "string" && j.message.length <= 200) {
-        // Bound + reflect only the store's own short message (the store
-        // is the user's own registered host — not an internal target,
-        // which the URL guard already rejected).
-        msg = j.message;
-      }
-    } catch {
-      // ignore
-    }
-    return { ok: false, status: res.status, errorFa: `فراخوانی فروشگاه ناموفق بود: ${msg}` };
-  }
-  let data: T;
-  try {
-    data = (await res.json()) as T;
-  } catch {
-    return { ok: false, errorFa: "پاسخ فروشگاه قابل تجزیه نیست." };
-  }
-  return { ok: true, data };
+  return { ok: true, data: parsed.data };
 }
 
 // ---------------------------------------------------------------------

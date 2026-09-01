@@ -10,6 +10,7 @@ import {
   AuthError,
   safeJsonParse,
 } from "@/lib/server/auth";
+import { requirePlanFeature, requireFeatureCapacity } from "@/lib/payments/plans";
 import { validateWorkflowDef } from "@/lib/bots/workflow";
 
 const PatchSchema = z.object({
@@ -80,6 +81,20 @@ export async function PATCH(
       { errorFa: parsed.error.issues[0]?.message ?? "ورودی نامعتبر است." },
       { status: 400 },
     );
+  }
+  // M-4/L-3 — the plan cap must hold at UPDATE time too: a downgraded
+  // owner cannot grow an existing workflow past their current
+  // workflowSteps limit (creation-time checks alone are not authz).
+  if (parsed.data.steps !== undefined) {
+    try {
+      await requirePlanFeature(user.id, "workflow");
+      const stepCount = Array.isArray(parsed.data.steps) ? parsed.data.steps.length : 0;
+      await requireFeatureCapacity(user.id, "workflow", "workflowSteps", stepCount, "گام‌های گردش کار");
+    } catch (e) {
+      const status = e instanceof AuthError ? e.status : 403;
+      const msg = e instanceof AuthError ? e.message : "امکان گردش کار در پلن فعلی شما فعال نیست.";
+      return NextResponse.json({ errorFa: msg }, { status });
+    }
   }
   const data: Record<string, unknown> = {};
   if (parsed.data.name !== undefined) data.name = parsed.data.name;

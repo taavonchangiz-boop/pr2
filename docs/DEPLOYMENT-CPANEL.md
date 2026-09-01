@@ -214,6 +214,7 @@ RewriteRule ^(.*)$ /app.js [L]
    DATABASE_URL=mysql://ACCOUNT_user:PASSWORD@127.0.0.1:3306/ACCOUNT_postyar
    POSTYAR_PUBLIC_URL=https://postyar.example
    POSTYAR_PUBLIC_BASE_URL=https://postyar.example
+   POSTYAR_TRUST_PROXY=1
    POSTYAR_MAX_VIDEO_MB=50
    ```
 

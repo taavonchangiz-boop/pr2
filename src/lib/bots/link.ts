@@ -6,13 +6,23 @@
 // The bot's workflow (START step) checks the linked user; if not
 // linked, the bot prompts the user to enter their link code.
 //
-// Link code shape: `POSTYAR-XXXXXX` (6 base32 chars, no ambiguous
-// chars). The PLAINTEXT code is shown ONCE to the user. The hash
-// (SHA-256) is stored in `BotLinkCode.codeHash` (UNIQUE).
+// Link code shape (C-07 — hardened): `POSTYAR-<nonce(6)><mac(12)>` —
+// 18 Crockford base32 chars = 90 bits of verification entropy. The HMAC
+// suffix binds (botId, userId, expiry, nonce) under a master-derived key
+// so a code cannot be transplanted across bots/accounts; redemption
+// requires presenting the FULL 90-bit plaintext (lookup is by SHA-256 of
+// the plaintext), and online guessing is additionally rate-limited (per
+// provider identity AND per bot — see CONSUME_RATE_LIMIT below). With the
+// per-identity limit of 5 attempts / 10 min, brute-forcing even a single
+// 60-bit MAC would take ~3.8 million years at the allowed attempt rate;
+// the full 90-bit space is astronomically beyond reach.
+//
+// The PLAINTEXT code is shown ONCE to the user. The hash (SHA-256) is
+// stored in `BotLinkCode.codeHash` (UNIQUE).
 //
 // The code's signature is HMAC("bot-link-code", `${botId}:${userId}:${expiryIso}:${nonce}`).
 // The plaintext code embeds the HMAC suffix:
-//   `POSTYAR-<base32(6)><base32(hmacSuffix(8))>`
+//   `POSTYAR-<base32(6)><base32(hmacSuffix(12))>`
 //
 // Verification on consume:
 //   1. Parse the code → nonce + hmac suffix
@@ -35,9 +45,13 @@ import crypto from "node:crypto";
 import type { Prisma } from "@prisma/client";
 
 const LINK_CODE_TTL_MS = 10 * 60 * 1000; // 10 min
-const LINK_CODE_NONCE_LEN = 6; // 6 base32 chars
 const CONSUME_RATE_LIMIT = 5;
 const CONSUME_RATE_WINDOW_MS = 10 * 60 * 1000;
+// C-07: aggregate per-bot redemption budget — bounds total online
+// guessing against ONE bot even when the attacker controls many provider
+// identities (each of which also has its own per-identity limit).
+const CONSUME_BOT_LIMIT = 60;
+const CONSUME_BOT_WINDOW_MS = 10 * 60 * 1000;
 
 // ---------------------------------------------------------------------
 // Base32 (Crockford — no 0/O/1/I/L ambiguity)
@@ -68,12 +82,15 @@ function randomBase32(len: number): string {
 // ---------------------------------------------------------------------
 // Build the plaintext link code + its HMAC suffix
 // ---------------------------------------------------------------------
-// Format: POSTYAR-<6 base32 nonce><8 base32 hmac suffix>
-// Total length: 8 + 6 + 8 = 22 chars.
+// Format: POSTYAR-<6 base32 nonce><12 base32 hmac suffix>
+// Total length: 8 + 6 + 12 = 26 chars.
 export const LINK_CODE_PREFIX = "POSTYAR-";
 const PREFIX = LINK_CODE_PREFIX;
-const NONCE_LEN = 6;
-const HMAC_SUFFIX_LEN = 8;
+// Exported (read-only) for the quantitative security regression test.
+export const LINK_CODE_NONCE_LEN = 6;
+export const LINK_CODE_HMAC_SUFFIX_LEN = 12;
+const NONCE_LEN = LINK_CODE_NONCE_LEN;
+const HMAC_SUFFIX_LEN = LINK_CODE_HMAC_SUFFIX_LEN;
 
 function buildPayload(botId: string, userId: string | null, expiresAt: Date, nonce: string): string {
   return `${botId}:${userId ?? ""}:${expiresAt.toISOString()}:${nonce}`;
@@ -136,12 +153,21 @@ async function generateLinkCodeImpl(input: {
     });
     return { code: plaintext, expiresAt, linkCodeId: row.id };
   } catch (err) {
-    // Hash collision (extremely unlikely) → retry once
+    // Hash collision (extremely unlikely): propagate to the BOUNDED retry
+    // loop in generateLinkCode() — the impl itself must never recurse.
     const msg = (err as { code?: string; message?: string })?.message ?? "";
     if (/unique|UNIQUE|constraint/i.test(msg)) {
-      return generateLinkCodeImpl(input);
+      throw new UniqueCollisionError();
     }
     throw err;
+  }
+}
+
+/** Internal signal for the bounded retry loop in generateLinkCode(). */
+class UniqueCollisionError extends Error {
+  constructor() {
+    super("bot link code hash collision");
+    this.name = "UniqueCollisionError";
   }
 }
 
@@ -160,6 +186,10 @@ export async function generateLinkCode(input: {
     try {
       return await generateLinkCodeImpl(input);
     } catch (err) {
+      if (err instanceof UniqueCollisionError) {
+        lastErr = err;
+        continue;
+      }
       const msg = (err as { code?: string; message?: string })?.message ?? "";
       if (/unique|UNIQUE|constraint/i.test(msg)) {
         lastErr = err;
@@ -183,7 +213,7 @@ export async function consumeLinkCode(input: {
   if (!input.code) return { ok: false, errorFa: "کد اتصال الزامی است." };
   if (!input.providerUserId) return { ok: false, errorFa: "شناسه کاربر در ربات الزامی است." };
 
-  // Rate limit per providerUserId
+  // Rate limit per providerUserId (C-07)
   const rlKey = `bot:link:consume:${input.providerUserId}`;
   const rl = await rateLimit({
     key: rlKey,
@@ -191,6 +221,16 @@ export async function consumeLinkCode(input: {
     windowMs: CONSUME_RATE_WINDOW_MS,
   });
   if (!rl.ok) {
+    return { ok: false, errorFa: "تعداد تلاش بیش از حد مجاز است. ده دقیقه بعد تلاش کنید." };
+  }
+  // Rate limit per bot (C-07): bounds AGGREGATE online guessing per bot
+  // across all provider identities.
+  const rlBot = await rateLimit({
+    key: `bot:link:consume:bot:${input.botId}`,
+    limit: CONSUME_BOT_LIMIT,
+    windowMs: CONSUME_BOT_WINDOW_MS,
+  });
+  if (!rlBot.ok) {
     return { ok: false, errorFa: "تعداد تلاش بیش از حد مجاز است. ده دقیقه بعد تلاش کنید." };
   }
 

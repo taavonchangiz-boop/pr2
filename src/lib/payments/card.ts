@@ -156,7 +156,27 @@ export async function adminApproveCardOrder(input: {
 
   // Idempotency key for the order-paid event
   const idemKey = `card:approve:${order.id}`;
-  // Mark receipt approved atomically with the order status transition
+  // M-3 ROOT-CAUSE FIX — FULFILLMENT BEFORE RECEIPT CAS. The previous
+  // order (receipt CAS first, fulfillment second) let a rejected order be
+  // flipped to receipt=approved by a concurrent approve that had passed
+  // its pre-check, after which activateSubscription refused the non-
+  // payable order and the retry path faked success with nothing
+  // fulfilled. Now:
+  //   1. activateSubscription (the single owner of order→paid + ledger +
+  //      wallet + subscription + referral) runs FIRST — it is internally
+  //      idempotent (orderId-keyed upserts + the per-order subscription
+  //      fulfillment marker) and REJECTS non-payable orders loudly. No
+  //      receipt state is touched unless fulfillment actually succeeded.
+  //   2. Only then is the receipt CAS'd to approved (bounded by the same
+  //      idempotency: a concurrent approve losing this CAS still reports
+  //      the already-fulfilled truth).
+  // A crash between the two steps leaves receipt=rejected + order=paid;
+  // the retry reaches step 1 (idempotent heal) and then completes step 2.
+  const result = await activateSubscription({
+    orderId: order.id,
+    paidRials: order.amountRials,
+    idempotencyKey: idemKey,
+  });
   const receiptUpdate = await db.cardTransferReceipt.updateMany({
     where: { orderId: order.id, status: { not: "approved" } },
     data: {
@@ -167,22 +187,6 @@ export async function adminApproveCardOrder(input: {
     },
   });
   const firstApprove = receiptUpdate.count === 1;
-  if (!firstApprove && order.status === "paid") {
-    // Fully finalized previously — pure idempotent re-entry.
-    return { ok: true, paidRials: order.amountRials };
-  }
-  // ROOT-CAUSE FIX (audit §12): activateSubscription is the single owner
-  // of order→paid + ledger + wallet credit + subscription + referral and
-  // is internally idempotent, so it runs on first approve AND whenever a
-  // previous approve crashed between the receipt CAS above and
-  // fulfillment (receipt approved, order not yet paid). It also rejects
-  // non-payable orders (expired/failed/cancelled) instead of faking
-  // success.
-  const result = await activateSubscription({
-    orderId: order.id,
-    paidRials: order.amountRials,
-    idempotencyKey: idemKey,
-  });
 
   // Notify + audit only on the first approve (no duplicate spam).
   // P0.7.7: notification/audit delivery must never invalidate the financial

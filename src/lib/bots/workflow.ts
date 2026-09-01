@@ -23,14 +23,14 @@
 // authenticating the inbound request.
 // =====================================================================
 import { db } from "@/lib/db";
-import { cache } from "@/lib/security/cache";
+import { cache, rateLimit } from "@/lib/security/cache";
 import { decryptString, hashToken } from "@/lib/security/crypto";
 import { audit, safeJsonParse, AuthError } from "@/lib/server/auth";
 import { sanitizeRaw } from "@/lib/providers/util";
 import { getDestinationProvider, isValidProviderName } from "@/lib/providers";
 import type { GlassButton } from "@/lib/types/glass-button";
 import { formatRials, toPersianDigits, formatJalaliDateTime } from "@/lib/persian";
-import { getActiveSubscription, getQuotaState, createOrderForSubscription } from "@/lib/payments/plans";
+import { getActiveSubscription, getQuotaState, createOrderForSubscription, getEffectiveFeatures, getFeatureBoolean, type PlanBooleanFeatureKey } from "@/lib/payments/plans";
 import { getBalance } from "@/lib/payments/wallet";
 import { processBaleUpdate, baleCreatePaymentRequest } from "@/lib/payments/bale";
 import { dispatchAi } from "@/lib/ai/dispatch";
@@ -153,21 +153,64 @@ export async function findLinkedUser(botId: string, providerUserId: string): Pro
 }
 
 // ---------------------------------------------------------------------
-// Idempotency: dedup by (botId, provider, updateId|providerMessageId)
+// C-11/C-12 — DEDUPLICATION OWNERSHIP
 // ---------------------------------------------------------------------
-function dedupKey(ctx: WorkflowContext): string | null {
-  const id = ctx.updateId ?? ctx.providerMessageId;
-  if (id === undefined || id === null || id === "") return null;
-  return `bot:upd:${ctx.bot.id}:${ctx.bot.provider}:${String(id)}`;
-}
+// The inbound-update deduplication has exactly ONE authoritative owner:
+// the webhook/cron layer that receives the event, via the ATOMIC
+// claimUpdateOnce() (atomic INCR in both the Redis and in-memory
+// backends) — or, for payment-bearing Bale events, the durable
+// BalePaymentRef UNIQUE constraints in the database.
+//
+// executeWorkflow() deliberately performs NO update-level dedup of its
+// own. The previous second layer (cache get-then-set on the same update
+// key) suppressed every workflow AFTER the first one matched the same
+// event — one event with multiple intended workflows executed only the
+// first (self-suppression), the exact C-11/C-12 defect. Removing the
+// second layer gives the required semantics:
+//
+//   one inbound event → EACH intended workflow executes exactly once
+//   semantically (duplicate EVENT deliveries are still collapsed by the
+//   single owner above).
+//
+// Side-effecting actions keep their own deterministic idempotency keys
+// (AI: AiJob.idempotencyKey UNIQUE; payments: Order.idempotencyKey), so
+// action-level replays converge even across process crashes.
+// ---------------------------------------------------------------------
 
-async function isDuplicate(ctx: WorkflowContext): Promise<boolean> {
-  const key = dedupKey(ctx);
-  if (!key) return false;
-  const flag = await cache.get<boolean>(key);
-  if (flag === true) return true;
-  await cache.set(key, true, 24 * 60 * 60 * 1000);
-  return false;
+// ---------------------------------------------------------------------
+// C-13/C-14 — EXECUTION-TIME ENTITLEMENT GATE (single reusable boundary)
+// ---------------------------------------------------------------------
+// A workflow created under a premium plan must not keep invoking
+// premium-only capabilities after the owner's plan downgrades/expires.
+// Gating at creation/UI time is NOT authorization — the gate below is
+// evaluated at every execution, against the bot OWNER's CURRENT
+// effective plan.
+// ---------------------------------------------------------------------
+const ACTION_FEATURE_GATE: Partial<Record<ActionKind, PlanBooleanFeatureKey>> = {
+  create_ticket: "tickets",
+  show_gold: "goldMonitor",
+  invoke_ai: "smartReply",
+};
+
+async function assertActionEntitlement(
+  ownerId: string,
+  action: ActionKind,
+  workflowId: string,
+  linkedUserId: string | null,
+): Promise<{ allowed: boolean; errorFa?: string }> {
+  const gate = ACTION_FEATURE_GATE[action];
+  if (!gate) return { allowed: true };
+  const features = await getEffectiveFeatures(ownerId);
+  if (getFeatureBoolean(features, gate, false)) return { allowed: true };
+  await audit({
+    userId: linkedUserId,
+    actor: "system",
+    action: "bot_workflow_action_entitlement_blocked",
+    targetType: "bot_workflow",
+    targetId: workflowId,
+    meta: { actionKind: action, feature: gate },
+  });
+  return { allowed: false, errorFa: "امکان مربوط به این عملیات در پلن فعلی مالک ربات فعال نیست." };
 }
 
 // ---------------------------------------------------------------------
@@ -175,8 +218,6 @@ async function isDuplicate(ctx: WorkflowContext): Promise<boolean> {
 // ---------------------------------------------------------------------
 function sanitizeForHistory(raw: unknown, ctx: WorkflowContext): string {
   const sanitized = sanitizeRaw(raw);
-  // Embed update_id at the top level for forensic recovery (the cache
-  // may evict; the DB row should be self-contained).
   const out: Record<string, unknown> =
     sanitized && typeof sanitized === "object" && !Array.isArray(sanitized)
       ? { ...(sanitized as Record<string, unknown>) }
@@ -188,23 +229,37 @@ function sanitizeForHistory(raw: unknown, ctx: WorkflowContext): string {
   return s;
 }
 
-// ---------------------------------------------------------------------
-// Persist inbound + outbound BotHistory rows
-// ---------------------------------------------------------------------
-async function persistInbound(ctx: WorkflowContext, text: string): Promise<void> {
+/**
+ * Persist the inbound history row for an event — ONCE per event, from the
+ * webhook layer (not per workflow). Workflows no longer persist inbound
+ * rows themselves (C-11/C-12: an event matched by N workflows previously
+ * produced N duplicate inbound history rows).
+ */
+export async function persistInboundOnce(
+  bot: Bot,
+  providerUserId: string,
+  text: string,
+  rawUpdate: unknown,
+  updateId?: string | number,
+  providerMessageId?: string | number,
+): Promise<void> {
   try {
     await db.botHistory.create({
       data: {
-        botId: ctx.bot.id,
+        botId: bot.id,
         direction: "inbound",
-        providerUserId: ctx.providerUserId,
+        providerUserId,
         text: (text ?? "").slice(0, 4000),
-        raw: sanitizeForHistory(ctx.rawUpdate, ctx),
+        raw: sanitizeForHistory(rawUpdate, { bot, providerUserId, rawUpdate, workflow: {} as BotWorkflow, updateId, providerMessageId } as WorkflowContext),
       },
     });
-  } catch { /* never fail the workflow on persistence */ }
+  } catch { /* never fail the event on persistence */ }
 }
 
+// ---------------------------------------------------------------------
+// Persist outbound BotHistory rows (inbound persistence lives in
+// persistInboundOnce — owned by the webhook layer, once per event).
+// ---------------------------------------------------------------------
 async function persistOutbound(ctx: WorkflowContext, userId: string | null, text: string): Promise<void> {
   try {
     await db.botHistory.create({
@@ -251,11 +306,18 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
   if (ctx.workflow.enabled === false) {
     return { ok: true, matched: false, outboundCount: 0 };
   }
-  // Idempotency check — if we've already processed this update, bail.
-  if (await isDuplicate(ctx)) {
-    return { ok: true, matched: false, outboundCount: 0 };
-  }
-  const def = safeJsonParse<WorkflowDef>(ctx.workflow.steps, { steps: [] });
+  // C-11/C-12: NO update-level dedup here — the webhook layer is the
+  // single dedup owner (see the ownership note above). Every intended
+  // workflow for the event runs.
+  // SHAPE COMPATIBILITY: the creation/update routes persist the validated
+  // steps as a RAW ARRAY (`JSON.stringify(def.steps)`), while older rows
+  // may hold an object `{ steps: [...] }`. The engine must accept both —
+  // assuming the object shape silently disabled EVERY workflow (the walk
+  // early-returned on `def.steps` undefined).
+  const parsedSteps = safeJsonParse<WorkflowDef | WorkflowStep[]>(ctx.workflow.steps, { steps: [] });
+  const def: WorkflowDef = Array.isArray(parsedSteps)
+    ? { steps: parsedSteps }
+    : ((parsedSteps as WorkflowDef) ?? { steps: [] });
   if (!def.steps || def.steps.length === 0) {
     return { ok: true, matched: false, outboundCount: 0 };
   }
@@ -268,10 +330,9 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
     return { ok: false, matched: false, outboundCount: 0, errorFa: "هیچ گام شروع یافت نشد." };
   }
 
-  // Persist inbound first (always — even if no workflow matches, the
-  // history row matters for inbox forensics).
-  await persistInbound(ctx, ctx.incomingMessage ?? "");
-
+  // Persist inbound is owned by the webhook layer (persistInboundOnce) —
+  // once per EVENT, not once per workflow.
+  //
   // Resolve linked user once.
   const linkedUser = await findLinkedUser(ctx.bot.id, ctx.providerUserId);
 
@@ -290,6 +351,16 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
     visited.add(current.id);
 
     if (current.type === "end") break;
+
+    // START steps carry no behavior — advance to their next step. (The
+    // previous engine fell through to the "unknown step type" break here,
+    // so every workflow terminated at its first step and NEVER executed
+    // any action — a second total-disabling defect alongside the steps
+    // shape mismatch fixed above.)
+    if (current.type === "start") {
+      current = current.nextStepId ? stepMap.get(current.nextStepId) : undefined;
+      continue;
+    }
 
     if (current.type === "message") {
       const text = current.text ?? "";
@@ -328,6 +399,24 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
 
     if (current.type === "action" && current.action) {
       const a = current.action;
+      // C-13/C-14: execution-time entitlement check for gated actions
+      // (tickets / gold / AI) against the bot owner's CURRENT plan.
+      const entitlement = await assertActionEntitlement(
+        ctx.bot.ownerId,
+        a.kind,
+        ctx.workflow.id,
+        linkedUser?.id ?? null,
+      );
+      if (!entitlement.allowed) {
+        if (entitlement.errorFa) {
+          const r = await sendOutbound(ctx.bot, ctx.providerUserId, entitlement.errorFa);
+          if (r.ok) {
+            outboundCount++;
+            await persistOutbound(ctx, linkedUser?.id ?? null, entitlement.errorFa);
+          }
+        }
+        break; // gated action refused — stop the walk (fail closed)
+      }
       // Loop protection on AI
       if (a.kind === "invoke_ai") {
         if (aiInvoked) {
@@ -475,6 +564,16 @@ async function performAction(
       if (!args.linkedUserId) {
         return { outboundText: "برای ثبت تیکت ابتدا حساب پُست‌یار خود را به این ربات متصل کنید." };
       }
+      // L-6 — abuse cap: a trigger-happy workflow must not let a chat
+      // identity farm unlimited support tickets.
+      const ticketRl = await rateLimit({
+        key: `bot:ticket:${args.linkedUserId}`,
+        limit: 5,
+        windowMs: 60 * 60 * 1000,
+      });
+      if (!ticketRl.ok) {
+        return { outboundText: "تعداد تیکت‌های ثبت‌شده بیش از حد مجاز است. بعداً تلاش کنید." };
+      }
       const subject = String(cfg.subject ?? "تیکت از ربات");
       const body = String(cfg.body ?? args.ctx.incomingMessage ?? "");
       if (body.length < 3) {
@@ -527,7 +626,7 @@ async function performAction(
       const planCode = String(cfg.planCode ?? "basic");
       // look up plan by code
       const plan = await db.plan.findUnique({ where: { code: planCode } });
-      if (!plan || !plan.active) {
+      if (!plan || !plan.active || !plan.isPublic) {
         return { outboundText: "طرح انتخاب‌شده معتبر نیست." };
       }
       const idemKey = `bot:pay:${args.linkedUserId}:${plan.id}`;
@@ -538,6 +637,17 @@ async function performAction(
           provider: "bale",
           idempotencyKey: idemKey,
         });
+        // H-2 (defense in depth): an order that already reached a
+        // paid/terminal state is NEVER re-invoiced — the deterministic
+        // bot-payment key returns the existing order and re-issuing an
+        // invoice for it could regress its financial state. Direct the
+        // user to a fresh purchase instead.
+        if (order.status !== "pending" && order.status !== "awaiting_payment") {
+          return {
+            outboundText:
+              "این طرح قبلاً برای شما فاکتور شده و قابل صدور مجدد نیست. از داشبورد سفارش تازه‌ای ایجاد کنید.",
+          };
+        }
         // Send Bale invoice if bot is bale; otherwise just notify
         if (args.ctx.bot.provider === "bale") {
           const r = await baleCreatePaymentRequest({
@@ -600,10 +710,15 @@ async function performAction(
       if (!prompt) {
         return { outboundText: "پرامپت خالی است." };
       }
-      const idemKey = `bot:ai:${args.linkedUserId}:${args.ctx.bot.id}:${args.ctx.workflow.id}:${hashToken(prompt).slice(0, 32)}`;
+      const idemKey = `bot:ai:${args.ctx.bot.ownerId}:${args.ctx.bot.id}:${args.ctx.workflow.id}:${hashToken(prompt).slice(0, 32)}`;
       try {
+        // C-13/C-14: the AI invocation is charged to and gated by the BOT
+        // OWNER's plan (the bot is the owner's automated asset consuming
+        // the owner's AI quota) — the previous behavior charged whichever
+        // customer happened to text the bot, letting a downgraded owner
+        // keep premium automation on their customers' quota.
         const r = await dispatchAi({
-          userId: args.linkedUserId,
+          userId: args.ctx.bot.ownerId,
           provider,
           model,
           task: "custom",

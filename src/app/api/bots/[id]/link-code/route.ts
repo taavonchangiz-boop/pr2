@@ -8,6 +8,7 @@ import {
   AuthError,
 } from "@/lib/server/auth";
 import { generateLinkCode } from "@/lib/bots/link";
+import { requirePlanFeature } from "@/lib/payments/plans";
 
 export async function POST(
   req: Request,
@@ -22,6 +23,14 @@ export async function POST(
   const bot = await db.bot.findFirst({ where: { id, ownerId: user.id } });
   if (!bot) {
     return NextResponse.json({ errorFa: "ربات یافت نشد." }, { status: 404 });
+  }
+  // P0.15/H-1 — link codes are a plan feature.
+  try {
+    await requirePlanFeature(user.id, "linkCodes");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    const msg = e instanceof AuthError ? e.message : "امکان کدهای اتصال در پلن فعلی شما فعال نیست.";
+    return NextResponse.json({ errorFa: msg }, { status });
   }
   try {
     const r = await generateLinkCode({ botId: id, userId: user.id });

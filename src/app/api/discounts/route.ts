@@ -2,11 +2,18 @@
 import { NextResponse } from "next/server";
 import { requireUser, AuthError } from "@/lib/server/auth";
 import { previewDiscount } from "@/lib/payments/discount";
+import { rateLimit } from "@/lib/security/cache";
 
 export async function GET(req: Request) {
   let user;
   try { user = await requireUser(); } catch (e) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
+  }
+  // L-3: bounded preview attempts — the distinct error strings otherwise
+  // make this an unthrottled code-enumeration oracle.
+  const rl = await rateLimit({ key: `discount:preview:${user.id}`, limit: 20, windowMs: 60 * 1000 });
+  if (!rl.ok) {
+    return NextResponse.json({ errorFa: "تعداد درخواست بیش از حد مجاز است." }, { status: 429 });
   }
   const url = new URL(req.url);
   const code = url.searchParams.get("code") ?? "";

@@ -441,12 +441,14 @@ const geminiProvider: AiProvider = {
     return (async () => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 30_000);
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(key)}`;
+      // L-8: the key is sent in the x-goog-api-key HEADER, never in the
+      // URL query — URLs leak into proxies, access logs and error reports.
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
       let res: Response;
       try {
         res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
           body: JSON.stringify({
             contents,
             systemInstruction: sysText ? { parts: [{ text: sysText }] } : undefined,

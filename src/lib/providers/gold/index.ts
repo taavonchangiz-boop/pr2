@@ -12,7 +12,7 @@
 import { db } from "@/lib/db";
 import { cache } from "@/lib/security/cache";
 import { assertSafeOutboundUrl } from "@/lib/security/net-guard";
-import { fetchJsonWithLimit } from "@/lib/security/http";
+import { pinnedFetchJson } from "@/lib/security/http";
 
 export type GoldInstrument = "18k" | "emami" | "bahar_azadi" | "ounce";
 
@@ -65,23 +65,15 @@ export async function getGoldPrice(instrument: GoldInstrument): Promise<GoldPric
   // through the egress guard (https-only, public IPs, safe ports) and a
   // bounded response read so neither an internal address nor an oversized
   // body can be abused.
-  try {
-    await assertSafeOutboundUrl(url, { allowedPorts: [443] });
-  } catch {
-    const stale = await getLastKnown(instrument);
-    return {
-      ok: false,
-      instrument,
-      priceRials: null,
-      stalePriceRials: stale,
-      errorFa: "نشانی ارائه‌دهنده داده طلا مجاز نیست.",
-    };
-  }
-
-  const parsed = await fetchJsonWithLimit<unknown>(url, {
+  // C-06: pinnedFetchJson validates AND pins the connection to the
+  // validated address (SNI keeps TLS tied to the real hostname), so a
+  // rebinding DNS answer cannot re-point an approved URL at an internal
+  // target between validation and connect.
+  const parsed = await pinnedFetchJson<unknown>(url, {
     method: "GET",
     timeoutMs: 8_000,
     maxBytes: 512 * 1024,
+    allowedPorts: [443],
   });
   if (!parsed.ok) {
     const stale = await getLastKnown(instrument);

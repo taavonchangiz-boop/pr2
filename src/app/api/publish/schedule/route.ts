@@ -1,17 +1,18 @@
 // POSTYAR — POST /api/publish/schedule
 // Body: { contentId, destinationIds: string[], scheduledAtJalali: "now" | { jy, jm, jd, hour, minute } }
-// Validates ownership + state machine + plan features + quota. Converts
+// Validates ownership + state machine + plan features. Converts
 // Jalali → UTC ISO. Creates one PublishJob per destination with a
-// deterministic idempotency key `contentId:destinationId:iso` so duplicate
-// submissions collapse.
+// deterministic idempotency key `contentId:destinationId:iso`.
 //
-// P0.1 ROOT-CAUSE FIX — authoritative quota path: the previous
-// implementation created jobs and then did a best-effort, non-atomic
-// read-modify-write of a legacy `publishUsed` counter on a DIFFERENT key
-// than the quota engine's `publishPerMonth` dimension. Quota is now
-// RESERVED ATOMICALLY (consumeQuota — CAS check-and-reserve) for exactly
-// the number of NEW jobs before any job row is committed, and the legacy
-// `publishUsed` writer is removed (single source of truth, P2.2).
+// C-02 ROOT-CAUSE FIX — FULLY ATOMIC SCHEDULING: content-state transition,
+// all per-destination job rows, and the quota reservation now commit in
+// ONE database transaction (schedulePublishJobsAtomic). The previous flow
+// reserved quota, moved the content status, and then created jobs one-by-
+// one in separate transactions — a mid-loop failure left quota reserved,
+// content moved, and only some jobs created. There is no compensation or
+// refund path anymore: insufficient quota rolls the entire transaction
+// back, and concurrent duplicate submissions converge on the UNIQUE job
+// idempotency keys (quota is charged for exactly the rows created).
 //
 // Quota unit: ONE publishPerMonth unit PER DESTINATION (the number of
 // provider messages the operation will produce). This is explicit and
@@ -26,14 +27,9 @@ import { db } from "@/lib/db";
 import { requireUser, clientIp, audit, AuthError } from "@/lib/server/auth";
 import { rateLimit } from "@/lib/security/cache";
 import { jalaliToUtcIso } from "@/lib/persian";
-import { assertTransition, isContentStatus } from "@/lib/publishing/state";
-import { schedulePublishJob } from "@/lib/queue/scheduler";
-import {
-  consumeQuota,
-  refundQuota,
-  requirePlanFeature,
-  type QuotaDimension,
-} from "@/lib/payments/plans";
+import { isContentStatus } from "@/lib/publishing/state";
+import { schedulePublishJobsAtomic, ContentTransitionError } from "@/lib/queue/scheduler";
+import { requirePlanFeature, type QuotaDimension } from "@/lib/payments/plans";
 
 const JalaliSchema = z.object({
   jy: z.number().int().min(1300).max(1500),
@@ -97,16 +93,6 @@ export async function POST(req: Request) {
           scheduledAtJalali.minute,
         );
 
-  // Validate state machine: draft → queued/allowed transition
-  try {
-    assertTransition(content.status, scheduledAtJalali === "now" ? "queued" : "scheduled");
-  } catch {
-    return NextResponse.json(
-      { errorFa: `انتقال وضعیت از «${content.status}» مجاز نیست.` },
-      { status: 400 },
-    );
-  }
-
   // De-duplicate destination IDs
   const uniqueDestIds = Array.from(new Set(destinationIds));
   // Verify all destinations belong to the user
@@ -136,121 +122,53 @@ export async function POST(req: Request) {
     return NextResponse.json({ errorFa: msg }, { status });
   }
 
-  // P0.1 — determine which destinations still need a NEW job. A duplicate
-  // submission (same contentId + destinationId + runAtIso) must NOT reserve
-  // quota again for already-queued jobs.
-  const jobKeys = uniqueDestIds.map((dstId) => `${contentId}:${dstId}:${runAtIso}`.slice(0, 200));
-  const existingJobs = await db.publishJob.findMany({
-    where: { idempotencyKey: { in: jobKeys } },
-    select: { idempotencyKey: true },
-  });
-  const existingKeys = new Set(existingJobs.map((j) => j.idempotencyKey));
-  const newDestIds = uniqueDestIds.filter(
-    (dstId, idx) => !existingKeys.has(jobKeys[idx] as string),
-  );
-
-  // Reserve quota BEFORE any job is committed (atomic check-and-reserve).
-  // A crash between reservation and job creation keeps the reservation
-  // (fail-closed — documented consumeQuota semantics).
-  if (newDestIds.length > 0) {
-    let reserved = false;
-    try {
-      reserved = await consumeQuota({
-        userId: user.id,
-        dimension: PUBLISH_DIMENSION,
-        amount: newDestIds.length,
-      });
-    } catch (e) {
-      const status = e instanceof AuthError ? e.status : 409;
-      const msg = e instanceof AuthError ? e.message : "به‌روزرسانی سهمیه انتشار ناموفق بود.";
-      return NextResponse.json({ errorFa: msg }, { status });
-    }
-    if (!reserved) {
-      return NextResponse.json(
-        { errorFa: "سهمیه انتشار ماهانه کافی نیست. پلن خود را ارتقا دهید یا ماه بعد تلاش کنید." },
-        { status: 403 },
-      );
-    }
-  }
-
-  // Transition content status atomically BEFORE job creation (CAS on the
-  // previous status) — a concurrent writer changing the status must not be
-  // clobbered, and no jobs may exist for a content whose state transition
-  // was rejected. On CAS failure the quota reservation is refunded.
-  const next = scheduledAtJalali === "now" ? "queued" : "scheduled";
-  const statusMoved = await db.content.updateMany({
-    where: { id: contentId, ownerId: user.id, status: content.status },
-    data: {
-      status: next,
-      scheduledAt: scheduledAtJalali === "now" ? null : new Date(runAtIso),
-      destinationIds: JSON.stringify(uniqueDestIds),
-    },
-  });
-  if (statusMoved.count === 0) {
-    if (newDestIds.length > 0) {
-      await refundQuota({
-        userId: user.id,
-        dimension: PUBLISH_DIMENSION,
-        amount: newDestIds.length,
-      });
-    }
-    return NextResponse.json(
-      { errorFa: `انتقال وضعیت از «${content.status}» مجاز نیست.` },
-      { status: 409 },
-    );
-  }
-
-  // Create one PublishJob per destination. skipDuplicates guarantees that a
-  // concurrent duplicate submission cannot violate the UNIQUE key.
-  const results: Array<{ destinationId: string; created: boolean; jobId: string }> = [];
-  let actuallyCreated = 0;
-  for (let i = 0; i < uniqueDestIds.length; i++) {
-    const dstId = uniqueDestIds[i] as string;
-    const r = await schedulePublishJob({
+  // C-02 — ONE atomic transaction: content CAS transition + all job rows +
+  // quota reservation for exactly the created rows. Any failure rolls back
+  // everything (no partial commit, no quota loss, no duplicate reservation).
+  try {
+    const result = await schedulePublishJobsAtomic({
+      ownerId: user.id,
       contentId,
-      destinationId: dstId,
+      destinationIds: uniqueDestIds,
       runAtIso,
-      idempotencyKey: jobKeys[i] as string,
-    });
-    if (r.created) actuallyCreated += 1;
-    results.push({ destinationId: dstId, created: r.created, jobId: r.jobId });
-  }
-
-  // Concurrency reconciliation: if a parallel duplicate created some of the
-  // jobs between our reservation and our inserts, refund the difference.
-  // (Over-reservation is fail-closed; under-reservation is impossible.)
-  if (newDestIds.length > actuallyCreated) {
-    await refundQuota({
-      userId: user.id,
+      scheduled: scheduledAtJalali !== "now",
       dimension: PUBLISH_DIMENSION,
-      amount: newDestIds.length - actuallyCreated,
     });
+
+    await audit({
+      userId: user.id,
+      actor: "user",
+      action: "publish_schedule",
+      targetType: "content",
+      targetId: contentId,
+      ip,
+      meta: {
+        destinationCount: uniqueDestIds.length,
+        newJobs: result.createdCount,
+        scheduledAtIso: runAtIso,
+        mode: scheduledAtJalali === "now" ? "now" : "scheduled",
+      },
+    });
+
+    // If scheduling for "now", opportunistically run the worker so the user
+    // sees immediate delivery without waiting for the next cron tick.
+    if (scheduledAtJalali === "now") {
+      try {
+        const { runWorkerOnce } = await import("@/lib/queue/worker");
+        // Fire-and-forget — we don't block the response (the cron worker is
+        // the durable fallback; this only accelerates first delivery).
+        void runWorkerOnce(5);
+      } catch { /* ignore — cron will pick it up */ }
+    }
+
+    return NextResponse.json({ ok: true, jobs: result.jobs, scheduledAtIso: runAtIso }, { status: 201 });
+  } catch (e) {
+    if (e instanceof ContentTransitionError) {
+      return NextResponse.json({ errorFa: e.message }, { status: 409 });
+    }
+    if (e instanceof AuthError) {
+      return NextResponse.json({ errorFa: e.message }, { status: e.status });
+    }
+    throw e;
   }
-
-  await audit({
-    userId: user.id,
-    actor: "user",
-    action: "publish_schedule",
-    targetType: "content",
-    targetId: contentId,
-    ip,
-    meta: {
-      destinationCount: uniqueDestIds.length,
-      newJobs: actuallyCreated,
-      scheduledAtIso: runAtIso,
-      mode: scheduledAtJalali === "now" ? "now" : "scheduled",
-    },
-  });
-
-  // If scheduling for "now", opportunistically run the worker so the user
-  // sees immediate delivery without waiting for the next cron tick.
-  if (scheduledAtJalali === "now") {
-    try {
-      const { runWorkerOnce } = await import("@/lib/queue/worker");
-      // Fire-and-forget — we don't block the response.
-      void runWorkerOnce(5);
-    } catch { /* ignore — cron will pick it up */ }
-  }
-
-  return NextResponse.json({ ok: true, jobs: results, scheduledAtIso: runAtIso }, { status: 201 });
 }

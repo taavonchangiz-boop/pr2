@@ -18,6 +18,9 @@
 	encode zstd gzip
 
 	handle {
+		# M-4: the app trusts X-Forwarded-For ONLY when POSTYAR_TRUST_PROXY=1
+		# is set in the app environment — production deployments behind this
+		# gateway MUST set it (see docs/DEPLOYMENT-CPANEL.md).
 		reverse_proxy localhost:3000 {
 			header_up Host {host}
 			header_up X-Forwarded-For {remote_host}

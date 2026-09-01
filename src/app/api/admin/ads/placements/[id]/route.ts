@@ -81,8 +81,7 @@ export async function PATCH(req: Request, { params }: Params) {
     });
     return NextResponse.json({ ok: true, placement: updated });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    return NextResponse.json({ errorFa: "خطای داخلی سرور." }, { status: 500 });
   }
 }
 
@@ -119,7 +118,6 @@ export async function DELETE(req: Request, { params }: Params) {
     });
     return NextResponse.json({ ok: true });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    return NextResponse.json({ errorFa: "خطای داخلی سرور." }, { status: 500 });
   }
 }

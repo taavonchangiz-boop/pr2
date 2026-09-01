@@ -21,10 +21,10 @@ import {
   verifyWebhookSig,
   computeWebhookBodySignature,
 } from "@/lib/bots/register-webhook";
-import { executeWorkflow, processBaleUpdate } from "@/lib/bots/workflow";
+import { executeWorkflow, processBaleUpdate, persistInboundOnce } from "@/lib/bots/workflow";
 import { audit } from "@/lib/server/auth";
 import type { BotWorkflow } from "@prisma/client";
-import { webhookRequestGuard, claimUpdateOnce } from "@/lib/bots/webhook-guard";
+import { webhookRequestGuard, claimUpdateOnce, readBoundedWebhookBody } from "@/lib/bots/webhook-guard";
 
 interface BaleUpdate {
   update_id: number;
@@ -83,7 +83,11 @@ export async function POST(req: Request) {
   if (bot.provider !== "bale") {
     return NextResponse.json({ ok: false, errorFa: "پروایدر ناهماهنگ است." }, { status: 400 });
   }
-  const rawBody = await req.text();
+  const bodyRead = await readBoundedWebhookBody(req);
+  if (!bodyRead.ok) {
+    return NextResponse.json({ ok: false, errorFa: bodyRead.errorFa }, { status: 413 });
+  }
+  const rawBody = bodyRead.text;
   const bodySig = await computeWebhookBodySignature(bot, rawBody);
   const baleHeader = req.headers.get("x-bale-webhook-signature") ?? "";
   const providedSig = baleHeader || (req.headers.get("x-postyar-body-sig") ?? "");
@@ -159,6 +163,10 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, noChat: true });
   }
 
+  // C-11/C-12: persist the inbound history row ONCE per event (owned by
+  // the webhook layer, not per workflow).
+  await persistInboundOnce(bot, chatId, incomingText, update, updateId);
+
   // Link-code consumption attempt.
   if (incomingText.startsWith("POSTYAR-")) {
     const { consumeLinkCode } = await import("@/lib/bots/link");
@@ -221,23 +229,6 @@ export async function POST(req: Request) {
         meta: { workflowId: wf.id, name: err instanceof Error ? err.name : "Error" },
       });
     }
-  }
-
-  if (!matchedAny) {
-    try {
-      await db.botHistory.create({
-        data: {
-          botId: bot.id,
-          direction: "inbound",
-          providerUserId: chatId,
-          text: incomingText.slice(0, 4000),
-          raw: JSON.stringify({
-            _update_id: String(updateId),
-            _payload: { message_id: update.message?.message_id ?? update.callback_query?.message?.message_id },
-          }),
-        },
-      });
-    } catch { /* ignore */ }
   }
 
   return NextResponse.json({ ok: true, matched: matchedAny });

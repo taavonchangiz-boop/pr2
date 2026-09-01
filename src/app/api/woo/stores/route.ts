@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { rateLimit } from "@/lib/security/cache";
 import { requireUser, clientIp, AuthError } from "@/lib/server/auth";
+import { requirePlanFeature } from "@/lib/payments/plans";
 import { listMyStores, createStore } from "@/lib/providers/woo";
 
 const CreateSchema = z.object({
@@ -27,6 +28,14 @@ export async function POST(req: Request) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   const ip = clientIp(req);
+  // P0.15/H-1 — WooCommerce integration is a plan feature.
+  try {
+    await requirePlanFeature(user.id, "woo");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    const msg = e instanceof AuthError ? e.message : "امکان ووکامرس در پلن فعلی شما فعال نیست.";
+    return NextResponse.json({ errorFa: msg }, { status });
+  }
   // SSRF amplification guard (audit WO1): throttle store creation probes.
   const rlWoo = await rateLimit({ key: `woo:create:${user.id}`, limit: 5, windowMs: 60 * 60 * 1000 });
   if (!rlWoo.ok) return NextResponse.json({ errorFa: "تعداد ثبت فروشگاه بیش از حد مجاز است." }, { status: 429 });

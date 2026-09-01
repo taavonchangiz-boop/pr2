@@ -25,7 +25,7 @@ import { z } from "zod";
 import { requireRole, clientIp, audit, AuthError } from "@/lib/server/auth";
 import { db } from "@/lib/db";
 import { formatJalaliDateTime } from "@/lib/persian";
-import { invalidateSettingsCache } from "@/lib/providers/util";
+import { bumpSettingsEpoch, invalidateSettingsCache } from "@/lib/providers/util";
 import { encryptString } from "@/lib/security/crypto";
 
 // ---------------------------------------------------------------------
@@ -206,13 +206,17 @@ export async function GET() {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   void user;
-  const rows = await db.systemSetting.findMany();
-  // ROOT-CAUSE FIX (audit §28/§34 — secret disclosure): the previous GET
-  // returned the RAW value of every key, including SMS/SMTP/bank/BI
-  // credentials, so any read of this endpoint (or DB dump/backup) exposed
-  // all provider secrets in plaintext. Sensitive values are now MASKED in
-  // responses; setting a value still works (write-only semantics) and the
-  // UI already renders masked previews.
+  // L-6 — only admin-manageable keys are ever listed. Internal rows
+  // (settings-cache epoch, one-shot migration markers, the first-admin
+  // bootstrap claim, future bookkeeping) are NEVER serialized to clients —
+  // a future secret accidentally written under a non-allowlist key cannot
+  // leak through this endpoint.
+  const rows = await db.systemSetting.findMany({
+    where: { key: { in: ALLOWED_KEYS } },
+  });
+  // ROOT-CAUSE FIX (audit §28/§34 — secret disclosure): sensitive values
+  // are MASKED in responses; setting a value still works (write-only
+  // semantics) and the UI already renders masked previews.
   const sensitiveByKey = new Map<string, boolean>(GROUPS.flatMap((g) => g.keys.map((k) => [k.key, k.sensitive === true] as [string, boolean])));
   return NextResponse.json({
     items: rows.map((r) => {
@@ -285,7 +289,10 @@ export async function POST(req: Request) {
     create: { key: parsed.data.key, value: storedValue },
     update: { value: storedValue },
   });
-  invalidateSettingsCache(parsed.data.key);
+  invalidateSettingsCache();
+  // C-05: bump the shared settings-cache epoch so EVERY app instance
+  // re-reads this setting within the explicit 3s window.
+  await bumpSettingsEpoch();
   await audit({
     userId: user.id,
     actor: "admin",
@@ -343,8 +350,10 @@ export async function PATCH(req: Request) {
       create: { key: it.key, value: storedValue },
       update: { value: storedValue },
     });
-    invalidateSettingsCache(it.key);
   }
+  invalidateSettingsCache();
+  // C-05: one shared-epoch bump covers the whole batch.
+  await bumpSettingsEpoch();
   await audit({
     userId: user.id,
     actor: "admin",
@@ -382,7 +391,8 @@ export async function DELETE(req: Request) {
   } catch {
     // Row doesn't exist — that's the same end-state (revert to env/default).
   }
-  invalidateSettingsCache(parsed.data.key);
+  invalidateSettingsCache();
+  await bumpSettingsEpoch();
   await audit({
     userId: user.id,
     actor: "admin",

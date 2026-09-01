@@ -28,16 +28,21 @@ let _connectPromise: Promise<Redis | null> | null = null;
 let _lastPingOk = false;
 let _lastError: string | null = null;
 
-const REDIS_URL = process.env.REDIS_URL?.trim();
+// Read dynamically: production never mutates env at runtime, but this
+// keeps the singleton honest if the URL is injected after module init and
+// makes the module testable against a runtime-provided Redis endpoint.
+function redisUrl(): string | null {
+  return process.env.REDIS_URL?.trim() || null;
+}
 
 /**
  * Lazily create the Redis client. Returns null when REDIS_URL is not set
  * (dev/sandbox). The client is created once and reused across the process.
  */
 function createClient(): Redis | null {
-  if (!REDIS_URL) return null;
+  if (!redisUrl()) return null;
   if (_client) return _client;
-  const client = new Redis(REDIS_URL, {
+  const client = new Redis(redisUrl() as string, {
     // Production-safe defaults
     maxRetriesPerRequest: 3,
     enableReadyCheck: true,
@@ -70,7 +75,7 @@ function createClient(): Redis | null {
  * concurrency-sensitive operations.
  */
 export function getRedis(): Redis | null {
-  if (!REDIS_URL) return null;
+  if (!redisUrl()) return null;
   return createClient();
 }
 
@@ -79,7 +84,7 @@ export function getRedis(): Redis | null {
  * Safe to call repeatedly. Returns true when the client is live.
  */
 export async function ensureRedisConnected(): Promise<boolean> {
-  if (!REDIS_URL) return false;
+  if (!redisUrl()) return false;
   if (_connectPromise) return _connectPromise.then((c) => c !== null).catch(() => false);
   _connectPromise = (async () => {
     try {
@@ -107,7 +112,7 @@ export async function ensureRedisConnected(): Promise<boolean> {
  * For a fresh PING (e.g. health endpoint), call `pingRedis()` instead.
  */
 export function isRedisConnected(): boolean {
-  return !!REDIS_URL && _lastPingOk;
+  return !!redisUrl() && _lastPingOk;
 }
 
 /**
@@ -115,7 +120,7 @@ export function isRedisConnected(): boolean {
  * milliseconds when successful, or null when Redis is unavailable.
  */
 export async function pingRedis(): Promise<number | null> {
-  if (!REDIS_URL) return null;
+  if (!redisUrl()) return null;
   try {
     const client = getRedis();
     if (!client) return null;
@@ -149,6 +154,7 @@ export function getRedisLastError(): string | null {
  * e.g. `redis://***@127.0.0.1:6379/0`
  */
 export function getRedisUrlMasked(): string | null {
+  const REDIS_URL = redisUrl();
   if (!REDIS_URL) return null;
   try {
     const u = new URL(REDIS_URL);
@@ -170,8 +176,14 @@ export function getRedisUrlMasked(): string | null {
  */
 export function requireRedis(): Redis {
   const client = getRedis();
-  if (!client || !REDIS_URL) {
+  if (!client || !redisUrl()) {
     throw new Error("عملیات حساس مالی نیاز به اتصال واقعی Redis دارد که در این محیط فعال نیست.");
+  }
+  // L-11: a configured-but-DEAD client must not pass the gate. A last-known
+  // liveness signal is used when available; a client that has never been
+  // ready is rejected here rather than on a mid-operation failure.
+  if (!isRedisConnected()) {
+    throw new Error("اتصال Redis برقرار نیست؛ عملیات حساس انجام نشد.");
   }
   return client;
 }

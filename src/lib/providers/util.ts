@@ -75,11 +75,66 @@ export function scrubTokenFromUrl(url: string): string {
 // ---------------------------------------------------------------------
 // Settings override: SystemSetting first, then env, then fallback.
 // Used by SMS/Email/AI provider libs so the admin can override env
-// without a redeploy. Always async (DB read); cached via Prisma's
-// query plan cache + the in-process cache for hot paths.
+// without a redeploy. Always async; cached via a VERSIONED, SHARED cache
+// (C-05 — multi-instance-safe):
+//
+//   * `SystemSetting` row `__settings_epoch__` is a monotonically
+//     bumped version string (bumpSettingsEpoch, called by the admin
+//     settings write routes in the same code path as the write).
+//   * getSetting() reads the CURRENT epoch (in-process 3s cache), then
+//     looks up the SHARED cache key `settings:<epoch>:<key>` (Redis
+//     when REDIS_URL is live; process-local Map otherwise) with a 60s
+//     TTL. A new epoch makes every old-epoch entry unreachable, so an
+//     admin change becomes effective on ALL instances within the
+//     explicit 3-second epoch-read window — without redeploy and
+//     without unbounded staleness.
+//   * The cached value is the RAW DB envelope (possibly
+//     `v1:aes-256-gcm:...`); DECRYPTION happens on every read, so
+//     plaintext secrets never sit in the shared cache. Legacy
+//     plaintext values remain supported (resolveStoredSecret).
 // ---------------------------------------------------------------------
-const settingCache = new Map<string, { value: string | null; exp: number }>();
-const SETTING_TTL_MS = 30_000; // 30s in-process cache
+import { cache } from "@/lib/security/cache";
+
+/** SystemSetting key holding the cache-version epoch (C-05). */
+export const SETTINGS_EPOCH_KEY = "__settings_epoch__";
+const SETTINGS_SHARED_TTL_MS = 60_000; // bounds growth of old-epoch keys
+const EPOCH_LOCAL_TTL_MS = 3_000; // explicit staleness window for admin changes
+
+let epochLocal: { value: string; exp: number } | null = null;
+
+async function readSettingsEpoch(): Promise<string> {
+  const t = Date.now();
+  if (epochLocal && epochLocal.exp > t) return epochLocal.value;
+  try {
+    const row = await db.systemSetting.findUnique({
+      where: { key: SETTINGS_EPOCH_KEY },
+      select: { value: true },
+    });
+    const value = row?.value ?? "0";
+    epochLocal = { value, exp: t + EPOCH_LOCAL_TTL_MS };
+    return value;
+  } catch {
+    // DB error → keep serving the last known epoch (bounded staleness).
+    return epochLocal?.value ?? "0";
+  }
+}
+
+/**
+ * Bump the settings-cache epoch so EVERY application instance re-reads
+ * SystemSetting values from the database on the next getSetting call
+ * (within the explicit 3s epoch-read window). Must be awaited by the
+ * admin write path AFTER the setting rows are committed.
+ */
+export async function bumpSettingsEpoch(): Promise<void> {
+  const next = String(Date.now());
+  await db.systemSetting.upsert({
+    where: { key: SETTINGS_EPOCH_KEY },
+    create: { key: SETTINGS_EPOCH_KEY, value: next },
+    update: { value: next },
+  });
+  // This instance switches immediately; peers follow within EPOCH_LOCAL_TTL_MS.
+  epochLocal = { value: next, exp: Date.now() + EPOCH_LOCAL_TTL_MS };
+}
 
 /**
  * Resolve a configuration value with this precedence:
@@ -93,16 +148,20 @@ const SETTING_TTL_MS = 30_000; // 30s in-process cache
  * simple (no null-checks before passing to fetch headers).
  */
 export async function getSetting(key: string, fallback: string = ""): Promise<string> {
-  const now = Date.now();
-  const cached = settingCache.get(key);
-  if (cached && cached.exp > now) {
-    if (cached.value !== null) return cached.value;
-    // DB has no row — fall through to env
+  // Guard: the epoch row itself must never be resolved as a setting.
+  if (key === SETTINGS_EPOCH_KEY) return process.env[key] ?? fallback;
+  const epoch = await readSettingsEpoch();
+  const cacheKey = `settings:${epoch}:${key}`;
+  const cached = await cache.get<{ v: string | null }>(cacheKey);
+  if (cached && typeof cached === "object" && "v" in cached) {
+    // DB has a row (v = raw stored value, possibly an encrypted envelope)
+    if (cached.v !== null) return resolveStoredSecret(cached.v);
+    // No row → fall through to env
   } else {
-    // Stale or absent — refresh from DB (best-effort).
+    // Cache miss — refresh from DB (best-effort).
     try {
       const row = await db.systemSetting.findUnique({ where: { key }, select: { value: true } });
-      settingCache.set(key, { value: row?.value ?? null, exp: now + SETTING_TTL_MS });
+      await cache.set(cacheKey, { v: row?.value ?? null }, SETTINGS_SHARED_TTL_MS);
       if (row?.value !== undefined) return resolveStoredSecret(row.value);
     } catch {
       // DB error → fall back to env silently. Never throw.
@@ -132,14 +191,13 @@ export function resolveStoredSecret(value: string): string {
 }
 
 /**
- * Clear the in-process cache for one key (or all keys when `key` is
- * omitted). Call this after the admin updates a setting so the next
- * `getSetting` call re-reads from the DB. Best-effort, non-throwing.
+ * Invalidate the settings cache. With the C-05 versioned design the
+ * SHARED invalidation is the epoch bump (`bumpSettingsEpoch`, awaited by
+ * the admin write routes); this function only clears THIS process's
+ * epoch snapshot so the next getSetting re-reads the epoch immediately.
+ * Best-effort, non-throwing. Call `bumpSettingsEpoch()` for cross-instance
+ * invalidation.
  */
-export function invalidateSettingsCache(key?: string): void {
-  if (key) {
-    settingCache.delete(key);
-    return;
-  }
-  settingCache.clear();
+export function invalidateSettingsCache(_key?: string): void {
+  epochLocal = null;
 }

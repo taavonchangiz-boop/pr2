@@ -362,10 +362,16 @@ model LedgerEntry {
   user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   orderId       String?
   order         Order?   @relation(fields: [orderId], references: [id])
-  eventType     String   // payment|credit|debit|refund|referral_reward|admin_adjust
+  eventType     String   // payment|credit|debit|refund|referral_reward|admin_adjust|subscription
   amountRials   Int      // signed
   currency      String   @default("IRR")
   idempotencyKey String  @unique
+  // Database-enforced financial invariants (C-03): when a ledger row
+  // represents an invariant-locked event, this column carries a stable
+  // key (e.g. "refund:<orderId>") and the UNIQUE index makes it
+  // IMPOSSIBLE for two concurrent transactions to both create the row.
+  // NULL on rows that carry no such invariant (payment, admin_adjust…).
+  refundKey     String?  @unique
   createdAt     DateTime @default(now())
   @@index([userId])
 }

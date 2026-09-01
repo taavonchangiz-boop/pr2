@@ -120,8 +120,25 @@ export class AuthError extends Error {
   }
 }
 
+// M-4 — EXPLICIT PROXY TRUST. X-Forwarded-For is attacker-controlled
+// whenever the Node server port is directly reachable (it is only safe
+// behind the repo's Caddy gateway, which overwrites the header with
+// {remote_host}). The application therefore trusts the first XFF hop
+// ONLY when the operator explicitly opts in with POSTYAR_TRUST_PROXY=1
+// (set in production deployments behind the reverse proxy). Without the
+// opt-in every request shares one conservative rate-limit bucket —
+// fail-closed for brute-force throttles (OTP/login/reset/ad metrics),
+// never fail-open.
+const TRUST_PROXY = process.env.POSTYAR_TRUST_PROXY === "1";
+const UNKNOWN_IP = "0.0.0.0";
+
 export function clientIp(req: Request): string {
-  return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() ?? "127.0.0.1";
+  if (TRUST_PROXY) {
+    return req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || UNKNOWN_IP;
+  }
+  // No trusted proxy configured: the header is untrusted and must not
+  // influence security decisions (per-IP throttles, audit attribution).
+  return UNKNOWN_IP;
 }
 
 // ---------------------------------------------------------------------

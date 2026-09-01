@@ -59,6 +59,16 @@ function isPrivateIp(ip: string): boolean {
 }
 
 /**
+ * Throw UnsafeOutboundUrlError when `ip` points at a protected range.
+ * Exported so the pinned fetcher (http.ts) can re-validate every resolved
+ * address at connect time (C-06 — DNS-rebinding defense).
+ */
+export function assertPublicIp(ip: string): void {
+  if (!isPrivateIp(ip)) return;
+  throw new UnsafeOutboundUrlError("آدرس به شبکه داخلی اشاره می‌کند و مجاز نیست.");
+}
+
+/**
  * Validate an outbound URL and return its origin (scheme://host[:port]).
  * Throws UnsafeOutboundUrlError when the URL must not be fetched.
  */
@@ -90,9 +100,10 @@ export async function assertSafeOutboundUrl(
 
   const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   // Literal IPs are checked directly; hostnames are resolved so a DNS
-  // name pointing at an internal address is caught too (DNS rebinding
-  // across the fetch itself remains possible without pinning — the fetch
-  // below happens within the same resolution TTL window).
+  // name pointing at an internal address is caught too. The pinned fetch
+  // helper (pinnedFetchJson in security/http.ts) connects to one of these
+  // validated addresses directly with SNI — closing the DNS-rebinding
+  // TOCTOU window that a separate validate-then-fetch would leave open.
   const addresses = net.isIP(hostname)
     ? [hostname]
     : await dns.lookup(hostname, { all: true, verbatim: true }).catch(() => {
@@ -100,9 +111,7 @@ export async function assertSafeOutboundUrl(
       });
   for (const entry of addresses) {
     const ip = typeof entry === "string" ? entry : entry.address;
-    if (isPrivateIp(ip)) {
-      throw new UnsafeOutboundUrlError("آدرس به شبکه داخلی اشاره می‌کند و مجاز نیست.");
-    }
+    assertPublicIp(ip);
   }
   return url;
 }

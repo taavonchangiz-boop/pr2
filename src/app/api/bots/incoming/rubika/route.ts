@@ -22,7 +22,7 @@ import { decryptString } from "@/lib/security/crypto";
 import { requireCronSecret } from "@/lib/server/cron-secret";
 import { audit } from "@/lib/server/auth";
 import { claimUpdateOnce } from "@/lib/bots/webhook-guard";
-import { executeWorkflow } from "@/lib/bots/workflow";
+import { executeWorkflow, persistInboundOnce } from "@/lib/bots/workflow";
 import type { BotWorkflow } from "@prisma/client";
 
 const PollSchema = z.object({
@@ -155,6 +155,10 @@ export async function POST(req: Request) {
     }
     if (!chatId) continue;
 
+    // C-11/C-12: persist the inbound history row ONCE per event (owned by
+    // the poller layer, not per workflow).
+    await persistInboundOnce(bot, chatId, incomingText, update, uid, providerMessageId);
+
     // Link-code consumption attempt.
     if (incomingText.startsWith("POSTYAR-")) {
       const { consumeLinkCode } = await import("@/lib/bots/link");
@@ -214,22 +218,6 @@ export async function POST(req: Request) {
           meta: { workflowId: wf.id, name: err instanceof Error ? err.name : "Error" },
         });
       }
-    }
-    if (!matchedAny) {
-      try {
-        await db.botHistory.create({
-          data: {
-            botId: bot.id,
-            direction: "inbound",
-            providerUserId: chatId,
-            text: incomingText.slice(0, 4000),
-            raw: JSON.stringify({
-              _update_id: String(uid),
-              _provider_msg_id: providerMessageId ? String(providerMessageId) : undefined,
-            }),
-          },
-        });
-      } catch { /* ignore */ }
     }
     processed++;
   }

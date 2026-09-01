@@ -91,6 +91,11 @@ function parseJalaliToUtcIso(raw: string | null | undefined, endOfDay: boolean):
   }
 }
 
+function maskMobile(m: string): string {
+  if (m.length < 6) return "••••••";
+  return `${m.slice(0, 4)}•••••${m.slice(-2)}`;
+}
+
 export async function GET(req: Request) {
   let user;
   try {
@@ -194,7 +199,6 @@ export async function GET(req: Request) {
 
     return NextResponse.json({ orders, total, page, pageSize });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    return NextResponse.json({ errorFa: "خطای داخلی سرور." }, { status: 500 });
   }
 }

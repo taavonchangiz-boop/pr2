@@ -10,6 +10,7 @@
 import { db } from "@/lib/db";
 import { audit } from "@/lib/server/auth";
 import { formatRials } from "@/lib/persian";
+import type { Prisma } from "@prisma/client";
 
 // ---------------------------------------------------------------------
 // Read-side: balance + history
@@ -161,6 +162,11 @@ export async function adminAdjustWallet(input: {
       select: { id: true },
     });
     if (!existing) {
+      // Serialize concurrent wallet mutations for this user (C-04): the
+      // row write on User takes the DB row lock (MariaDB InnoDB) so two
+      // concurrent adjustments cannot interleave their read-modify-write
+      // balance computations (SQLite's single writer already serializes).
+      await tx.user.update({ where: { id: input.userId }, data: { updatedAt: new Date() } });
       const prev = await tx.walletTxn.findMany({
         where: { userId: input.userId },
         select: { amountRials: true, direction: true },
@@ -168,6 +174,15 @@ export async function adminAdjustWallet(input: {
       let running = 0;
       for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
       const balanceAfter = running + (direction === "credit" ? amountAbs : -amountAbs);
+
+      // C-04 — BALANCE GUARD: spendable wallet balances are defined to be
+      // non-negative everywhere in the codebase (the refund path already
+      // enforces this). An admin debit that would drive the derived balance
+      // below zero is rejected here — inside the transaction, so no partial
+      // state can exist — instead of silently writing a negative balance.
+      if (direction === "debit" && balanceAfter < 0) {
+        throw new Error("موجودی کیف پول کاربر برای این کاهش اعتبار کافی نیست.");
+      }
 
       await tx.walletTxn.create({
         data: {
@@ -265,6 +280,24 @@ export async function refund(input: {
   const walletIdemKey = `wallet:refund:${input.idempotencyKey}`;
   const ledgerIdemKey = `ledger:refund:${input.idempotencyKey}`;
 
+  // C-03 — the ONE-REFUND-PER-ORDER invariant is now enforced by the
+  // DATABASE, not by a countable query. LedgerEntry.refundKey is a UNIQUE
+  // nullable column; the refund row carries `refund:<orderId>` so two
+  // concurrent refund transactions for the same order can never both
+  // commit — the loser observes the UNIQUE violation and converges on the
+  // winner's already-committed refund (exact idempotency on replay).
+  const refundInvariantKey = `refund:${order.id}`;
+
+  const computeBalance = async (tx: Prisma.TransactionClient): Promise<number> => {
+    const txns = await tx.walletTxn.findMany({
+      where: { userId: order.userId },
+      select: { amountRials: true, direction: true },
+    });
+    let bal = 0;
+    for (const t of txns) bal += t.direction === "credit" ? t.amountRials : -t.amountRials;
+    return bal;
+  };
+
   const result = await db.$transaction(async (tx) => {
     // Idempotent re-entry: an existing ledger row for this exact key means
     // this refund was already applied — report the true balance, change
@@ -274,39 +307,47 @@ export async function refund(input: {
       select: { id: true },
     });
     if (existingLedger) {
-      const txns = await tx.walletTxn.findMany({
-        where: { userId: order.userId },
-        select: { amountRials: true, direction: true },
-      });
-      let bal = 0;
-      for (const t of txns) bal += t.direction === "credit" ? t.amountRials : -t.amountRials;
-      return { balanceAfter: bal, duplicate: true as const };
-    }
-
-    // Invariant: ONE refund per order regardless of kind.
-    const refundCount = await tx.ledgerEntry.count({
-      where: { orderId: order.id, eventType: "refund" },
-    });
-    if (refundCount > 0) {
-      throw new Error("این سفارش قبلاً یک بازگشت وجه داشته است.");
+      return { balanceAfter: await computeBalance(tx), duplicate: true as const };
     }
 
     let balanceAfter = 0;
     if (isWalletKind) {
-      const prev = await tx.walletTxn.findMany({
-        where: { userId: order.userId },
-        select: { amountRials: true, direction: true },
-      });
-      let running = 0;
-      for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
-      balanceAfter = running - input.amount;
-
-      // Balance guard BEFORE the write: derived balance must never go
+      // Serialize concurrent wallet mutations for this user, then apply the
+      // balance guard BEFORE any write: derived balance must never go
       // negative; throwing rolls the whole transaction back.
+      await tx.user.update({ where: { id: order.userId }, data: { updatedAt: new Date() } });
+      const running = await computeBalance(tx);
+      balanceAfter = running - input.amount;
       if (balanceAfter < 0) {
         throw new Error("موجودی کیف پول برای بازگشت این مبلغ کافی نیست.");
       }
+    }
 
+    // DB-enforced invariant gate: creating the refund ledger row FIRST —
+    // with the UNIQUE refundKey — decides the sole winner. A concurrent
+    // refund for the same order (even with a DIFFERENT idempotency key)
+    // loses here and converges to "already refunded" without any writes.
+    try {
+      await tx.ledgerEntry.create({
+        data: {
+          userId: order.userId,
+          orderId: order.id,
+          eventType: "refund",
+          amountRials: -input.amount,
+          currency: "IRR",
+          idempotencyKey: ledgerIdemKey,
+          refundKey: refundInvariantKey,
+        },
+      });
+    } catch (err) {
+      const msg = (err as { code?: string; message?: string })?.message ?? "";
+      if (/unique|UNIQUE|constraint/i.test(msg)) {
+        return { balanceAfter: await computeBalance(tx), duplicate: true as const };
+      }
+      throw err;
+    }
+
+    if (isWalletKind) {
       await tx.walletTxn.create({
         data: {
           userId: order.userId,
@@ -320,16 +361,6 @@ export async function refund(input: {
       });
     }
 
-    await tx.ledgerEntry.create({
-      data: {
-        userId: order.userId,
-        orderId: order.id,
-        eventType: "refund",
-        amountRials: -input.amount,
-        currency: "IRR",
-        idempotencyKey: ledgerIdemKey,
-      },
-    });
     await tx.notification.create({
       data: {
         userId: order.userId,

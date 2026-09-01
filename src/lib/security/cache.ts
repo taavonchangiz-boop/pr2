@@ -31,7 +31,6 @@ type Entry = { value: unknown; expiresAt: number | null };
 const store = new Map<string, Entry>();
 const counters = new Map<string, { count: number; expiresAt: number }>();
 const locks = new Map<string, { holder: string; expiresAt: number }>();
-const idemStore = new Map<string, { result: unknown; expiresAt: number }>();
 
 function now(): number { return Date.now(); }
 
@@ -42,7 +41,8 @@ if (typeof setInterval !== "undefined") {
     for (const [k, v] of store) if (v.expiresAt && v.expiresAt < t) store.delete(k);
     for (const [k, v] of counters) if (v.expiresAt < t) counters.delete(k);
     for (const [k, v] of locks) if (v.expiresAt < t) locks.delete(k);
-    for (const [k, v] of idemStore) if (v.expiresAt < t) idemStore.delete(k);
+    for (const [k, v] of idemMemClaims) if (v.expiresAt < t) idemMemClaims.delete(k);
+    for (const [k, v] of idemMemResults) if (v.expiresAt < t) idemMemResults.delete(k);
   }, 60_000).unref?.();
 }
 
@@ -205,36 +205,88 @@ export async function releaseLock(key: string, holder: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------
-// Idempotency — ATOMIC claim (P0.12 ROOT-CAUSE FIX)
+// Idempotency — ATOMIC, COMPLETION-AWARE claim protocol (C-01 ROOT-CAUSE FIX)
 // ---------------------------------------------------------------------
-// The previous implementation was GET → fn() → SET: N concurrent callers
-// with the same key ALL executed the business function (double quota
-// consumption, double side effects). It was not idempotent.
+// The previous Redis protocol stored the result at `idem:<key>:result` and
+// DELETED the claim marker on completion. A later sequential duplicate
+// then found no claim, re-acquired a fresh one and re-executed fn() — the
+// operation was NOT idempotent after completion.
 //
-// New protocol (works identically on Redis and the dev-only in-memory map):
-//   1. ATOMICALLY claim the key: SET idem:<key> = "__claim__:<holder>" NX PX
-//      <claimTtl>. Only ONE caller wins the claim.
-//   2. The winner runs fn(), stores the JSON result (PX ttlMs), deletes the
-//      claim marker, and returns.
-//   3. Losers POLL for the result (bounded by waitTimeoutMs). When the
-//      winner finishes, every loser returns the SAME result — the business
-//      function executed exactly once.
-//   4. ABANDONED claims (winner crashed mid-flight) are safe: the claim
-//      marker expires after claimTtl; the next caller takes over and
-//      re-executes. This is why claimTtl must exceed the business
-//      function's worst-case duration. Durable correctness for money/
-//      security operations additionally relies on DB-level uniqueness
-//      (e.g. AiJob.idempotencyKey) layered under this claim.
+// New protocol (identical semantics on Redis and the dev-only in-memory
+// fallback; every state transition is atomic):
+//
+//   Claim key `idem:<key>` holds exactly one of:
+//     * `__inflight__<holder>`  — an execution is in flight (PX claimTtl)
+//     * `__done__`              — a result was completed successfully
+//                                 (PX resultTtl — same TTL as the result)
+//   Result key `idem:<key>:result` holds the JSON result (PX resultTtl).
+//
+//   ACQUIRE (Lua, atomic):
+//     1. claim == done        → read result; result present → return it
+//                                (a completed result NEVER re-executes fn)
+//     2. claim absent         → SET claim=inflight NX PX claimTtl
+//                                → won: caller owns the execution
+//     3. claim == inflight    → report in-flight (caller polls)
+//
+//   COMPLETE (Lua, atomic — winner only, holder-checked):
+//     SET result PX ttl; SET claim=done PX ttl — one atomic step, so a
+//     done marker can never exist without its result.
+//
+//   ABORT (Lua, holder-checked): fn threw → DEL the claim so the next
+//     caller retries. Failed operations are NEVER cached as results.
+//
+//   ABANDONED claims (winner crashed mid-flight): the inflight marker
+//     expires after claimTtl; the next ACQUIRE takes over safely. This is
+//     why claimTtl must exceed the business function's worst-case
+//     duration. Durable correctness for money/security operations
+//     additionally relies on DB-level uniqueness (e.g.
+//     AiJob.idempotencyKey) layered beneath this claim.
 //
 // `opts.critical`: when true, the function REFUSES to run without a real
 // Redis connection in production (fail closed). The process-local Map is
 // acceptable ONLY for dev/test single-process operation — never silently
 // for production-critical money/security paths.
 // ---------------------------------------------------------------------
-const IDEM_CLAIM_PREFIX = "__claim__:";
+const IDEM_INFLIGHT_PREFIX = "__inflight__";
+const IDEM_DONE = "__done__";
 const IDEM_DEFAULT_CLAIM_TTL_MS = 90_000; // > AI provider timeout + margin
 const IDEM_POLL_INTERVAL_MS = 120;
 const IDEM_DEFAULT_WAIT_MS = 120_000;
+
+const IDEM_ACQUIRE_LUA = `
+local claim = redis.call('GET', KEYS[1])
+if claim == ARGV[3] then
+  local result = redis.call('GET', KEYS[2])
+  if result then return {2, result} end
+  redis.call('DEL', KEYS[1])
+  claim = false
+end
+if not claim then
+  local ok = redis.call('SET', KEYS[1], ARGV[4] .. ARGV[1], 'PX', ARGV[2], 'NX')
+  if ok then return {1, ''} end
+  claim = redis.call('GET', KEYS[1])
+end
+return {0, claim}
+`;
+
+const IDEM_COMPLETE_LUA = `
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[4] .. ARGV[1] then
+  redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3])
+  redis.call('SET', KEYS[1], ARGV[5], 'PX', ARGV[3])
+  return 1
+end
+return 0
+`;
+
+const IDEM_ABORT_LUA = `
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[2] .. ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0
+`;
 
 export interface IdempotencyOptions {
   /** TTL of the stored result (default 24h). */
@@ -247,64 +299,163 @@ export interface IdempotencyOptions {
   critical?: boolean;
 }
 
-async function idempotencyRedis<T>(
-  client: NonNullable<ReturnType<typeof getRedis>>,
-  idemKey: string,
+interface IdempotencyConfig {
+  ttlMs: number;
+  claimTtlMs: number;
+  waitTimeoutMs: number;
+}
+
+type AcquireOutcome =
+  | { state: "claimed" }
+  | { state: "inflight" }
+  | { state: "completed"; raw: string };
+
+interface IdempotencyBackend {
+  acquire(key: string, holder: string, cfg: IdempotencyConfig): Promise<AcquireOutcome>;
+  complete(key: string, holder: string, resultJson: string, cfg: IdempotencyConfig): Promise<void>;
+  abort(key: string, holder: string): Promise<void>;
+  /** Result lookup for pollers (null while absent). */
+  getResult(key: string): Promise<string | null>;
+}
+
+// ---------------- Redis backend (production) ----------------
+function redisIdempotencyBackend(client: NonNullable<ReturnType<typeof getRedis>>): IdempotencyBackend {
+  return {
+    async acquire(key, holder, cfg) {
+      const claimKey = `idem:${key}`;
+      const res = (await client.eval(
+        IDEM_ACQUIRE_LUA, 2, claimKey, `${claimKey}:result`,
+        holder, String(cfg.claimTtlMs), IDEM_DONE, IDEM_INFLIGHT_PREFIX,
+      )) as [number, string | null];
+      if (res[0] === 1) return { state: "claimed" };
+      if (res[0] === 2) return { state: "completed", raw: String(res[1] ?? "") };
+      return { state: "inflight" };
+    },
+    async complete(key, holder, resultJson, cfg) {
+      const claimKey = `idem:${key}`;
+      await client.eval(
+        IDEM_COMPLETE_LUA, 2, claimKey, `${claimKey}:result`,
+        holder, resultJson, String(cfg.ttlMs), IDEM_INFLIGHT_PREFIX, IDEM_DONE,
+      );
+    },
+    async abort(key, holder) {
+      const claimKey = `idem:${key}`;
+      await client.eval(
+        IDEM_ABORT_LUA, 1, claimKey,
+        holder, IDEM_INFLIGHT_PREFIX,
+      );
+    },
+    async getResult(key) {
+      return client.get(`idem:${key}:result`);
+    },
+  };
+}
+
+// ---------------- In-memory backend (dev/test only) ----------------
+// Mirrors the Redis state machine exactly: claim → done/result, result
+// checked BEFORE a new claim is created, failures release the claim
+// without storing a result.
+interface MemClaim { holder: string; expiresAt: number; done: boolean }
+const idemMemClaims = new Map<string, MemClaim>();
+const idemMemResults = new Map<string, { raw: string; expiresAt: number }>();
+
+function memIdempotencyBackend(): IdempotencyBackend {
+  return {
+    async acquire(key, holder, cfg) {
+      const t = now();
+      const result = idemMemResults.get(key);
+      const claim = idemMemClaims.get(key);
+      if (claim && claim.done && claim.expiresAt > t) {
+        if (result && result.expiresAt > t) return { state: "completed", raw: result.raw };
+        idemMemClaims.delete(key); // done marker without result → reset
+        idemMemResults.delete(key);
+      } else if (claim && claim.expiresAt <= t) {
+        idemMemClaims.delete(key); // abandoned claim expired
+      }
+      const fresh = idemMemClaims.get(key);
+      if (!fresh) {
+        // Single-threaded JS: check-then-set without an await between them
+        // is atomic within the process.
+        idemMemClaims.set(key, { holder, expiresAt: t + cfg.claimTtlMs, done: false });
+        return { state: "claimed" };
+      }
+      return { state: "inflight" };
+    },
+    async complete(key, holder, resultJson, cfg) {
+      const t = now();
+      const claim = idemMemClaims.get(key);
+      if (claim && !claim.done && claim.holder === holder && claim.expiresAt > t) {
+        idemMemResults.set(key, { raw: resultJson, expiresAt: t + cfg.ttlMs });
+        idemMemClaims.set(key, { holder, expiresAt: t + cfg.ttlMs, done: true });
+      }
+      // Holder mismatch → claim expired/lost; do nothing (same as Redis).
+    },
+    async abort(key, holder) {
+      const claim = idemMemClaims.get(key);
+      if (claim && claim.holder === holder && !claim.done) idemMemClaims.delete(key);
+    },
+    async getResult(key) {
+      const r = idemMemResults.get(key);
+      if (!r) return null;
+      if (r.expiresAt <= now()) { idemMemResults.delete(key); return null; }
+      return r.raw;
+    },
+  };
+}
+
+async function parseResultOr<T>(raw: string | null): Promise<T | null> {
+  if (raw === null) return null;
+  try { return JSON.parse(raw) as T; } catch { return null; }
+}
+
+async function runIdempotency<T>(
+  backend: IdempotencyBackend,
+  key: string,
   fn: () => Promise<T>,
-  opts: Required<Omit<IdempotencyOptions, "critical">>,
+  cfg: IdempotencyConfig,
 ): Promise<T> {
   const holder = randomToken(12);
-  const claimRes = await client.set(
-    idemKey,
-    `${IDEM_CLAIM_PREFIX}${holder}`,
-    "PX",
-    opts.claimTtlMs,
-    "NX",
-  );
-  if (claimRes === "OK") {
-    // We own the claim — run the function exactly once.
+  const first = await backend.acquire(key, holder, cfg);
+  if (first.state === "completed") {
+    const parsed = await parseResultOr<T>(first.raw);
+    if (parsed !== null) return parsed;
+  } else if (first.state === "claimed") {
     try {
       const result = await fn();
-      await client.set(idemKey + ":result", JSON.stringify(result), "PX", opts.ttlMs);
+      await backend.complete(key, holder, JSON.stringify(result), cfg);
       return result;
-    } finally {
-      // Release the claim so late losers read the result (or take over
-      // after claim TTL expiry if fn threw before a result was stored).
-      const current = await client.get(idemKey);
-      if (current === `${IDEM_CLAIM_PREFIX}${holder}`) {
-        await client.del(idemKey);
-      }
+    } catch (err) {
+      // Failure semantics: release the claim, store NO result — the next
+      // caller retries the operation.
+      await backend.abort(key, holder).catch(() => undefined);
+      throw err;
     }
   }
 
-  // Someone else holds the claim — poll for the result.
-  const deadline = Date.now() + opts.waitTimeoutMs;
-  while (Date.now() < deadline) {
-    const raw = await client.get(idemKey + ":result");
+  // Someone else holds the claim — poll for the durable result; take over
+  // the claim if it is abandoned.
+  const deadline = Date.now() + cfg.waitTimeoutMs;
+  for (;;) {
+    const raw = await backend.getResult(key);
     if (raw !== null) {
-      try { return JSON.parse(raw) as T; } catch { /* fall through to retry */ }
+      const parsed = await parseResultOr<T>(raw);
+      if (parsed !== null) return parsed;
     }
-    const current = await client.get(idemKey);
-    if (current === null) {
-      // Claim released but result not visible yet (crash between del and
-      // set, or abandoned). Retry the claim once via the outer loop below.
-      const reClaim = await client.set(idemKey, `${IDEM_CLAIM_PREFIX}${holder}`, "PX", opts.claimTtlMs, "NX");
-      if (reClaim === "OK") {
-        try {
-          // Check again — the previous winner may have stored the result
-          // between our read and our claim.
-          const raw2 = await client.get(idemKey + ":result");
-          if (raw2 !== null) {
-            try { return JSON.parse(raw2) as T; } catch { /* re-run */ }
-          }
-          const result = await fn();
-          await client.set(idemKey + ":result", JSON.stringify(result), "PX", opts.ttlMs);
-          return result;
-        } finally {
-          const cur2 = await client.get(idemKey);
-          if (cur2 === `${IDEM_CLAIM_PREFIX}${holder}`) await client.del(idemKey);
-        }
+    if (Date.now() >= deadline) break;
+    const acq = await backend.acquire(key, holder, cfg);
+    if (acq.state === "claimed") {
+      try {
+        const result = await fn();
+        await backend.complete(key, holder, JSON.stringify(result), cfg);
+        return result;
+      } catch (err) {
+        await backend.abort(key, holder).catch(() => undefined);
+        throw err;
       }
+    }
+    if (acq.state === "completed") {
+      const parsed = await parseResultOr<T>(acq.raw);
+      if (parsed !== null) return parsed;
     }
     await new Promise((r) => setTimeout(r, IDEM_POLL_INTERVAL_MS));
   }
@@ -312,16 +463,13 @@ async function idempotencyRedis<T>(
   throw new Error("عملیات هم‌زمان با کلید یکتا بیش از حد طول کشید. دوباره تلاش کنید.");
 }
 
-// In-memory fallback claim registry (dev/test only).
-const idemClaims = new Map<string, { holder: string; expiresAt: number }>();
-
 export async function idempotency<T>(
   key: string,
   fn: () => Promise<T>,
   ttlMs: number = 24 * 60 * 60 * 1000,
   opts: IdempotencyOptions = {},
 ): Promise<T> {
-  const cfg = {
+  const cfg: IdempotencyConfig = {
     ttlMs: opts.ttlMs ?? ttlMs,
     claimTtlMs: opts.claimTtlMs ?? IDEM_DEFAULT_CLAIM_TTL_MS,
     waitTimeoutMs: opts.waitTimeoutMs ?? IDEM_DEFAULT_WAIT_MS,
@@ -329,7 +477,7 @@ export async function idempotency<T>(
   await maybeRefresh();
   const client = getRedis();
   if (client && _isRedisLive) {
-    return idempotencyRedis<T>(client, `idem:${key}`, fn, cfg);
+    return runIdempotency<T>(redisIdempotencyBackend(client), key, fn, cfg);
   }
 
   // --- Fallback (dev/test only) ---
@@ -338,49 +486,37 @@ export async function idempotency<T>(
     // on a process-local Map (no cross-process serialization).
     throw new Error("عملیات حساس مالی نیاز به اتصال واقعی Redis دارد که در این محیط فعال نیست.");
   }
-
-  const idemKey = `idem:${key}`;
-  const t = now();
-  const existingClaim = idemClaims.get(idemKey);
-  const existingResult = idemStore.get(key);
-
-  if (existingResult && existingResult.expiresAt > t) {
-    return existingResult.result as T;
-  }
-
-  if (!existingClaim || existingClaim.expiresAt < t) {
-    // Claim atomically (single-threaded JS — check+set without await in
-    // between is atomic).
-    idemClaims.set(idemKey, { holder: "self", expiresAt: t + cfg.claimTtlMs });
-    try {
-      const result = await fn();
-      idemStore.set(key, { result, expiresAt: now() + cfg.ttlMs });
-      return result;
-    } finally {
-      idemClaims.delete(idemKey);
-    }
-  }
-
-  // Another in-flight claim — poll for the result.
-  const deadline = Date.now() + cfg.waitTimeoutMs;
-  while (Date.now() < deadline) {
-    const res = idemStore.get(key);
-    if (res && res.expiresAt > now()) return res.result as T;
-    if (!idemClaims.has(idemKey)) {
-      // Claim disappeared (finished with error or evicted) — take over.
-      idemClaims.set(idemKey, { holder: "self", expiresAt: now() + cfg.claimTtlMs });
-      try {
-        const result = await fn();
-        idemStore.set(key, { result, expiresAt: now() + cfg.ttlMs });
-        return result;
-      } finally {
-        idemClaims.delete(idemKey);
-      }
-    }
-    await new Promise((r) => setTimeout(r, IDEM_POLL_INTERVAL_MS));
-  }
-  throw new Error("عملیات هم‌زمان با کلید یکتا بیش از حد طول کشید. دوباره تلاش کنید.");
+  return runIdempotency<T>(memIdempotencyBackend(), key, fn, cfg);
 }
+
+// ---------------------------------------------------------------------
+// TEST HOOKS — used exclusively by tests/cache-idempotency-redis.test.ts
+// to drive the RAW Redis state machine (claim lifecycle, done-marker
+// visibility, abandoned claims) without going through the high-level
+// idempotency() orchestration. Not used by production call-sites.
+// ---------------------------------------------------------------------
+export const IDEM_TEST_HOOKS = {
+  claimKeyFor(key: string): string {
+    return `idem:${key}`;
+  },
+  /** Raw ACQUIRE script evaluation (returns the [state, payload] pair). */
+  async rawEvalAcquire(claimKey: string, holder: string, claimTtlMs: number): Promise<[number, string | null]> {
+    const client = getRedis();
+    if (!client) throw new Error("redis not available");
+    const res = (await client.eval(
+      IDEM_ACQUIRE_LUA, 2, claimKey, `${claimKey}:result`,
+      holder, String(claimTtlMs), IDEM_DONE, IDEM_INFLIGHT_PREFIX,
+    )) as [number, string | null];
+    return res;
+  },
+  /** Raw SET-inflight claim with a tiny TTL (abandoned-claim simulation). */
+  async rawEvalClaimTiny(claimKey: string, holder: string, ttlMs: number): Promise<number> {
+    const client = getRedis();
+    if (!client) throw new Error("redis not available");
+    const res = await client.set(claimKey, `${IDEM_INFLIGHT_PREFIX}${holder}`, "PX", ttlMs, "NX");
+    return res === "OK" ? 1 : 0;
+  },
+};
 
 // ---------------------------------------------------------------------
 // Public API for the health endpoint to call a fresh PING.

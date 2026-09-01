@@ -18,6 +18,7 @@ import { db } from "@/lib/db";
 import { cache } from "@/lib/security/cache";
 import { audit, safeJsonParse } from "@/lib/server/auth";
 import { dispatchAi } from "./dispatch";
+import { hashToken } from "@/lib/security/crypto";
 
 function redact(input: Record<string, unknown>): Record<string, unknown> {
   // For audit-only fields. The senderId/destinationId are NOT secrets;
@@ -135,7 +136,7 @@ export async function evalResponder(input: EvalResponderInput): Promise<EvalResp
   const text = input.incomingText.trim();
   let matchedIdx = -1;
   for (let i = 0; i < rules.length; i++) {
-    if (ruleMatches(rules[i], text)) {
+    if (await ruleMatches(rules[i], text)) {
       matchedIdx = i;
       break;
     }
@@ -181,7 +182,7 @@ export async function evalResponder(input: EvalResponderInput): Promise<EvalResp
       systemPrompt: "تو دستیار پاسخگوی خودکار پُست‌یار هستی. پاسخ‌ها را فارسی، کوتاه، مفید و مودبانه بنویس. از توضیح اضافه پرهیز کن.",
       temperature: 0.5,
       maxTokens: 400,
-      idempotencyKey: `autoresp:${input.userId}:${input.senderId}:${matchedIdx}:${Date.now()}`,
+      idempotencyKey: `autoresp:${input.userId}:${input.senderId}:${matchedIdx}:${hashToken(input.incomingText).slice(0, 32)}`,
       meta: { destinationId: input.destinationId, ruleIndex: matchedIdx },
     });
     if (!result.ok || !result.content) {
@@ -226,7 +227,7 @@ export async function evalResponder(input: EvalResponderInput): Promise<EvalResp
 // ---------------------------------------------------------------------
 // Rule matching
 // ---------------------------------------------------------------------
-function ruleMatches(rule: ResponderRule, text: string): boolean {
+async function ruleMatches(rule: ResponderRule, text: string): Promise<boolean> {
   const mode = rule.matchMode ?? "contains";
   for (const kw of rule.keywords ?? []) {
     if (!kw) continue;
@@ -234,17 +235,16 @@ function ruleMatches(rule: ResponderRule, text: string): boolean {
       if (mode === "exact" && text.toLowerCase() === kw.toLowerCase()) return true;
       if (mode === "contains" && text.toLowerCase().includes(kw.toLowerCase())) return true;
       if (mode === "regex") {
-        // ROOT-CAUSE FIX (audit — ReDoS): `new RegExp(kw, "i")` compiled
-        // raw user-authored keywords on the inbound-message hot path, so a
-        // catastrophic-backtracking pattern (e.g. `(a+)+$`) could stall
-        // the event loop. Guardrails: cap pattern length, strip control
-        // chars, cap test-input length, and bound run time with a
-        // wall-clock check on chunks of the input.
+        // ROOT-CAUSE FIX (audit — ReDoS): user-authored regexes are run in
+        // a short-lived WORKER THREAD with a hard wall-clock budget — a
+        // catastrophic-backtracking pattern (e.g. `(a+)+$`) can no longer
+        // stall the shared event loop (the worker is terminated, the rule
+        // is treated as non-matching). Caps on pattern/input length and
+        // control-char stripping remain as defense in depth.
         if (kw.length > 120) continue;
         const safeKw = kw.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "");
-        const re = new RegExp(safeKw, "i");
         const hay = text.length > 4000 ? text.slice(0, 4000) : text;
-        if (re.test(hay)) return true;
+        if (await boundedRegexTest(safeKw, hay)) return true;
       }
     } catch {
       // bad regex — skip this kw
@@ -277,5 +277,43 @@ async function markFired(
     });
   } catch {
     // best-effort
+  }
+}
+
+// ---------------------------------------------------------------------
+// ReDoS isolation: bounded regex execution in a worker thread.
+// A catastrophic-backtracking pattern can only burn its own worker (hard
+// 250ms budget, then terminate) — never the shared event loop.
+// ---------------------------------------------------------------------
+import { Worker } from "node:worker_threads";
+
+const REGEX_BUDGET_MS = 250;
+
+async function boundedRegexTest(pattern: string, input: string): Promise<boolean> {
+  try {
+    const workerSrc =
+      'const { workerData, parentPort } = require("node:worker_threads");' +
+      'const re = new RegExp(workerData.pattern, "i");' +
+      'parentPort.postMessage(re.test(workerData.input));';
+    const w = new Worker(workerSrc, { eval: true, workerData: { pattern, input } });
+    const outcome = await new Promise<boolean | null>((resolve) => {
+      const timer = setTimeout(() => {
+        w.terminate().catch(() => undefined);
+        resolve(null);
+      }, REGEX_BUDGET_MS);
+      w.on("message", (v: unknown) => {
+        clearTimeout(timer);
+        resolve(typeof v === "boolean" ? v : null);
+      });
+      w.on("error", () => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+    });
+    return outcome === true;
+  } catch {
+    // Worker unavailable or invalid pattern — treat as non-matching
+    // (never run the regex unbounded on the hot path).
+    return false;
   }
 }

@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { requireUser, clientIp, audit, AuthError } from "@/lib/server/auth";
+import { requirePlanFeature } from "@/lib/payments/plans";
 import { formatJalaliDateTime } from "@/lib/persian";
 
 function toView(b: {
@@ -58,6 +59,14 @@ export async function POST(req: Request) {
   let user;
   try { user = await requireUser(); } catch (e) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
+  }
+  // P0.15/H-1 — gold bots are a plan feature.
+  try {
+    await requirePlanFeature(user.id, "goldBot");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    const msg = e instanceof AuthError ? e.message : "امکان ربات طلا در پلن فعلی شما فعال نیست.";
+    return NextResponse.json({ errorFa: msg }, { status });
   }
   const ip = clientIp(req);
   let body: unknown;

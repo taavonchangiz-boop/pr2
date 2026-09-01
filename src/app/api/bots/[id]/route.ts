@@ -100,7 +100,20 @@ export async function PATCH(
   if (parsed.data.username !== undefined) data.username = parsed.data.username;
   if (parsed.data.status !== undefined) data.status = parsed.data.status;
   if (parsed.data.config !== undefined) data.config = JSON.stringify(parsed.data.config);
-  if (parsed.data.destinationId !== undefined) data.destinationId = parsed.data.destinationId;
+  if (parsed.data.destinationId !== undefined) {
+    // L-1: the reference must exist AND belong to the bot owner (the old
+    // code persisted any client-supplied id — dangling/cross-user refs).
+    if (parsed.data.destinationId !== null) {
+      const dest = await db.destination.findUnique({
+        where: { id: parsed.data.destinationId },
+        select: { ownerId: true, provider: true },
+      });
+      if (!dest || dest.ownerId !== user.id) {
+        return NextResponse.json({ errorFa: "مقصد نامعتبر است یا متعلق به شما نیست." }, { status: 400 });
+      }
+    }
+    data.destinationId = parsed.data.destinationId;
+  }
   if (parsed.data.botToken !== undefined) {
     // Re-verify the new token
     if (!isValidProviderName(existing.provider)) {

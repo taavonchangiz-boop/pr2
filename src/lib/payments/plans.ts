@@ -413,6 +413,21 @@ const SEED_PLANS: Array<{
 
 let seedPromise: Promise<void> | null = null;
 
+/**
+ * C-09 — PLANS SEEDING IS CREATE-ONLY.
+ *
+ * Seeding provisions MISSING seed plans; it NEVER overwrites live rows.
+ * The previous upsert wrote the hard-coded seed `quota`/`features` over
+ * the existing row on every module load — a process restart silently
+ * reverted every administrator customization (prices, features, quota).
+ * Bootstrap (create missing plans) and operator changes (admin routes)
+ * are now strictly separated; there is no implicit runtime migration of
+ * legacy rows anymore.
+ *
+ * Legacy 0-as-unlimited rows are migrated ONCE by the explicit, versioned
+ * operator migration `migrateLegacyPlanQuotaShape()` (below) — never by
+ * an implicit module-import side effect.
+ */
 export async function ensurePlansSeeded(): Promise<void> {
   if (seedPromise) {
     await seedPromise;
@@ -426,6 +441,8 @@ export async function ensurePlansSeeded(): Promise<void> {
   }
   seedPromise = (async () => {
     for (const p of SEED_PLANS) {
+      // CREATE-ONLY: an existing row (with any admin configuration) is
+      // left completely untouched.
       await db.plan.upsert({
         where: { code: p.code },
         create: {
@@ -439,20 +456,60 @@ export async function ensurePlansSeeded(): Promise<void> {
           isPublic: p.isPublic,
           active: p.active,
         },
-        update: {
-          // Refresh volatile + semantic fields — including `features` and
-          // `quota`, which deterministically migrates legacy rows that relied
-          // on the old "0 = unlimited" overload (P0.2). Prices are NEVER
-          // overwritten so an admin-adjusted price survives re-seeding.
-          nameFa: p.nameFa,
-          descriptionFa: p.descriptionFa,
-          quota: JSON.stringify(p.quota),
-          features: JSON.stringify(p.features),
-        },
+        update: {},
       });
     }
   })();
   return seedPromise;
+}
+
+/**
+ * C-09 — EXPLICIT one-shot migration for legacy plan rows that relied on
+ * the pre-P0.2 overload `0 = unlimited` in `features` numerics. Runs only
+ * when the recorded `plan_quota_shape_migration` SystemSetting marker is
+ * absent, is idempotent, and NEVER touches price/name/description. To be
+ * invoked by an operator (script/admin endpoint), not on module load —
+ * implicit runtime mutation of live admin configuration is forbidden.
+ *
+ * Semantics: numeric feature values of 0 that are KNOWN to have been
+ * unlimited in the legacy seed (publishPerMonth/aiPerMonth/channels on
+ * the business plan) become UNLIMITED_QUOTA; every other 0 keeps the new
+ * `0 = disabled` meaning. A numeric key absent from the row is left alone.
+ */
+export const PLAN_QUOTA_SHAPE_MIGRATION_KEY = "plan_quota_shape_migration";
+export async function migrateLegacyPlanQuotaShape(): Promise<{ changed: number; skipped: boolean }> {
+  const marker = await db.systemSetting.findUnique({
+    where: { key: PLAN_QUOTA_SHAPE_MIGRATION_KEY },
+    select: { id: true },
+  });
+  if (marker) return { changed: 0, skipped: true };
+
+  let changed = 0;
+  const plans = await db.plan.findMany({ where: { code: { in: SEED_PLANS.map((p) => p.code) } } });
+  for (const plan of plans) {
+    const seed = SEED_PLANS.find((p) => p.code === plan.code);
+    if (!seed) continue;
+    const features = parsePlanFeatures(plan.features);
+    let touched = false;
+    // The legacy business seed used 0 to mean unlimited for these dims.
+    const legacyUnlimitedDims: PlanNumericFeatureKey[] = [
+      "publishPerMonth", "aiPerMonth", "channels", "bots",
+      "destinations", "contentItems", "glassButtonsPerDest", "workflowSteps",
+    ];
+    for (const dim of legacyUnlimitedDims) {
+      const current = features[dim];
+      if (current === 0 && seed.features[dim] === UNLIMITED_QUOTA && plan.code === "business") {
+        features[dim] = UNLIMITED_QUOTA;
+        touched = true;
+      }
+    }
+    if (touched) {
+      await db.plan.update({ where: { id: plan.id }, data: { features: JSON.stringify(features) } });
+      changed += 1;
+    }
+  }
+  await db.systemSetting.create({ data: { key: PLAN_QUOTA_SHAPE_MIGRATION_KEY, value: new Date().toISOString() } });
+  return { changed, skipped: false };
 }
 
 // Run on module load (idempotent)
@@ -512,11 +569,22 @@ export async function createOrderForSubscription(input: {
   idempotencyKey: string;
   provider?: "card" | "bank" | "bale";
   metadata?: Record<string, unknown>;
+  /** Explicit privileged-purchase bypass (admin/internal paths only). */
+  allowNonPublicPlan?: boolean;
 }): Promise<{ order: { id: string; amountRials: number; status: string; descriptionFa: string }; created: boolean }> {
   await ensurePlansSeeded();
   const plan = await db.plan.findUnique({ where: { id: input.planId } });
   if (!plan || !plan.active) {
     throw new AuthError("طرح انتخاب‌شده معتبر یا فعال نیست.", 400);
+  }
+  // C-08 — the authoritative business rule:
+  //   `active`     = internally usable (admin/internal references)
+  //   `isPublic`   = purchasable through the ordinary public purchase APIs
+  // Ordinary customer purchase paths MUST enforce BOTH. A hidden plan can
+  // only be bought through an explicitly privileged path
+  // (allowNonPublicPlan: true — currently NO public route sets it).
+  if (!plan.isPublic && input.allowNonPublicPlan !== true) {
+    throw new AuthError("طرح انتخاب‌شده برای خرید عمومی در دسترس نیست.", 403);
   }
   // Try to create with idempotencyKey UNIQUE — if it exists, return that.
   const existing = await db.order.findUnique({
@@ -795,60 +863,99 @@ export async function activateSubscription(input: {
       if (!plan) {
         throw new AuthError("طرح مرتبط با سفارش یافت نشد.", 500);
       }
-      const now = new Date();
-      const addInterval = (from: Date): Date => {
-        const d = new Date(from);
-        d.setMonth(d.getMonth() + plan.intervalMonths);
-        return d;
-      };
-      // P0.9 — DB-backed uniqueness: the live subscription row per
-      // (user, plan) is identified by the UNIQUE `activeKey`. Renewal
-      // extends endsAt from max(existing.endsAt, now); a concurrent
-      // purchase of the same plan loses the UNIQUE race and converges on
-      // the winner's row via renewal (never creates a second live row).
-      const activeKey = `${order.userId}:${plan.id}`;
-      const existing = await tx.subscription.findUnique({ where: { activeKey } });
-      if (!existing) {
-        try {
-          const created = await tx.subscription.create({
-            data: {
-              userId: order.userId,
-              planId: plan.id,
-              status: "active",
-              startedAt: now,
-              endsAt: addInterval(now),
-              usedQuota: "{}",
-              activeKey,
-            },
-          });
-          subscriptionId = created.id;
-          endsAt = created.endsAt;
-        } catch (err) {
-          // Concurrent activation created the row first — renew it instead.
-          const msg = (err as { code?: string; message?: string })?.message ?? "";
-          if (!/unique|UNIQUE|constraint/i.test(msg)) throw err;
-          const winner = await tx.subscription.findUnique({ where: { activeKey } });
-          if (!winner) {
-            throw new AuthError("خطای هم‌زمانی در فعال‌سازی اشتراک.", 500);
+      // H-1 — PER-ORDER FULFILLMENT MARKER (database-enforced): the
+      // renewal/creation below runs EXACTLY ONCE per order. The previous
+      // code extended `endsAt` unconditionally, so re-entry on an
+      // already-paid order (duplicate payment webhook, admin approve
+      // retry, crash-recovery heal) granted a FREE extra interval on every
+      // replay. The UNIQUE LedgerEntry.idempotencyKey makes the marker
+      // insert the atomic arbiter: the first fulfillment wins, every
+      // later re-entry observes the row and skips the interval extension
+      // (ledger/wallet/referral upserts remain safe no-op heals).
+      const fulfilKey = `sub:fulfil:${order.id}`;
+      let firstFulfilment = false;
+      try {
+        await tx.ledgerEntry.create({
+          data: {
+            userId: order.userId,
+            orderId: order.id,
+            eventType: "subscription",
+            amountRials: 0,
+            currency: "IRR",
+            idempotencyKey: fulfilKey,
+          },
+        });
+        firstFulfilment = true;
+      } catch (err) {
+        const msg = (err as { code?: string; message?: string })?.message ?? "";
+        if (!/unique|UNIQUE|constraint/i.test(msg)) throw err;
+        firstFulfilment = false;
+      }
+      if (!firstFulfilment) {
+        // This order already activated its interval — pure idempotent
+        // re-entry. Report the current live subscription state.
+        const existingSub = await tx.subscription.findUnique({
+          where: { activeKey: `${order.userId}:${plan.id}` },
+          select: { id: true, endsAt: true },
+        });
+        subscriptionId = existingSub?.id ?? "";
+        endsAt = existingSub?.endsAt ?? new Date(0);
+      } else {
+        const now = new Date();
+        const addInterval = (from: Date): Date => {
+          const d = new Date(from);
+          d.setMonth(d.getMonth() + plan.intervalMonths);
+          return d;
+        };
+        // P0.9 — DB-backed uniqueness: the live subscription row per
+        // (user, plan) is identified by the UNIQUE `activeKey`. Renewal
+        // extends endsAt from max(existing.endsAt, now); a concurrent
+        // purchase of the same plan loses the UNIQUE race and converges on
+        // the winner's row via renewal (never creates a second live row).
+        const activeKey = `${order.userId}:${plan.id}`;
+        const existing = await tx.subscription.findUnique({ where: { activeKey } });
+        if (!existing) {
+          try {
+            const created = await tx.subscription.create({
+              data: {
+                userId: order.userId,
+                planId: plan.id,
+                status: "active",
+                startedAt: now,
+                endsAt: addInterval(now),
+                usedQuota: "{}",
+                activeKey,
+              },
+            });
+            subscriptionId = created.id;
+            endsAt = created.endsAt;
+          } catch (err) {
+            // Concurrent activation created the row first — renew it instead.
+            const msg = (err as { code?: string; message?: string })?.message ?? "";
+            if (!/unique|UNIQUE|constraint/i.test(msg)) throw err;
+            const winner = await tx.subscription.findUnique({ where: { activeKey } });
+            if (!winner) {
+              throw new AuthError("خطای هم‌زمانی در فعال‌سازی اشتراک.", 500);
+            }
+            const base = winner.endsAt.getTime() > now.getTime() ? winner.endsAt : now;
+            const newEndsAt = addInterval(base);
+            await tx.subscription.update({
+              where: { id: winner.id },
+              data: { status: "active", endsAt: newEndsAt },
+            });
+            subscriptionId = winner.id;
+            endsAt = newEndsAt;
           }
-          const base = winner.endsAt.getTime() > now.getTime() ? winner.endsAt : now;
+        } else {
+          const base = existing.endsAt.getTime() > now.getTime() ? existing.endsAt : now;
           const newEndsAt = addInterval(base);
           await tx.subscription.update({
-            where: { id: winner.id },
+            where: { id: existing.id },
             data: { status: "active", endsAt: newEndsAt },
           });
-          subscriptionId = winner.id;
+          subscriptionId = existing.id;
           endsAt = newEndsAt;
         }
-      } else {
-        const base = existing.endsAt.getTime() > now.getTime() ? existing.endsAt : now;
-        const newEndsAt = addInterval(base);
-        await tx.subscription.update({
-          where: { id: existing.id },
-          data: { status: "active", endsAt: newEndsAt },
-        });
-        subscriptionId = existing.id;
-        endsAt = newEndsAt;
       }
     }
 
@@ -1018,12 +1125,25 @@ function readQuotaJson(raw: string | null | undefined): Record<string, number> {
  * Returns null only when the free plan itself cannot be resolved, in
  * which case enforcement FAILS CLOSED (callers deny the operation).
  */
-async function ensureQuotaTarget(userId: string): Promise<{
+async function ensureQuotaTarget(
+  userId: string,
+  tx?: Prisma.TransactionClient,
+): Promise<{
   id: string;
   usedQuota: string;
   limitFor(dimension: QuotaDimension): number;
 } | null> {
-  const active = await getActiveSubscription(userId);
+  const client = tx ?? db;
+  const now = new Date();
+  const active = await client.subscription.findFirst({
+    where: {
+      userId,
+      status: "active",
+      endsAt: { gt: now },
+    },
+    orderBy: { createdAt: "desc" },
+    include: { plan: true },
+  });
   if (active) {
     const planQuota = safeJsonParse<PlanQuota>(active.plan.quota, {});
     return {
@@ -1034,13 +1154,12 @@ async function ensureQuotaTarget(userId: string): Promise<{
   }
 
   await ensurePlansSeeded();
-  const freePlan = await db.plan.findUnique({ where: { code: "free" } });
+  const freePlan = await (tx ?? db).plan.findUnique({ where: { code: "free" } });
   if (!freePlan) return null; // fail closed
   const freeQuota = safeJsonParse<PlanQuota>(freePlan.quota, {});
   const activeKey = `${userId}:${freePlan.id}`;
 
-  const existing = await db.subscription.findUnique({ where: { activeKey } });
-  const now = new Date();
+  const existing = await client.subscription.findUnique({ where: { activeKey } });
   const addInterval = (from: Date): Date => {
     const d = new Date(from);
     d.setMonth(d.getMonth() + freePlan.intervalMonths);
@@ -1049,7 +1168,7 @@ async function ensureQuotaTarget(userId: string): Promise<{
 
   if (!existing) {
     try {
-      const created = await db.subscription.create({
+      const created = await client.subscription.create({
         data: {
           userId,
           planId: freePlan.id,
@@ -1069,7 +1188,7 @@ async function ensureQuotaTarget(userId: string): Promise<{
       // Lost the UNIQUE race → use the winner's row.
       const msg = (err as { code?: string; message?: string })?.message ?? "";
       if (!/unique|UNIQUE|constraint/i.test(msg)) throw err;
-      const winner = await db.subscription.findUnique({ where: { activeKey } });
+      const winner = await client.subscription.findUnique({ where: { activeKey } });
       if (!winner) return null;
       return {
         id: winner.id,
@@ -1082,23 +1201,110 @@ async function ensureQuotaTarget(userId: string): Promise<{
   if (existing.endsAt.getTime() <= now.getTime()) {
     // Expired free row → renew + reset the period usage (best-effort CAS;
     // a concurrent renewal just means the row was refreshed for us).
-    await db.subscription.updateMany({
+    await client.subscription.updateMany({
       where: { id: existing.id, endsAt: existing.endsAt },
       data: { status: "active", endsAt: addInterval(now), usedQuota: "{}" },
     });
   } else if (existing.status !== "active") {
-    await db.subscription.updateMany({
+    await client.subscription.updateMany({
       where: { id: existing.id, status: { not: "active" } },
       data: { status: "active" },
     });
   }
-  const fresh = await db.subscription.findUnique({ where: { id: existing.id } });
+  const fresh = await client.subscription.findUnique({ where: { id: existing.id } });
   if (!fresh) return null;
   return {
     id: fresh.id,
     usedQuota: fresh.usedQuota,
     limitFor: (dimension) => freeQuota[dimension] ?? 0,
   };
+}
+
+/**
+ * C-02 — TRANSACTION-BOUND quota reservation for atomic multi-row
+ * operations (publish scheduling). Same P0.2 semantics as
+ * consumeQuotaDetailed (0=disabled, <0=unlimited, >0 finite CAS) but:
+ *   * every read/write runs on the CALLER'S transaction client, and
+ *   * a disabled/exhausted/unconfigured quota THROWS AuthError so the
+ *     surrounding transaction rolls back ALL of the operation (no job
+ *     rows, no content transition) — there is no partial commit and no
+ *     refund/compensation path to get wrong.
+ */
+export async function consumeQuotaInTx(
+  tx: Prisma.TransactionClient,
+  input: { userId: string; dimension: QuotaDimension; amount: number },
+): Promise<void> {
+  if (!Number.isInteger(input.amount) || input.amount <= 0) {
+    throw new AuthError("مقدار افزایش نامعتبر است.", 400);
+  }
+  const target = await ensureQuotaTarget(input.userId, tx);
+  if (!target) throw new AuthError("سهمیه پلن فعلی قابل بررسی نیست.", 403);
+  const limit = target.limitFor(input.dimension);
+  if (limit < 0) {
+    // Unlimited sentinel — advance the observable usage counter.
+    await incrementQuotaUsageInTx(tx, target, input);
+    return;
+  }
+  if (limit === 0) {
+    const dimFa: Record<QuotaDimension, string> = {
+      publishPerMonth: "انتشار ماهانه",
+      aiPerMonth: "استفاده هوش مصنوعی ماهانه",
+      channels: "کانال‌ها",
+      automation: "اتوماسیون",
+    };
+    throw new AuthError(`امکان «${dimFa[input.dimension]}» در پلن فعلی شما غیرفعال است. برای استفاده پلن را ارتقا دهید.`, 403);
+  }
+  for (let attempt = 0; attempt < QUOTA_CAS_RETRIES; attempt++) {
+    const fresh = await tx.subscription.findUnique({
+      where: { id: target.id },
+      select: { usedQuota: true },
+    });
+    const prevRaw = fresh?.usedQuota ?? "{}";
+    const used = readQuotaJson(prevRaw);
+    const current = used[input.dimension] ?? 0;
+    if (current + input.amount > limit) {
+      const dimFa: Record<QuotaDimension, string> = {
+        publishPerMonth: "انتشار ماهانه",
+        aiPerMonth: "استفاده هوش مصنوعی ماهانه",
+        channels: "کانال‌ها",
+        automation: "اتوماسیون",
+      };
+      throw new AuthError(
+        `سهمیه ${dimFa[input.dimension]} کافی نیست. ` +
+        `استفاده‌شده: ${toPersianDigits(current)} از ${toPersianDigits(limit)}.`,
+        403,
+      );
+    }
+    used[input.dimension] = current + input.amount;
+    const updated = await tx.subscription.updateMany({
+      where: { id: target.id, usedQuota: prevRaw },
+      data: { usedQuota: JSON.stringify(used) },
+    });
+    if (updated.count === 1) return;
+  }
+  throw new AuthError("به‌روزرسانی سهمیه هم‌زمان ناموفق بود. دوباره تلاش کنید.", 409);
+}
+
+async function incrementQuotaUsageInTx(
+  tx: Prisma.TransactionClient,
+  target: { id: string },
+  input: { userId: string; dimension: QuotaDimension; amount: number },
+): Promise<void> {
+  for (let attempt = 0; attempt < QUOTA_CAS_RETRIES; attempt++) {
+    const fresh = await tx.subscription.findUnique({
+      where: { id: target.id },
+      select: { usedQuota: true },
+    });
+    const prevRaw = fresh?.usedQuota ?? "{}";
+    const used = readQuotaJson(prevRaw);
+    used[input.dimension] = (used[input.dimension] ?? 0) + input.amount;
+    const updated = await tx.subscription.updateMany({
+      where: { id: target.id, usedQuota: prevRaw },
+      data: { usedQuota: JSON.stringify(used) },
+    });
+    if (updated.count === 1) return;
+  }
+  throw new AuthError("به‌روزرسانی سهمیه هم‌زمان ناموفق بود. دوباره تلاش کنید.", 409);
 }
 
 /** Quota check result — distinguishes disabled (limit 0) from exhausted. */

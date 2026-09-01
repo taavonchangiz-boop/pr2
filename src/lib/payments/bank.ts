@@ -29,7 +29,8 @@ import { db } from "@/lib/db";
 import { audit } from "@/lib/server/auth";
 import { hmacSign, hmacVerify } from "@/lib/security/crypto";
 import { assertSafeOutboundUrl, UnsafeOutboundUrlError } from "@/lib/security/net-guard";
-import { fetchJsonWithLimit } from "@/lib/security/http";
+import { pinnedFetchJson } from "@/lib/security/http";
+import { PAYABLE_STATUSES } from "@/lib/payments/plans";
 import { formatRials } from "@/lib/persian";
 import type { PaymentProvider, OrderLike } from "@/lib/payments/engine";
 import { activateSubscription } from "@/lib/payments/plans";
@@ -82,8 +83,12 @@ function readIntermediaryConfig(): BankIntermediaryConfig | null {
   };
 }
 
-// State token: HMAC of order id + a short TTL (10 minutes)
-const STATE_TOKEN_TTL_MS = 10 * 60 * 1000;
+// State token: HMAC of order id + a bounded TTL. 60 minutes: the bank
+// redirect can legally arrive long after the token request (slow PSP
+// flows) — the state token is only the FIRST gate; the callback then
+// re-verifies authority ownership (BankGatewayRef) and the amount
+// server-side, so a longer window does not weaken the trust model.
+const STATE_TOKEN_TTL_MS = 60 * 60 * 1000;
 const STATE_LABEL = "bank-callback-state";
 
 function makeStateToken(orderId: string): string {
@@ -111,7 +116,14 @@ export function verifyStateToken(orderId: string, token: string): boolean {
 function buildCallbackUrl(orderId: string, publicBaseUrl: string | undefined, path: string): string {
   const state = makeStateToken(orderId);
   if (!publicBaseUrl) {
-    // Relative — works when called from browser via the gateway
+    // A gateway MUST receive an absolute URL to redirect the payer back.
+    // A relative path silently breaks the return flow (money captured,
+    // customer stranded). Development keeps the relative form; any
+    // non-development runtime must configure POSTYAR_PUBLIC_BASE_URL —
+    // fail closed instead of pretending the callback will work.
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("POSTYAR_PUBLIC_BASE_URL تنظیم نشده است؛ درگاه بانکی بدون نشانی مطلق بازگشت کار نمی‌کند.");
+    }
     return `${path}?order=${encodeURIComponent(orderId)}&state=${state}`;
   }
   return `${publicBaseUrl}${path}?order=${encodeURIComponent(orderId)}&state=${state}`;
@@ -154,17 +166,17 @@ export async function bankCreatePaymentRequest(input: {
   const cfg = input.mode === "direct" ? directCfg! : null;
   const interC = input.mode === "intermediary" ? interCfg! : null;
   const path = cfg?.callbackPath ?? interC?.callbackPath ?? "/api/payments/bank/callback";
-  const callbackUrl = buildCallbackUrl(input.order.id, publicBase, path);
-
   // Try calling the gateway token-request endpoint. If the gateway is not
   // reachable (e.g. dev with no network), we DO NOT return success — we
   // return the Persian error. The user must configure a real gateway
   // OR use the card-to-card path.
   try {
+    const callbackUrl = buildCallbackUrl(input.order.id, publicBase, path);
     const isDirect = input.mode === "direct";
     const url = isDirect ? cfg!.baseUrl : interC!.baseUrl;
     // P0.14 — outbound policy: even env/admin-configured endpoints go
     // through the egress guard (https-only, public IPs, safe ports).
+    // C-06: pinned connection to the validated public address (SNI-bound).
     await assertSafeOutboundUrl(url, { allowedPorts: [443] });
     const body: Record<string, string | number> = isDirect
       ? {
@@ -183,9 +195,10 @@ export async function bankCreatePaymentRequest(input: {
           Timestamp: Math.floor(Date.now() / 1000),
         };
 
-    const parsed = await fetchJsonWithLimit<{ authority?: string; Authority?: string; status?: number | string }>(
+    const parsed = await pinnedFetchJson<{ authority?: string; Authority?: string; status?: number | string }>(
       url,
       {
+        allowedPorts: [443],
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
         body: JSON.stringify(body),
@@ -210,16 +223,31 @@ export async function bankCreatePaymentRequest(input: {
       };
     }
 
-    // Persist BankGatewayRef
-    await db.bankGatewayRef.create({
-      data: {
-        orderId: input.order.id,
-        authority,
-        mode: input.mode,
-      },
-    });
-    await db.order.update({
-      where: { id: input.order.id },
+    // Persist BankGatewayRef. A second payment attempt on the same order
+    // violates the UNIQUE(orderId) — surface an explicit Persian message
+    // instead of a raw constraint error.
+    try {
+      await db.bankGatewayRef.create({
+        data: {
+          orderId: input.order.id,
+          authority,
+          mode: input.mode,
+        },
+      });
+    } catch (err) {
+      const msg = (err as { code?: string; message?: string })?.message ?? "";
+      if (/unique|UNIQUE|constraint/i.test(msg)) {
+        return {
+          providerRef: "",
+          mode: input.mode,
+          errorFa: "برای این سفارش قبلاً یک تراکنش بانکی ثبت شده است. سفارش تازه‌ای ایجاد کنید.",
+        };
+      }
+      throw err;
+    }
+    // CAS: never regress an already-paid/awaiting_review order.
+    await db.order.updateMany({
+      where: { id: input.order.id, status: { in: PAYABLE_STATUSES } },
       data: { status: "awaiting_payment", provider: "bank", providerRef: authority },
     });
 
@@ -274,12 +302,13 @@ export async function bankVerifyAndFinalize(input: {
     const verifyUrl = baseUrl.replace(/\/Token$/, "/Verify");
     // P0.14 — same egress policy for the verify call.
     await assertSafeOutboundUrl(verifyUrl, { allowedPorts: [443] });
-    const parsed = await fetchJsonWithLimit<{
+    const parsed = await pinnedFetchJson<{
       status?: number | string;
       RefId?: string;
       TraceNo?: string;
       Amount?: number;
     }>(verifyUrl, {
+      allowedPorts: [443],
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({
@@ -314,8 +343,11 @@ export async function bankVerifyAndFinalize(input: {
       });
     }
     if (json.Amount !== undefined && returnedAmount !== input.order.amountRials) {
-      await db.order.update({
-        where: { id: input.order.id },
+      // CAS-guarded (M-2): only a still-payable order may transition to
+      // failed — a re-verify racing a successful finalize (or hitting an
+      // already-paid order) must NOT corrupt the paid financial state.
+      await db.order.updateMany({
+        where: { id: input.order.id, status: { in: PAYABLE_STATUSES } },
         data: { status: "failed" },
       });
       await audit({
@@ -337,8 +369,9 @@ export async function bankVerifyAndFinalize(input: {
     const status = String(json.status ?? "");
     const isOkStatus = status === "100" || status === "OK" || status === "ok" || status === "1";
     if (!isOkStatus) {
-      await db.order.update({
-        where: { id: input.order.id },
+      // CAS-guarded (M-2): see above — never regress a paid order.
+      await db.order.updateMany({
+        where: { id: input.order.id, status: { in: PAYABLE_STATUSES } },
         data: { status: "failed" },
       });
       return { ok: false, errorFa: "پرداخت توسط بانک تأیید نشد." };

@@ -39,7 +39,6 @@ export async function POST(req: Request) {
     if (e instanceof AuthError) {
       return NextResponse.json({ errorFa: e.message }, { status: e.status });
     }
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    return NextResponse.json({ errorFa: "خطای داخلی سرور." }, { status: 500 });
   }
 }
