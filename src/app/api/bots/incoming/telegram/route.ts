@@ -34,7 +34,7 @@ import {
   completeBotEvent,
   failBotEvent,
   recoverBotEvents,
-  runWorkflowOnceForEvent,
+  runMatchedWorkflowsForEvent,
 } from "@/lib/bots/event-dedup";
 import { executeWorkflow, persistInboundOnce } from "@/lib/bots/workflow";
 import { audit } from "@/lib/server/auth";
@@ -194,13 +194,12 @@ async function processTelegramUpdate(
     return;
   }
 
-  // C-11/C-12: persist the inbound history row ONCE per event (the old
-  // code persisted it inside executeWorkflow — once per matched workflow —
-  // or here when nothing matched, producing duplicate/missing rows).
-  // On a durable retry the row already exists — never duplicate it.
-  if (!opts.isRetry) {
-    await persistInboundOnce(bot, chatId, incomingText, update, update.update_id);
-  }
+  // C-11/C-12 + V4 H-04: persist the inbound history row ONCE per event
+  // (the old code persisted it inside executeWorkflow — once per matched
+  // workflow). The UNIQUE inboundEventId makes this DB-idempotent, so it
+  // runs on EVERY delivery — a durable retry after a crash-before-persist
+  // heals the missing row instead of skipping it.
+  await persistInboundOnce(bot, chatId, incomingText, update, update.update_id, undefined, opts.eventId);
 
   // If the incoming text starts with `POSTYAR-`, it's a link-code consumption
   // attempt — verify + consume.
@@ -241,34 +240,34 @@ async function processTelegramUpdate(
   // Otherwise, run enabled workflows that match this trigger. Each
   // intended workflow gets a UNIQUE per-event run row: executed exactly
   // once per event, retried when failed, never repeated when completed.
+  // V4 C-01: the callback returns the TYPED engine outcome — an
+  // executeWorkflow ok:false is a genuine failure and keeps the run
+  // retryable instead of being recorded as completed.
+  // V4 C-02: runMatchedWorkflowsForEvent THROWS when any child failed,
+  // so this handler fails the EVENT — event completion never implies
+  // child completion, and recovery re-runs only the failed children.
   const workflows = await db.botWorkflow.findMany({
     where: { botId: bot.id, enabled: true },
     take: 50,
   });
-  for (const wf of workflows) {
-    if (!matchesTrigger(wf, incomingText)) continue;
-    const r = await runWorkflowOnceForEvent(opts.eventId, wf.id, async () => {
-      await executeWorkflow({
-        bot,
-        providerUserId: chatId,
-        rawUpdate: update,
-        incomingMessage: incomingText,
-        callbackQueryId,
-        updateId: update.update_id,
-        workflow: wf,
-      });
-    });
-    if (!r.ok) {
-      await audit({
-        userId: bot.ownerId,
-        actor: "system",
-        action: "bot_workflow_execute_failed",
-        targetType: "bot",
-        targetId: bot.id,
-        meta: { workflowId: wf.id, eventId: opts.eventId },
-      });
-    }
-  }
+  const jobs = workflows
+    .filter((wf) => matchesTrigger(wf, incomingText))
+    .map((wf) => ({
+      workflowId: wf.id,
+      execute: async () => {
+        const r = await executeWorkflow({
+          bot,
+          providerUserId: chatId,
+          rawUpdate: update,
+          incomingMessage: incomingText,
+          callbackQueryId,
+          updateId: update.update_id,
+          workflow: wf,
+        });
+        return { ok: r.ok, errorFa: r.errorFa };
+      },
+    }));
+  await runMatchedWorkflowsForEvent(opts.eventId, jobs);
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {

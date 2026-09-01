@@ -12,6 +12,7 @@ import { AuthError, audit } from "@/lib/server/auth";
 import {
   getAiProvider,
   pickProvider,
+  isProviderAvailableAsync,
   sanitizePrompt,
   validateModel,
   getValidModels,
@@ -20,7 +21,8 @@ import {
   type AiChatResponse,
   redactAiPayload,
 } from "@/lib/providers/ai";
-import { consumeQuota } from "@/lib/payments/plans";
+import { getSetting } from "@/lib/providers/util";
+import { consumeQuota, refundQuota } from "@/lib/payments/plans";
 import { toPersianDigits } from "@/lib/persian";
 
 // ---------------------------------------------------------------------
@@ -82,21 +84,29 @@ export async function dispatchAi(input: DispatchAiInput): Promise<DispatchAiResu
   //    concurrent execution per logical operation, and the quota
   //    reservation lives INSIDE that single execution — exactly one
   //    reservation per logical AI operation, in every interleaving.
+  // V4 H-7 — AI dispatch is quota-bearing (a money-adjacent, distributed
+  // critical operation): in production without real Redis it must FAIL
+  // CLOSED, never silently degrade to a per-process Map.
   return idempotency<DispatchAiResult>(
     `ai:dispatch:${input.userId}:${input.idempotencyKey}`,
     async () => {
       // 3) Resolve provider: pick the configured/preferred one, fall back to
       //    postyar-zai which is always available. Validation happens BEFORE
       //    the quota reservation so an invalid request never burns quota.
-      const providerId: AiProviderId = pickProvider(input.provider);
+      //    V4 M-14 — pickProvider and the availability check are the
+      //    AUTHORITATIVE (settings-aware) resolvers: the admin-configured
+      //    default provider applies when the caller has no preference.
+      const providerId: AiProviderId = await pickProvider(input.provider);
       const provider = getAiProvider(providerId);
-      if (!provider.available) {
+      if (!(await isProviderAvailableAsync(providerId))) {
         // Should never happen for postyar-zai, but defensive.
         return persistFailed(input, providerId, "ارائه‌دهنده هوش مصنوعی پیکربندی نشده است.");
       }
 
-      // 4) Resolve & validate model
-      let model = input.model ?? null;
+      // 4) Resolve & validate model — the admin-configured default model
+      //    (POSTYAR_AI_MODEL via getSetting) applies when the caller does
+      //    not request one (V4 M-14).
+      let model = input.model ?? ((await getSetting("POSTYAR_AI_MODEL", "")).trim() || null);
       const validModels = getValidModels(providerId);
       if (!model) model = validModels[0] ?? null;
       if (model) {
@@ -145,6 +155,13 @@ export async function dispatchAi(input: DispatchAiInput): Promise<DispatchAiResu
       } catch (err) {
         const msg = (err as { code?: string; message?: string })?.message ?? "";
         if (/unique|UNIQUE|constraint/i.test(msg)) {
+          // V4 H-7 — THIS execution's quota reservation (step 6) belongs to
+          // a logical operation that was already executed by the winner of
+          // the durable UNIQUE race. Refund it so the duplicate loser
+          // never burns quota: exactly one reservation per logical AI
+          // operation survives every interleaving (CAS refund, floored at
+          // 0, fail-closed on exhaustion).
+          await refundQuota({ userId: input.userId, dimension: "aiPerMonth", amount: 1 }).catch(() => undefined);
           const existing = await db.aiJob.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
           return {
             ok: existing?.status === "completed",

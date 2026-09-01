@@ -126,8 +126,9 @@ export async function POST(req: Request) {
         broadcastId: r.broadcastId,
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : "ارسال ناموفق بود.";
-      return NextResponse.json({ errorFa: msg }, { status: 500 });
+      // V4 M-13 — bounded Persian for the client; internals stay server-side.
+      console.error("admin segmented broadcast failed:", err instanceof Error ? err.message : err);
+      return NextResponse.json({ errorFa: "ارسال اعلان ناموفق بود. لطفاً دوباره تلاش کنید." }, { status: 500 });
     }
   }
 

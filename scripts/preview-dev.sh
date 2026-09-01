@@ -8,8 +8,19 @@
 #     bash scripts/preview-dev.sh
 #
 # What it does (idempotent, safe to re-run):
-#   1. Creates .env from .env.example when missing, generating REAL
-#      random dev secrets (master key / JWT / cron) via openssl.
+#   1. Creates the EXPLICIT preview environment file `.env.preview` from
+#      `.env.example` when missing, generating REAL random dev secrets
+#      (master key / JWT / cron) via openssl.
+#      V4 M-11 — the preview NEVER silently consumes a production `.env`:
+#        * every key defined in `.env.preview` is exported into the
+#          server process BEFORE `next dev` starts, and process-env
+#          always wins over Next.js `.env` files;
+#        * every SECURITY-RELEVANT provider key (SMS / SMTP / bank
+#          gateways / gold / AI / Redis / public URL) is explicitly set
+#          to its sandbox value (empty or "mock"), so a production
+#          `.env` sitting next to the repo can never leak real
+#          credentials or real destinations into the preview;
+#        * the real `.env` is NEVER read, written or overwritten.
 #   2. Points DATABASE_URL at an ABSOLUTE, repo-local SQLite file
 #      (db/postyar-preview.db). An absolute URL removes the classic
 #      ambiguity where the Prisma CLI resolves `file:` URLs relative to
@@ -20,21 +31,35 @@
 #   5. Starts the dev server on 0.0.0.0:3000 (reverse-proxy friendly:
 #      the preview gateway forwards Host/X-Forwarded-* headers).
 #
-# The real .env is NEVER committed (gitignored); only this script and
-# the committed .env.example template are in the repository.
+# Side-effect safety (V4 M-10): with the sandbox env above, the SMS and
+# bank channels are hard-disabled in non-production runtime
+# (NODE_ENV=development), so the preview can NEVER send a real SMS,
+# e-mail, or contact a real payment gateway. Telegram/Bale/Rubika bots
+# only talk to their sandbox APIs when a bot token is configured by the
+# user INSIDE the preview UI — the preview env ships with all bot/sms/
+# bank credentials empty.
+#
+# `.env.preview` is gitignored and must never be committed; only this
+# script and the committed `.env.example` template are in the repository.
 # =====================================================================
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-ENV_FILE="$ROOT/.env"
+ENV_FILE="$ROOT/.env.preview"
 DB_FILE="$ROOT/db/postyar-preview.db"
 
 mkdir -p "$ROOT/db"
 
+if [ -f "$ROOT/.env" ]; then
+  echo "[preview] WARNING: a production '.env' exists next to the repo."
+  echo "[preview] The preview will NOT read it: every security-relevant"
+  echo "[preview] variable is explicitly overridden from '.env.preview'."
+fi
+
 if [ ! -f "$ENV_FILE" ]; then
-  echo "[preview] .env not found — creating from .env.example with fresh dev secrets"
+  echo "[preview] .env.preview not found — creating from .env.example with fresh dev secrets"
   cp .env.example "$ENV_FILE"
   if command -v openssl >/dev/null 2>&1; then
     MASTER_KEY="$(openssl rand -hex 32)"
@@ -54,13 +79,46 @@ s = s.replace('POSTYAR_JWT_SECRET="REPLACE_WITH_LONG_RANDOM_STRING"', f'POSTYAR_
 s = s.replace('POSTYAR_CRON_SECRET="REPLACE_WITH_LONG_RANDOM_STRING"', f'POSTYAR_CRON_SECRET="{cron}"')
 io.open(path, "w", encoding="utf-8").write(s)
 PYEOF
-  echo "[preview] secrets generated into .env (never commit it)"
+  echo "[preview] secrets generated into .env.preview (never commit it)"
 fi
 
-# Absolute SQLite URL wins over any inherited DATABASE_URL (the Prisma
-# CLI resolves relative file: URLs from prisma/, the runtime from cwd —
-# an absolute path keeps both processes on the SAME database).
+# ---------------------------------------------------------------------
+# V4 M-11 — export the preview environment. `set -a` exports every
+# variable defined in .env.preview, and process-env wins over any .env
+# file Next.js would otherwise load, so a production .env can NEVER
+# silently leak values into the preview runtime.
+# ---------------------------------------------------------------------
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
+
+# V4 M-10/M-11 — SANDBOX OVERRIDES: explicitly neutralize every channel
+# with a real-world side effect. These win over BOTH .env.preview and any
+# production .env, so the preview is side-effect-safe by construction.
+export NODE_ENV=development
 export DATABASE_URL="file:${DB_FILE}"
+export POSTYAR_SMS_PROVIDER=""
+export POSTYAR_SMS_API_KEY=""
+export POSTYAR_SMS_USERNAME=""
+export POSTYAR_SMS_PASSWORD=""
+export POSTYAR_SMS_SENDER=""
+export POSTYAR_SMTP_HOST=""
+export POSTYAR_SMTP_USER=""
+export POSTYAR_SMTP_PASSWORD=""
+export POSTYAR_BANK_DIRECT_URL=""
+export POSTYAR_BANK_DIRECT_MERCHANT=""
+export POSTYAR_BANK_DIRECT_TERMINAL=""
+export POSTYAR_BANK_DIRECT_SECRET=""
+export POSTYAR_BANK_INTERMEDIARY_URL=""
+export POSTYAR_BANK_INTERMEDIARY_MERCHANT=""
+export POSTYAR_BANK_INTERMEDIARY_SECRET=""
+export POSTYAR_GOLD_PROVIDER_URL=""
+export POSTYAR_AI_PROVIDER=""
+export POSTYAR_AI_API_KEY=""
+export REDIS_URL=""
+# POSTYAR_PUBLIC_BASE_URL stays unset unless the operator exports it —
+# webhook registration then degrades to the dev fallback + poll route.
 
 echo "[preview] applying migrations to ${DB_FILE}"
 bunx prisma migrate deploy
@@ -68,5 +126,5 @@ bunx prisma migrate deploy
 # Ensure the generated client matches the current schema.
 bunx prisma generate >/dev/null
 
-echo "[preview] starting POSTYAR on http://0.0.0.0:3000"
+echo "[preview] starting POSTYAR on http://0.0.0.0:3000 (sandbox env: no real SMS/bank/email)"
 exec bunx next dev -p 3000 -H 0.0.0.0

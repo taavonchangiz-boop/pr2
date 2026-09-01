@@ -13,6 +13,7 @@ import { db } from "@/lib/db";
 import { cache } from "@/lib/security/cache";
 import { assertSafeOutboundUrl } from "@/lib/security/net-guard";
 import { pinnedFetchJson } from "@/lib/security/http";
+import { getSetting } from "@/lib/providers/util";
 
 export type GoldInstrument = "18k" | "emami" | "bahar_azadi" | "ounce";
 
@@ -49,7 +50,7 @@ export async function getGoldPrice(instrument: GoldInstrument): Promise<GoldPric
   const cached = await cache.get<GoldPriceResult>(cacheKey);
   if (cached) return cached;
 
-  const url = process.env.POSTYAR_GOLD_PROVIDER_URL ?? "";
+  const url = (await getSetting("POSTYAR_GOLD_PROVIDER_URL", "")).trim();
   if (!url) {
     const stale = await getLastKnown(instrument);
     return {

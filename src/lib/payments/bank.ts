@@ -28,9 +28,11 @@
 import { db } from "@/lib/db";
 import { audit } from "@/lib/server/auth";
 import { hmacSign, hmacVerify } from "@/lib/security/crypto";
+import { isPlaceholderSecret } from "@/lib/security/placeholder";
 import { assertSafeOutboundUrl, UnsafeOutboundUrlError } from "@/lib/security/net-guard";
 import { pinnedFetchJson } from "@/lib/security/http";
 import { PAYABLE_STATUSES } from "@/lib/payments/plans";
+import { getSetting } from "@/lib/providers/util";
 import { formatRials } from "@/lib/persian";
 import type { PaymentProvider, OrderLike } from "@/lib/payments/engine";
 import { activateSubscription } from "@/lib/payments/plans";
@@ -55,31 +57,41 @@ interface BankIntermediaryConfig {
   callbackPath: string;
 }
 
-function readDirectConfig(): BankDirectConfig | null {
-  const baseUrl = process.env.POSTYAR_BANK_DIRECT_URL;
-  const merchantId = process.env.POSTYAR_BANK_DIRECT_MERCHANT;
-  const terminalId = process.env.POSTYAR_BANK_DIRECT_TERMINAL;
-  const secret = process.env.POSTYAR_BANK_DIRECT_SECRET;
+async function readDirectConfig(): Promise<BankDirectConfig | null> {
+  // V4 M-14 — ONE authoritative resolver: gateway config resolves through
+  // getSetting (admin settings UI first, env fallback), so the values the
+  // admin writes in the settings UI actually take effect. Previously this
+  // was env-only and every admin edit was dead config.
+  const baseUrl = (await getSetting("POSTYAR_BANK_DIRECT_URL", "")).trim();
+  const merchantId = (await getSetting("POSTYAR_BANK_DIRECT_MERCHANT", "")).trim();
+  const terminalId = (await getSetting("POSTYAR_BANK_DIRECT_TERMINAL", "")).trim();
+  const secret = (await getSetting("POSTYAR_BANK_DIRECT_SECRET", "")).trim();
+  // V4 M-10 — placeholder values from .env.example are NOT configuration:
+  // they must never be sent to a real gateway endpoint.
   if (!baseUrl || !merchantId || !terminalId || !secret) return null;
+  if (isPlaceholderSecret(baseUrl) || isPlaceholderSecret(merchantId) || isPlaceholderSecret(terminalId) || isPlaceholderSecret(secret)) return null;
   return {
     baseUrl,
     merchantId,
     terminalId,
     secret,
-    callbackPath: process.env.POSTYAR_BANK_CALLBACK_PATH ?? "/api/payments/bank/callback",
+    callbackPath: (await getSetting("POSTYAR_BANK_CALLBACK_PATH", "")).trim() || "/api/payments/bank/callback",
   };
 }
 
-function readIntermediaryConfig(): BankIntermediaryConfig | null {
-  const baseUrl = process.env.POSTYAR_BANK_INTERMEDIARY_URL;
-  const merchantCode = process.env.POSTYAR_BANK_INTERMEDIARY_MERCHANT;
-  const secret = process.env.POSTYAR_BANK_INTERMEDIARY_SECRET;
+async function readIntermediaryConfig(): Promise<BankIntermediaryConfig | null> {
+  // V4 M-14 — same authoritative resolver as readDirectConfig.
+  const baseUrl = (await getSetting("POSTYAR_BANK_INTERMEDIARY_URL", "")).trim();
+  const merchantCode = (await getSetting("POSTYAR_BANK_INTERMEDIARY_MERCHANT", "")).trim();
+  const secret = (await getSetting("POSTYAR_BANK_INTERMEDIARY_SECRET", "")).trim();
+  // V4 M-10 — placeholder values from .env.example are NOT configuration.
   if (!baseUrl || !merchantCode || !secret) return null;
+  if (isPlaceholderSecret(baseUrl) || isPlaceholderSecret(merchantCode) || isPlaceholderSecret(secret)) return null;
   return {
     baseUrl,
     merchantCode,
     secret,
-    callbackPath: process.env.POSTYAR_BANK_CALLBACK_PATH ?? "/api/payments/bank/callback",
+    callbackPath: (await getSetting("POSTYAR_BANK_CALLBACK_PATH", "")).trim() || "/api/payments/bank/callback",
   };
 }
 
@@ -144,8 +156,20 @@ export async function bankCreatePaymentRequest(input: {
   order: OrderLike;
   mode: BankMode;
 }): Promise<BankCreateResult> {
-  const directCfg = readDirectConfig();
-  const interCfg = readIntermediaryConfig();
+  // V4 M-10 — preview/dev side-effect safety: outside production the bank
+  // gateway is NEVER contacted (a real gateway call can charge real
+  // money) unless the operator explicitly opts in via
+  // POSTYAR_ALLOW_REAL_BANK_IN_DEV=1. The card-to-card path remains
+  // available in preview.
+  if (process.env.NODE_ENV !== "production" && process.env.POSTYAR_ALLOW_REAL_BANK_IN_DEV !== "1") {
+    return {
+      providerRef: "",
+      mode: input.mode,
+      errorFa: "درگاه بانکی در محیط توسعه/پیش‌نمایش غیرفعال است؛ از پرداخت کارت به کارت استفاده کنید.",
+    };
+  }
+  const directCfg = await readDirectConfig();
+  const interCfg = await readIntermediaryConfig();
   if (input.mode === "direct" && !directCfg) {
     return {
       providerRef: "",
@@ -162,7 +186,8 @@ export async function bankCreatePaymentRequest(input: {
   }
 
   // Build callback URL — use POSTYAR_PUBLIC_BASE_URL if available
-  const publicBase = process.env.POSTYAR_PUBLIC_BASE_URL;
+  // (V4 M-14 — settings-UI value wins over env via getSetting).
+  const publicBase = (await getSetting("POSTYAR_PUBLIC_BASE_URL", "")).trim() || undefined;
   const cfg = input.mode === "direct" ? directCfg! : null;
   const interC = input.mode === "intermediary" ? interCfg! : null;
   const path = cfg?.callbackPath ?? interC?.callbackPath ?? "/api/payments/bank/callback";
@@ -288,8 +313,8 @@ export async function bankVerifyAndFinalize(input: {
     return { ok: false, errorFa: "حالت درگاه نامعتبر است." };
   }
   const isDirect = ref.mode === "direct";
-  const directCfg = readDirectConfig();
-  const interCfg = readIntermediaryConfig();
+  const directCfg = await readDirectConfig();
+  const interCfg = await readIntermediaryConfig();
   const baseUrl = isDirect ? directCfg?.baseUrl : interCfg?.baseUrl;
   const secret = isDirect ? directCfg?.secret : interCfg?.secret;
   const merchantId = isDirect ? directCfg?.merchantId : interCfg?.merchantCode;

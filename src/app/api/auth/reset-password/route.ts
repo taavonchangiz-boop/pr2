@@ -26,7 +26,7 @@ const Schema = z.object({
 export async function POST(req: Request) {
   const ip = clientIp(req);
   // Brute-force budget for the opaque 256-bit token + 8+ char password.
-  const rl = await rateLimit({ key: `reset-pw:${ip}`, limit: 5, windowMs: 15 * 60 * 1000 });
+  const rl = await rateLimit({ key: `reset-pw:${ip}`, limit: 5, windowMs: 15 * 60 * 1000, critical: true });
   if (!rl.ok) {
     return NextResponse.json({ errorFa: "تعداد تلاش بیش از حد مجاز است. ۱۵ دقیقه بعد تلاش کنید." }, { status: 429 });
   }
@@ -67,23 +67,26 @@ export async function POST(req: Request) {
   }
 
   const passwordHash = await hashPassword(newPassword);
-  await db.$transaction([
-    db.user.update({ where: { id: user.id }, data: { passwordHash } }),
+  // V4 H-9 — the credential change + mass session revocation + its
+  // critical audit commit as ONE unit.
+  await db.$transaction(async (tx) => {
+    await tx.user.update({ where: { id: user.id }, data: { passwordHash } });
     // Revoke every session — a password reset must never leave a stolen
     // session alive.
-    db.session.updateMany({
+    await tx.session.updateMany({
       where: { userId: user.id, revokedAt: null },
       data: { revokedAt: new Date() },
-    }),
-  ]);
-
-  await audit({
-    userId: user.id,
-    actor: "user",
-    action: "password_reset_completed",
-    targetType: "user",
-    targetId: user.id,
-    ip,
+    });
+    await audit({
+      userId: user.id,
+      actor: "user",
+      action: "password_reset_completed",
+      targetType: "user",
+      targetId: user.id,
+      ip,
+      tx,
+      critical: true,
+    });
   });
 
   return NextResponse.json({ ok: true });

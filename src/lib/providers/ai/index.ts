@@ -11,7 +11,7 @@
 // We never expose the API key to the browser.
 // =====================================================================
 import { cache } from "@/lib/security/cache";
-import { sanitizeRaw } from "@/lib/providers/util";
+import { sanitizeRaw, getSetting } from "@/lib/providers/util";
 
 // ---------------------------------------------------------------------
 // Public interface
@@ -100,18 +100,47 @@ export function validateModel(provider: string, model: string): void {
 
 // ---------------------------------------------------------------------
 // Env key resolution
+// V4 M-14 — ONE authoritative resolver: provider config resolves through
+// getSetting (admin settings UI first, env fallback). Previously these
+// were env-only reads, so every admin write in the AI settings group was
+// dead config. The settings UI writes ONE generic key (POSTYAR_AI_API_KEY)
+// bound to the admin-selected default provider (POSTYAR_AI_PROVIDER);
+// per-provider env keys remain supported for multi-provider deployments.
 // ---------------------------------------------------------------------
-function getEnvKey(provider: AiProviderId): string | undefined {
-  if (provider === "postyar-zai") return undefined; // in-house SDK, no key
-  if (provider === "ollama") return process.env.POSTYAR_AI_OLLAMA_URL ?? ""; // URL only
-  const key = process.env[`POSTYAR_AI_${provider.toUpperCase().replace(/-/g, "_")}_KEY`];
-  return key;
+async function getEnvKey(provider: AiProviderId): Promise<string> {
+  if (provider === "postyar-zai") return ""; // in-house SDK, no key
+  if (provider === "ollama") return (await getSetting("POSTYAR_AI_OLLAMA_URL", "")).trim(); // URL only
+  const defaultProvider = (await getSetting("POSTYAR_AI_PROVIDER", "")).trim();
+  const generic = (await getSetting("POSTYAR_AI_API_KEY", "")).trim();
+  if (generic && defaultProvider === provider) return generic;
+  return (await getSetting(`POSTYAR_AI_${provider.toUpperCase().replace(/-/g, "_")}_KEY`, "")).trim();
+}
+
+/** DB-aware availability (async — the authoritative check). */
+export async function isProviderAvailableAsync(provider: AiProviderId): Promise<boolean> {
+  if (provider === "postyar-zai") return true;
+  const k = await getEnvKey(provider);
+  if (provider === "ollama") return Boolean(k);
+  return Boolean(k && k.length >= 8);
+}
+
+/**
+ * ENV-ONLY availability snapshot (sync) — kept ONLY for the synchronous
+ * `available` getters on the provider registry objects. The AUTHORITATIVE
+ * availability check is {@link isProviderAvailableAsync} (settings-UI
+ * aware); decision paths (dispatch, pickProvider, status listing) MUST
+ * use the async variant.
+ */
+function getEnvKeySync(provider: AiProviderId): string {
+  if (provider === "postyar-zai") return "";
+  if (provider === "ollama") return process.env.POSTYAR_AI_OLLAMA_URL ?? "";
+  return process.env[`POSTYAR_AI_${provider.toUpperCase().replace(/-/g, "_")}_KEY`] ?? "";
 }
 
 export function isProviderAvailable(provider: AiProviderId): boolean {
   if (provider === "postyar-zai") return true;
-  if (provider === "ollama") return Boolean(getEnvKey(provider));
-  const k = getEnvKey(provider);
+  if (provider === "ollama") return Boolean(getEnvKeySync(provider));
+  const k = getEnvKeySync(provider);
   return Boolean(k && k.length >= 8);
 }
 
@@ -190,8 +219,8 @@ async function callOpenAiCompatible(opts: {
 const openaiProvider: AiProvider = {
   name: "openai",
   get available() { return isProviderAvailable("openai"); },
-  chat(req) {
-    const key = getEnvKey("openai");
+  async chat(req) {
+    const key = await getEnvKey("openai");
     if (!key) return Promise.reject(new Error("ارائه‌دهنده OpenAI پیکربندی نشده است."));
     const model = req.model ?? "gpt-4o-mini";
     validateModel("openai", model);
@@ -210,8 +239,8 @@ const openaiProvider: AiProvider = {
 const deepseekProvider: AiProvider = {
   name: "deepseek",
   get available() { return isProviderAvailable("deepseek"); },
-  chat(req) {
-    const key = getEnvKey("deepseek");
+  async chat(req) {
+    const key = await getEnvKey("deepseek");
     if (!key) return Promise.reject(new Error("ارائه‌دهنده DeepSeek پیکربندی نشده است."));
     const model = req.model ?? "deepseek-chat";
     validateModel("deepseek", model);
@@ -230,8 +259,8 @@ const deepseekProvider: AiProvider = {
 const grokProvider: AiProvider = {
   name: "grok",
   get available() { return isProviderAvailable("grok"); },
-  chat(req) {
-    const key = getEnvKey("grok");
+  async chat(req) {
+    const key = await getEnvKey("grok");
     if (!key) return Promise.reject(new Error("ارائه‌دهنده Grok پیکربندی نشده است."));
     const model = req.model ?? "grok-3-mini";
     validateModel("grok", model);
@@ -250,8 +279,8 @@ const grokProvider: AiProvider = {
 const openrouterProvider: AiProvider = {
   name: "openrouter",
   get available() { return isProviderAvailable("openrouter"); },
-  chat(req) {
-    const key = getEnvKey("openrouter");
+  async chat(req) {
+    const key = await getEnvKey("openrouter");
     if (!key) return Promise.reject(new Error("ارائه‌دهنده OpenRouter پیکربندی نشده است."));
     const model = req.model ?? "openrouter/auto";
     validateModel("openrouter", model);
@@ -270,8 +299,8 @@ const openrouterProvider: AiProvider = {
 const mistralProvider: AiProvider = {
   name: "mistral",
   get available() { return isProviderAvailable("mistral"); },
-  chat(req) {
-    const key = getEnvKey("mistral");
+  async chat(req) {
+    const key = await getEnvKey("mistral");
     if (!key) return Promise.reject(new Error("ارائه‌دهنده Mistral پیکربندی نشده است."));
     const model = req.model ?? "mistral-small-latest";
     validateModel("mistral", model);
@@ -290,8 +319,8 @@ const mistralProvider: AiProvider = {
 const togetherProvider: AiProvider = {
   name: "together",
   get available() { return isProviderAvailable("together"); },
-  chat(req) {
-    const key = getEnvKey("together");
+  async chat(req) {
+    const key = await getEnvKey("together");
     if (!key) return Promise.reject(new Error("ارائه‌دهنده Together پیکربندی نشده است."));
     const model = req.model ?? "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo";
     validateModel("together", model);
@@ -310,8 +339,8 @@ const togetherProvider: AiProvider = {
 const ollamaProvider: AiProvider = {
   name: "ollama",
   get available() { return isProviderAvailable("ollama"); },
-  chat(req) {
-    const baseUrl = getEnvKey("ollama");
+  async chat(req) {
+    const baseUrl = await getEnvKey("ollama");
     if (!baseUrl) return Promise.reject(new Error("ارائه‌دهنده Ollama پیکربندی نشده است."));
     const model = req.model ?? "llama3.2";
     validateModel("ollama", model);
@@ -361,8 +390,8 @@ const ollamaProvider: AiProvider = {
 const anthropicProvider: AiProvider = {
   name: "anthropic",
   get available() { return isProviderAvailable("anthropic"); },
-  chat(req) {
-    const key = getEnvKey("anthropic");
+  async chat(req) {
+    const key = await getEnvKey("anthropic");
     if (!key) return Promise.reject(new Error("ارائه‌دهنده Anthropic پیکربندی نشده است."));
     const model = req.model ?? "claude-3-5-haiku-latest";
     validateModel("anthropic", model);
@@ -428,8 +457,8 @@ const anthropicProvider: AiProvider = {
 const geminiProvider: AiProvider = {
   name: "gemini",
   get available() { return isProviderAvailable("gemini"); },
-  chat(req) {
-    const key = getEnvKey("gemini");
+  async chat(req) {
+    const key = await getEnvKey("gemini");
     if (!key) return Promise.reject(new Error("ارائه‌دهنده Gemini پیکربندی نشده است."));
     const model = req.model ?? "gemini-2.0-flash";
     validateModel("gemini", model);
@@ -499,7 +528,7 @@ const geminiProvider: AiProvider = {
 const postyarZaiProvider: AiProvider = {
   name: "postyar-zai",
   get available() { return true; },
-  chat(req) {
+  async chat(req) {
     return (async () => {
       // Dynamic import so we don't accidentally pull the SDK into a client bundle.
       const ZAIModule = (await import("z-ai-web-dev-sdk")) as typeof import("z-ai-web-dev-sdk");
@@ -553,13 +582,15 @@ export function getAiProvider(provider: string): AiProvider {
 
 /**
  * Returns the provider the system should use given the user's configured
- * preference. If the user has no preference or the preferred provider is
- * unavailable, falls back to `postyar-zai` (always available).
+ * preference. Falls back to the ADMIN-CONFIGURED default provider
+ * (POSTYAR_AI_PROVIDER via getSetting — V4 M-14), then to `postyar-zai`
+ * (always available).
  */
-export function pickProvider(preferred?: string | null): AiProviderId {
-  if (preferred && (AI_PROVIDER_IDS as string[]).includes(preferred)) {
-    const id = preferred as AiProviderId;
-    if (isProviderAvailable(id)) return id;
+export async function pickProvider(preferred?: string | null): Promise<AiProviderId> {
+  const wanted = (preferred ?? "").trim() || (await getSetting("POSTYAR_AI_PROVIDER", "")).trim();
+  if (wanted && (AI_PROVIDER_IDS as string[]).includes(wanted)) {
+    const id = wanted as AiProviderId;
+    if (await isProviderAvailableAsync(id)) return id;
   }
   return "postyar-zai";
 }
@@ -583,12 +614,16 @@ export async function listProviderStatus(): Promise<
   Array<{ id: AiProviderId; available: boolean; models: string[]; defaultModel: string }>
 > {
   return await cache.get("ai:provider-status") ?? (await (async () => {
-    const out = AI_PROVIDER_IDS.map((id) => ({
-      id,
-      available: isProviderAvailable(id),
-      models: AI_MODELS[id],
-      defaultModel: AI_MODELS[id][0] ?? "",
-    }));
+    // V4 M-14 — availability reflects the AUTHORITATIVE (settings-aware)
+    // resolver, not the env-only snapshot.
+    const out = await Promise.all(
+      AI_PROVIDER_IDS.map(async (id) => ({
+        id,
+        available: await isProviderAvailableAsync(id),
+        models: AI_MODELS[id],
+        defaultModel: AI_MODELS[id][0] ?? "",
+      })),
+    );
     await cache.set("ai:provider-status", out, 60_000);
     return out;
   }))();

@@ -32,7 +32,7 @@ export async function POST(req: Request) {
   }
   const ip = clientIp(req);
 
-  const rl = await rateLimit({ key: `pw:${user.id}`, limit: 5, windowMs: 15 * 60 * 1000 });
+  const rl = await rateLimit({ key: `pw:${user.id}`, limit: 5, windowMs: 15 * 60 * 1000, critical: true });
   if (!rl.ok) {
     return NextResponse.json(
       { errorFa: "تلاش بیش از حد. ۱۵ دقیقه بعد امتحان کنید." },
@@ -98,15 +98,19 @@ export async function POST(req: Request) {
     } else {
       await tx.session.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } });
     }
-  });
-  await audit({
-    userId: user.id,
-    actor: "user",
-    action: "password_changed",
-    targetType: "user",
-    targetId: user.id,
-    ip,
-    meta: { revokedOtherSessions: true },
+    // V4 H-9 — the credential change's audit JOINS the transaction
+    // (critical).
+    await audit({
+      userId: user.id,
+      actor: "user",
+      action: "password_changed",
+      targetType: "user",
+      targetId: user.id,
+      ip,
+      tx,
+      critical: true,
+      meta: { revokedOtherSessions: true },
+    });
   });
   return NextResponse.json({ ok: true });
 }

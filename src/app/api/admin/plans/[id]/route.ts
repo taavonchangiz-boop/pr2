@@ -7,6 +7,9 @@ import {
   parsePlanFeatures,
   parsePlanQuota,
   findUnknownFeatureKeys,
+  findImpossibleFeatureCombinations,
+  isBooleanFeature,
+  ALL_FEATURE_DEFS,
   type PlanFeatures,
 } from "@/lib/payments/plans";
 
@@ -68,6 +71,38 @@ export async function PATCH(
     if (unknown.length > 0) {
       return NextResponse.json(
         { errorFa: `ویژگی(های) ناشناخته: ${unknown.join("، ")}` },
+        { status: 400 },
+      );
+    }
+    // V4 M-2 — strict per-key typing against the authoritative catalog:
+    // a boolean-typed feature must receive a boolean, a numeric-typed
+    // feature a finite number (no silent coercion, no silent drop).
+    const featureInput = parsed.data.features as Record<string, unknown>;
+    for (const [k, v] of Object.entries(featureInput)) {
+      const def = ALL_FEATURE_DEFS.find((d) => d.key === k);
+      if (!def) continue; // already rejected above as unknown
+      if (isBooleanFeature(k as never)) {
+        if (typeof v !== "boolean") {
+          return NextResponse.json(
+            { errorFa: `ویژگی «${k}» باید مقدار درست/غیردرست (boolean) بپذیرد.` },
+            { status: 400 },
+          );
+        }
+      } else {
+        if (typeof v !== "number" || !Number.isFinite(v)) {
+          return NextResponse.json(
+            { errorFa: `ویژگی «${k}» باید عدد متناهی باشد.` },
+            { status: 400 },
+          );
+        }
+      }
+    }
+    // V4 M-2 — impossible feature/quota combinations (e.g. a capability
+    // toggled ON with its linked quota explicitly disabled) are rejected.
+    const impossible = findImpossibleFeatureCombinations(featureInput);
+    if (impossible.length > 0) {
+      return NextResponse.json(
+        { errorFa: `ترکیب ناممکن ویژگی/سهمیه: ${impossible.join("، ")} — امکان فعال با سهمیهٔ صفر قابل ذخیره نیست.` },
         { status: 400 },
       );
     }

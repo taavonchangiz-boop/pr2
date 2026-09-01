@@ -62,8 +62,10 @@ export async function GET(req: Request) {
     }));
     return NextResponse.json({ orders, total, page, pageSize });
   } catch (e) {
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    // V4 M-13 — public errors stay bounded and Persian; raw internals
+    // (Prisma/SQL/driver text) are logged server-side only.
+    console.error("orders list failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ errorFa: "دریافت سفارش‌ها ناموفق بود. لطفاً دوباره تلاش کنید." }, { status: 500 });
   }
 }
 
@@ -214,7 +216,8 @@ export async function POST(req: Request) {
     if (e instanceof AuthError) {
       return NextResponse.json({ errorFa: e.message }, { status: e.status });
     }
-    const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    // V4 M-13 — no raw internal error text on this public path.
+    console.error("order create failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ errorFa: "ثبت سفارش ناموفق بود. لطفاً دوباره تلاش کنید." }, { status: 500 });
   }
 }

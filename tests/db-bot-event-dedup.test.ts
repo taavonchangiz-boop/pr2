@@ -106,6 +106,17 @@ describe("C-04/H-03 — durable bot event inbox (DB-backed)", () => {
       expect(await claimBotEvent(ev.id)).toBe(true);
       const verdict = await failBotEvent(ev.id, "خطای آزمایشی");
       expect(verdict).toBe(i === BOT_EVENT_MAX_ATTEMPTS - 1 ? "dead" : "failed");
+      // V4 H-02: the durable backoff schedule must be honored between
+      // attempts — expire it manually so the next loop iteration can claim.
+      if (i < BOT_EVENT_MAX_ATTEMPTS - 1) {
+        const row = await db.botInboundEvent.findUniqueOrThrow({ where: { id: ev.id } });
+        expect(row.nextRetryAt).not.toBeNull();
+        expect(row.nextRetryAt!.getTime()).toBeGreaterThan(Date.now());
+        await db.botInboundEvent.update({
+          where: { id: ev.id },
+          data: { nextRetryAt: new Date(Date.now() - 1) },
+        });
+      }
     }
     expect(await claimBotEvent(ev.id)).toBe(false); // dead — not claimable
     const row = await db.botInboundEvent.findUniqueOrThrow({ where: { id: ev.id } });
@@ -118,20 +129,20 @@ describe("C-04/H-03 — durable bot event inbox (DB-backed)", () => {
     const wf1 = await seedWorkflow("run-1");
     const wf2 = await seedWorkflow("run-2");
     let executions = 0;
-    const r1 = await runWorkflowOnceForEvent(ev.id, wf1, async () => { executions++; });
+    const r1 = await runWorkflowOnceForEvent(ev.id, wf1, async () => { executions++; return { ok: true }; });
     expect(r1).toEqual({ executed: true, ok: true });
     // Duplicate delivery (same event, same workflow) must NOT re-execute.
-    const r2 = await runWorkflowOnceForEvent(ev.id, wf1, async () => { executions++; });
+    const r2 = await runWorkflowOnceForEvent(ev.id, wf1, async () => { executions++; return { ok: true }; });
     expect(r2.executed).toBe(false);
     expect(executions).toBe(1);
 
     // A failing run is marked failed and IS re-executed on the next pass.
-    await runWorkflowOnceForEvent(ev.id, wf2, async () => { throw new Error("boom"); });
+    await runWorkflowOnceForEvent(ev.id, wf2, async () => { throw new Error("boom"); /* throws stay failures */ });
     const run2 = await db.botWorkflowRun.findUniqueOrThrow({
       where: { eventId_workflowId: { eventId: ev.id, workflowId: wf2 } },
     });
     expect(run2.status).toBe("failed");
-    const r3 = await runWorkflowOnceForEvent(ev.id, wf2, async () => { executions++; });
+    const r3 = await runWorkflowOnceForEvent(ev.id, wf2, async () => { executions++; return { ok: true }; });
     expect(r3.executed).toBe(true);
     const run2b = await db.botWorkflowRun.findUniqueOrThrow({
       where: { eventId_workflowId: { eventId: ev.id, workflowId: wf2 } },
@@ -140,7 +151,7 @@ describe("C-04/H-03 — durable bot event inbox (DB-backed)", () => {
     expect(executions).toBe(2);
 
     // The repaired run is now completed — never repeats again.
-    const r4 = await runWorkflowOnceForEvent(ev.id, wf2, async () => { executions++; });
+    const r4 = await runWorkflowOnceForEvent(ev.id, wf2, async () => { executions++; return { ok: true }; });
     expect(r4.executed).toBe(false);
     expect(executions).toBe(2);
   });
@@ -152,9 +163,9 @@ describe("C-04/H-03 — durable bot event inbox (DB-backed)", () => {
     const wfc = await seedWorkflow("sib-c");
     const ran: string[] = [];
     const [a, b, c] = await Promise.all([
-      runWorkflowOnceForEvent(ev.id, wfa, async () => { ran.push("a"); }),
-      runWorkflowOnceForEvent(ev.id, wfb, async () => { throw new Error("wf-b failed"); }),
-      runWorkflowOnceForEvent(ev.id, wfc, async () => { ran.push("c"); }),
+      runWorkflowOnceForEvent(ev.id, wfa, async () => { ran.push("a"); return { ok: true }; }),
+      runWorkflowOnceForEvent(ev.id, wfb, async () => { throw new Error("wf-b failed"); /* throws stay failures */ }),
+      runWorkflowOnceForEvent(ev.id, wfc, async () => { ran.push("c"); return { ok: true }; }),
     ]);
     expect(a.ok).toBe(true);
     expect(b.ok).toBe(false);

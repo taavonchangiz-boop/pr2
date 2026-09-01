@@ -20,7 +20,7 @@ const Schema = z.object({
 
 export async function POST(req: Request) {
   const ip = clientIp(req);
-  const rl = await rateLimit({ key: `register:${ip}`, limit: 5, windowMs: 60 * 60 * 1000 });
+  const rl = await rateLimit({ key: `register:${ip}`, limit: 5, windowMs: 60 * 60 * 1000, critical: true });
   if (!rl.ok) {
     return NextResponse.json({ errorFa: "تعداد تلاش‌ها بیش از حد مجاز بود. یک ساعت بعد امتحان کنید." }, { status: 429 });
   }
@@ -103,11 +103,17 @@ export async function POST(req: Request) {
   // hide the checkout button for the free plan while a free subscription is
   // still active or even expired-and-renewable).
   if (freePlan) {
+    // V4 M-14 — the auto-activated FREE row must carry the SAME UNIQUE
+    // activeKey (`${userId}:${planId}`) identity used by
+    // activateSubscription/ensureQuotaTarget, so it lives INSIDE the
+    // one-live-row-per-plan invariant instead of as an invisible zombie
+    // row that expiry reconciliation cannot see or renew.
     await db.subscription.create({
       data: {
         userId: user.id,
         planId: freePlan.id,
         status: "active",
+        activeKey: `${user.id}:${freePlan.id}`,
         startedAt: new Date(),
         endsAt,
         usedQuota: "{}",

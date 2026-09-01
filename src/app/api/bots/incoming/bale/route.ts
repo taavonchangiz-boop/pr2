@@ -31,7 +31,7 @@ import {
   completeBotEvent,
   failBotEvent,
   recoverBotEvents,
-  runWorkflowOnceForEvent,
+  runMatchedWorkflowsForEvent,
 } from "@/lib/bots/event-dedup";
 import { audit } from "@/lib/server/auth";
 import type { Bot, BotWorkflow } from "@prisma/client";
@@ -206,11 +206,11 @@ async function processBaleNonPaymentUpdate(
     return;
   }
 
-  // C-11/C-12: persist the inbound history row ONCE per event (owned by
-  // the webhook layer, not per workflow). Skipped on durable retries.
-  if (!opts.isRetry) {
-    await persistInboundOnce(bot, chatId, incomingText, update, update.update_id);
-  }
+  // C-11/C-12 + V4 H-04: persist the inbound history row ONCE per event
+  // (owned by the webhook layer, not per workflow). The UNIQUE
+  // inboundEventId makes this DB-idempotent — it runs on EVERY delivery
+  // and heals a crash-before-persist on durable retries.
+  await persistInboundOnce(bot, chatId, incomingText, update, update.update_id, undefined, opts.eventId);
 
   // Link-code consumption attempt.
   if (incomingText.startsWith("POSTYAR-")) {
@@ -247,34 +247,33 @@ async function processBaleNonPaymentUpdate(
 
   // Workflow dispatch — per-event UNIQUE run rows guarantee exactly-once
   // execution per intended workflow across retries and recovery.
+  // V4 C-01: the callback returns the TYPED engine outcome — an
+  // executeWorkflow ok:false is a genuine failure and keeps the run
+  // retryable instead of being recorded as completed.
+  // V4 C-02: runMatchedWorkflowsForEvent THROWS when any child failed —
+  // event completion never implies child completion.
   const workflows = await db.botWorkflow.findMany({
     where: { botId: bot.id, enabled: true },
     take: 50,
   });
-  for (const wf of workflows) {
-    if (!matchesTrigger(wf, incomingText)) continue;
-    const r = await runWorkflowOnceForEvent(opts.eventId, wf.id, async () => {
-      await executeWorkflow({
-        bot,
-        providerUserId: chatId,
-        rawUpdate: update,
-        incomingMessage: incomingText,
-        callbackQueryId,
-        updateId: update.update_id,
-        workflow: wf,
-      });
-    });
-    if (!r.ok) {
-      await audit({
-        userId: bot.ownerId,
-        actor: "system",
-        action: "bot_workflow_execute_failed",
-        targetType: "bot",
-        targetId: bot.id,
-        meta: { workflowId: wf.id, eventId: opts.eventId },
-      });
-    }
-  }
+  const jobs = workflows
+    .filter((wf) => matchesTrigger(wf, incomingText))
+    .map((wf) => ({
+      workflowId: wf.id,
+      execute: async () => {
+        const r = await executeWorkflow({
+          bot,
+          providerUserId: chatId,
+          rawUpdate: update,
+          incomingMessage: incomingText,
+          callbackQueryId,
+          updateId: update.update_id,
+          workflow: wf,
+        });
+        return { ok: r.ok, errorFa: r.errorFa };
+      },
+    }));
+  await runMatchedWorkflowsForEvent(opts.eventId, jobs);
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {

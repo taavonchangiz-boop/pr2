@@ -36,17 +36,21 @@ import {
   constantTimeEqual,
 } from "@/lib/security/crypto";
 import { audit } from "@/lib/server/auth";
-import { sanitizeRaw } from "@/lib/providers/util";
+import { sanitizeRaw, getSetting } from "@/lib/providers/util";
 import type { Bot } from "@prisma/client";
 
 // ---------------------------------------------------------------------
 // Public base URL — MUST be configured in production
+// V4 M-14 — resolves through getSetting (admin settings UI first, env
+// fallback): the value the admin writes in the settings UI takes effect.
 // ---------------------------------------------------------------------
-function getPublicBaseUrl(): string {
-  const url = process.env.POSTYAR_PUBLIC_BASE_URL;
+async function getPublicBaseUrl(): Promise<string> {
+  const url = (await getSetting("POSTYAR_PUBLIC_BASE_URL", "")).trim();
   if (url && /^https?:\/\//.test(url)) return url.replace(/\/$/, "");
   if (process.env.NODE_ENV === "production") {
-    throw new Error("POSTYAR_PUBLIC_BASE_URL not configured for production webhook registration.");
+    // V4 M-13 — bounded Persian message; the env-var detail stays in logs.
+    console.error("POSTYAR_PUBLIC_BASE_URL is not configured for production webhook registration.");
+    throw new Error("نشانی عمومی سرویس برای ثبت وب‌هوک پیکربندی نشده است.");
   }
   // Dev fallback — webhook registration will likely fail in dev unless
   // the user is on a tunneled host. The poll fallback (POST /api/bots/[id]/poll)
@@ -106,8 +110,8 @@ export function rotateWebhookSecret(): string {
 // ---------------------------------------------------------------------
 // Public URL for a bot's webhook
 // ---------------------------------------------------------------------
-export function webhookUrlFor(bot: Bot): string {
-  const base = getPublicBaseUrl();
+export async function webhookUrlFor(bot: Bot): Promise<string> {
+  const base = await getPublicBaseUrl();
   const sig = makeWebhookSig(bot.id);
   return `${base}/api/bots/incoming/${bot.provider}?bid=${encodeURIComponent(bot.id)}&sig=${sig}`;
 }
@@ -121,7 +125,7 @@ async function registerTelegramWebhook(bot: Bot, botToken: string, secretToken: 
   raw?: unknown;
 }> {
   const url = `https://api.telegram.org/bot${botToken}/setWebhook`;
-  const webhookUrl = webhookUrlFor(bot);
+  const webhookUrl = await webhookUrlFor(bot);
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -141,7 +145,11 @@ async function registerTelegramWebhook(bot: Bot, botToken: string, secretToken: 
     if (!j.ok) {
       return {
         ok: false,
-        errorFa: j.description ? `ثبت وب‌هوک ناموفق بود: ${j.description}` : "ثبت وب‌هوک ناموفق بود.",
+        // V4 M-13 — the provider description is bounded; raw provider
+        // payloads stay server-side (sanitizeRaw/audit only).
+        errorFa: j.description
+          ? `ثبت وب‌هوک ناموفق بود: ${String(j.description).slice(0, 200)}`
+          : "ثبت وب‌هوک ناموفق بود.",
         raw: sanitizeRaw(json),
       };
     }
@@ -164,7 +172,7 @@ async function registerBaleWebhook(bot: Bot, botToken: string): Promise<{
   raw?: unknown;
 }> {
   const url = `https://api.bale.ai/bot${botToken}/setWebhook`;
-  const webhookUrl = webhookUrlFor(bot);
+  const webhookUrl = await webhookUrlFor(bot);
   try {
     const res = await fetch(url, {
       method: "POST",
@@ -182,7 +190,11 @@ async function registerBaleWebhook(bot: Bot, botToken: string): Promise<{
     if (!j.ok) {
       return {
         ok: false,
-        errorFa: j.description ? `ثبت وب‌هوک ناموفق بود: ${j.description}` : "ثبت وب‌هوک ناموفق بود.",
+        // V4 M-13 — the provider description is bounded; raw provider
+        // payloads stay server-side (sanitizeRaw/audit only).
+        errorFa: j.description
+          ? `ثبت وب‌هوک ناموفق بود: ${String(j.description).slice(0, 200)}`
+          : "ثبت وب‌هوک ناموفق بود.",
         raw: sanitizeRaw(json),
       };
     }
@@ -310,7 +322,7 @@ export async function deleteWebhook(botId: string): Promise<{ ok: boolean; error
         action: "bot_webhook_delete_failed",
         targetType: "bot",
         targetId: bot.id,
-        meta: { provider: bot.provider, description: j.description ?? "" },
+        meta: { provider: bot.provider, description: (j.description ?? "").slice(0, 200) },
       });
     }
     await db.bot.update({ where: { id: bot.id }, data: { webhookSecret: null } });

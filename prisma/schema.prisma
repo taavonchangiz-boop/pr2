@@ -351,6 +351,9 @@ model WalletTxn {
   idempotencyKey String  @unique
   createdAt     DateTime @default(now())
   @@index([userId])
+  // V4 H-06 — O(1) latest-checkpoint balance lookup (id order == insert
+  // order; the latest row's balanceAfter IS the derived balance).
+  @@index([userId, id])
 }
 
 model LedgerEntry {
@@ -748,6 +751,10 @@ model BotHistory {
   providerUserId String?
   text          String
   raw           String?  // sanitized JSON
+  // V4 H-04 — the inbound history row is tied to the durable event
+  // identity; the UNIQUE index makes persistInboundOnce truly idempotent
+  // at the DATABASE level (crash/retry-safe, no preflight reads).
+  inboundEventId String? @unique
   createdAt     DateTime @default(now())
   @@index([botId])
 }
@@ -774,8 +781,15 @@ model BotInboundEvent {
   status          String    @default("received") // received|processing|completed|failed|dead
   attempts        Int       @default(0)
   leaseUntil      DateTime?
+  // V4 H-02 — durable retry schedule: exponential backoff + jitter is
+  // persisted so recovery NEVER hot-loops a just-failed event and
+  // multi-instance deployments honor the same schedule.
+  nextRetryAt     DateTime?
   lastError       String?
   payload         String?   // sanitized JSON of the raw update (recovery input)
+  // V4 H-03 — explicit truncation marker: a payload that exceeded the
+  // bounded representation is NEVER replayed as though it were original.
+  payloadTruncated Boolean  @default(false)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
   completedAt     DateTime?
@@ -798,6 +812,11 @@ model BotWorkflowRun {
   workflow    BotWorkflow     @relation(fields: [workflowId], references: [id], onDelete: Cascade)
   status      String          @default("pending") // pending|completed|failed
   attempts    Int             @default(0)
+  // V4 H-01 — per-workflow execution lease (same duration as the parent
+  // event lease, renewed by a live worker): a claimed run cannot be
+  // stolen while its worker is alive; a crashed run's lease expires and
+  // the run becomes claimable again. Completed runs are immutable.
+  leaseUntil  DateTime?
   lastError   String?
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt

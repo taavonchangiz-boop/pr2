@@ -360,6 +360,7 @@ model WalletTxn {
   idempotencyKey String  @unique
   createdAt     DateTime @default(now())
   @@index([userId])
+  @@index([userId, id])
 }
 
 model LedgerEntry {
@@ -757,6 +758,7 @@ model BotHistory {
   providerUserId String?
   text          String
   raw           String?  // sanitized JSON
+  inboundEventId String? @unique
   createdAt     DateTime @default(now())
   @@index([botId])
 }
@@ -783,8 +785,10 @@ model BotInboundEvent {
   status          String    @default("received") // received|processing|completed|failed|dead
   attempts        Int       @default(0)
   leaseUntil      DateTime?
+  nextRetryAt     DateTime?
   lastError       String?
   payload         String?   // sanitized JSON of the raw update (recovery input)
+  payloadTruncated Boolean  @default(false)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
   completedAt     DateTime?
@@ -807,6 +811,7 @@ model BotWorkflowRun {
   workflow    BotWorkflow     @relation(fields: [workflowId], references: [id], onDelete: Cascade)
   status      String          @default("pending") // pending|completed|failed
   attempts    Int             @default(0)
+  leaseUntil  DateTime?
   lastError   String?
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt

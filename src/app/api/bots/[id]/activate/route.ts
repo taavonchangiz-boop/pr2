@@ -33,11 +33,13 @@ export async function POST(
   try {
     webhookResult = await registerWebhook(id);
   } catch (err) {
-    // Network / config errors — don't fail activation but flag the bot
+    // V4 M-13 — network/config internals (env var names, provider URLs,
+    // raw fetch text) never reach the client; they are logged instead.
+    console.error("webhook registration failed:", err instanceof Error ? err.message : err);
     webhookResult = {
       ok: false,
       supported: false,
-      errorFa: err instanceof Error ? err.message : "ثبت وب‌هوک ناموفق بود.",
+      errorFa: "ثبت وب‌هوک ناموفق بود. تنظیمات ربات را بررسی کنید و دوباره تلاش کنید.",
     };
   }
   if (webhookResult && !webhookResult.ok && webhookResult.supported) {

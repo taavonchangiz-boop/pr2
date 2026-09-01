@@ -28,7 +28,7 @@ import {
   completeBotEvent,
   failBotEvent,
   recoverBotEvents,
-  runWorkflowOnceForEvent,
+  runMatchedWorkflowsForEvent,
 } from "@/lib/bots/event-dedup";
 import { executeWorkflow, persistInboundOnce } from "@/lib/bots/workflow";
 import type { Bot, BotWorkflow } from "@prisma/client";
@@ -215,11 +215,11 @@ async function processRubikaUpdate(
   }
   if (!chatId) return;
 
-  // C-11/C-12: persist the inbound history row ONCE per event (owned by
-  // the poller layer, not per workflow). Skipped on durable retries.
-  if (!opts.isRetry) {
-    await persistInboundOnce(bot, chatId, incomingText, update, uid, providerMessageId);
-  }
+  // C-11/C-12 + V4 H-04: persist the inbound history row ONCE per event
+  // (owned by the poller layer, not per workflow). The UNIQUE
+  // inboundEventId makes this DB-idempotent — it runs on EVERY delivery
+  // and heals a crash-before-persist on durable retries.
+  await persistInboundOnce(bot, chatId, incomingText, update, uid, providerMessageId, opts.eventId);
 
   // Link-code consumption attempt.
   if (incomingText.startsWith("POSTYAR-")) {
@@ -251,14 +251,17 @@ async function processRubikaUpdate(
 
   // Workflow dispatch — per-event UNIQUE run rows guarantee exactly-once
   // execution per intended workflow across retries and recovery.
+  // V4 C-01/C-02: typed execution outcome + event-level aggregation that
+  // throws when any child failed (event completion never implies child
+  // completion; recovery re-runs only the failed children).
   const workflows = await db.botWorkflow.findMany({
     where: { botId: bot.id, enabled: true },
     take: 50,
   });
-  for (const wf of workflows) {
-    if (!matchesTrigger(wf, incomingText)) continue;
-    if (opts.eventId === null) {
-      // No dedup key: run directly (previous semantics, never collapsed).
+  const matched = workflows.filter((wf) => matchesTrigger(wf, incomingText));
+  if (opts.eventId === null) {
+    // No dedup key: run directly (previous semantics, never collapsed).
+    for (const wf of matched) {
       try {
         await executeWorkflow({
           bot,
@@ -280,10 +283,13 @@ async function processRubikaUpdate(
           meta: { workflowId: wf.id, name: err instanceof Error ? err.name : "Error", unkeyed: true },
         });
       }
-      continue;
     }
-    const r = await runWorkflowOnceForEvent(opts.eventId, wf.id, async () => {
-      await executeWorkflow({
+    return;
+  }
+  const jobs = matched.map((wf) => ({
+    workflowId: wf.id,
+    execute: async () => {
+      const r = await executeWorkflow({
         bot,
         providerUserId: chatId,
         rawUpdate: update,
@@ -293,18 +299,10 @@ async function processRubikaUpdate(
         providerMessageId,
         workflow: wf,
       });
-    });
-    if (!r.ok) {
-      await audit({
-        userId: bot.ownerId,
-        actor: "system",
-        action: "bot_workflow_execute_failed",
-        targetType: "bot",
-        targetId: bot.id,
-        meta: { workflowId: wf.id, eventId: opts.eventId },
-      });
-    }
-  }
+      return { ok: r.ok, errorFa: r.errorFa };
+    },
+  }));
+  await runMatchedWorkflowsForEvent(opts.eventId, jobs);
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {

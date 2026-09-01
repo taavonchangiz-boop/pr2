@@ -12,6 +12,7 @@ import { rateLimit } from "@/lib/security/cache";
 import { decryptString, hmacSign } from "@/lib/security/crypto";
 import { requireRole, AuthError, clientIp, audit } from "@/lib/server/auth";
 import { executeWorkflow } from "@/lib/bots/workflow";
+import { getSetting } from "@/lib/providers/util";
 import type { BotWorkflow } from "@prisma/client";
 
 const POLL_RATE_LIMIT = 1;
@@ -154,7 +155,8 @@ export async function POST(
       // Call the inbound handler directly via a fetch to the same origin.
       // Use POSTYAR_PUBLIC_BASE_URL if set, otherwise fall back to a
       // relative call to the dev server.
-      const base = process.env.POSTYAR_PUBLIC_BASE_URL?.replace(/\/$/, "") ?? "http://localhost:3000";
+      // V4 M-14 — authoritative settings-aware resolver.
+      const base = (await getSetting("POSTYAR_PUBLIC_BASE_URL", "")).trim().replace(/\/$/, "") || "http://localhost:3000";
       const resp = await fetch(`${base}${webhookPath}`, {
         method: "POST",
         headers,

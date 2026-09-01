@@ -248,6 +248,15 @@ function sanitizeForHistory(raw: unknown, ctx: WorkflowContext): string {
  * webhook layer (not per workflow). Workflows no longer persist inbound
  * rows themselves (C-11/C-12: an event matched by N workflows previously
  * produced N duplicate inbound history rows).
+ *
+ * V4 H-04 — the row is tied to the durable event identity via
+ * BotHistory.inboundEventId (UNIQUE): the insert is truly idempotent at
+ * the DATABASE level. Duplicate deliveries, durable retries and
+ * concurrent workers all converge on ONE row; a retry after a
+ * crash-before-persist heals the missing row. Callers therefore invoke
+ * this on EVERY delivery (no isRetry skip). Failures other than the
+ * idempotent-duplicate case are logged, never silently swallowed —
+ * BotHistory is forensic observability and must not fail the event.
  */
 export async function persistInboundOnce(
   bot: Bot,
@@ -256,6 +265,7 @@ export async function persistInboundOnce(
   rawUpdate: unknown,
   updateId?: string | number,
   providerMessageId?: string | number,
+  inboundEventId?: string | null,
 ): Promise<void> {
   try {
     await db.botHistory.create({
@@ -265,9 +275,19 @@ export async function persistInboundOnce(
         providerUserId,
         text: (text ?? "").slice(0, 4000),
         raw: sanitizeForHistory(rawUpdate, { bot, providerUserId, rawUpdate, workflow: {} as BotWorkflow, updateId, providerMessageId } as WorkflowContext),
+        inboundEventId: inboundEventId ?? null,
       },
     });
-  } catch { /* never fail the event on persistence */ }
+  } catch (err) {
+    const msg = (err as { code?: string; message?: string })?.message ?? "";
+    if (/unique|UNIQUE|constraint/i.test(msg)) {
+      // Durable idempotency: the history row for this event already exists.
+      return;
+    }
+    // Never fail the event on observability persistence — but never hide
+    // the failure either.
+    console.error("bot history persist failed:", err instanceof Error ? err.message : err);
+  }
 }
 
 // ---------------------------------------------------------------------

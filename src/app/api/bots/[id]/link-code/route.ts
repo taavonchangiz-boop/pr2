@@ -45,11 +45,13 @@ export async function POST(
         "کد تنها برای ده دقیقه معتبر است و فقط یک‌بار قابل استفاده است.",
     }, { status: 201 });
   } catch (err) {
-    const e = err as AuthError;
-    return NextResponse.json(
-      { errorFa: e.message ?? "صدور کد اتصال ناموفق بود." },
-      { status: e.status ?? 400 },
-    );
+    // V4 M-13 — only intentional AuthError messages reach the client;
+    // anything else is logged server-side and answered generically.
+    if (err instanceof AuthError) {
+      return NextResponse.json({ errorFa: err.message }, { status: err.status });
+    }
+    console.error("generate link code failed:", err instanceof Error ? err.message : err);
+    return NextResponse.json({ errorFa: "صدور کد اتصال ناموفق بود." }, { status: 500 });
   }
   // clientIp captured for audit inside generateLinkCode (via audit()).
   void clientIp;

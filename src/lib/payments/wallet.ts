@@ -1,27 +1,50 @@
 // =====================================================================
-// POSTYAR — Wallet + Ledger (append-only, derived balance)
+// POSTYAR — Wallet + Ledger (append-only, checkpointed derived balance)
 // ---------------------------------------------------------------------
 // Money: INTEGER Rial minor units. NO floats.
 // All mutations are atomic via Prisma $transaction with deterministic
-// idempotency keys. Balance is DERIVED from WalletTxn sum — never a
-// mutable balance column.
+// idempotency keys. The balance is a DERIVED checkpoint: every WalletTxn
+// row carries `balanceAfter` (the running balance at insert time), the
+// write paths are serialized per-user (user-row lock as the FIRST
+// statement of the transaction — this also pins the SQLite WAL read
+// snapshot AFTER the write lock, so no stale checkpoint can be read),
+// and the balance is read in O(1) from the latest row instead of
+// scanning the whole history (V4 H-6). History stays append-only and
+// the checkpoint is exactly reconcilable: sum(history) MUST always equal
+// the latest row's balanceAfter — `verifyWalletIntegrity` proves it and
+// `rebuildWalletCheckpoint` is the recovery path (V4 H-6).
 // Persian error strings only.
 // =====================================================================
 import { db } from "@/lib/db";
 import { audit } from "@/lib/server/auth";
 import { formatRials } from "@/lib/persian";
-import type { Prisma } from "@prisma/client";
+import type { Prisma, PrismaClient } from "@prisma/client";
+
+/** Any Prisma client that can execute queries (global or tx-bound). */
+type QueryClient = Prisma.TransactionClient | PrismaClient;
 
 // ---------------------------------------------------------------------
 // Read-side: balance + history
 // ---------------------------------------------------------------------
-export async function getBalance(userId: string): Promise<{ balanceRials: number; balanceFa: string }> {
-  const txns = await db.walletTxn.findMany({
+/**
+ * V4 H-6 — O(1) derived balance: the LATEST WalletTxn row's
+ * `balanceAfter` checkpoint IS the balance. Every write path maintains
+ * the checkpoint inside a user-row-serialized transaction, so no
+ * additional lock is needed for reads. `id` order == insert order
+ * (cuid() is monotonic within a process and writes are serialized),
+ * backed by the (userId, id) index.
+ */
+export async function latestBalanceFor(client: QueryClient, userId: string): Promise<number> {
+  const last = await client.walletTxn.findFirst({
     where: { userId },
-    select: { amountRials: true, direction: true },
+    orderBy: { id: "desc" },
+    select: { balanceAfter: true },
   });
-  let bal = 0;
-  for (const t of txns) bal += t.direction === "credit" ? t.amountRials : -t.amountRials;
+  return last?.balanceAfter ?? 0;
+}
+
+export async function getBalance(userId: string): Promise<{ balanceRials: number; balanceFa: string }> {
+  const bal = await latestBalanceFor(db, userId);
   return { balanceRials: bal, balanceFa: formatRials(bal) };
 }
 
@@ -154,25 +177,21 @@ export async function adminAdjustWallet(input: {
   const walletIdemKey = `wallet:admin_adjust:${scopedKey}`;
 
   const result = await db.$transaction(async (tx) => {
-    // Idempotency check first: an existing row for this exact key means
-    // this adjustment was already applied — do NOT create anything and
-    // do NOT re-send the notification.
+    // Serialize concurrent wallet mutations for this user FIRST — the row
+    // write on User takes the DB write lock and (on SQLite/WAL) pins the
+    // transaction snapshot AFTER the lock, so the checkpoint read below
+    // can never observe a pre-lock (stale) balance (V4 H-6).
+    await tx.user.update({ where: { id: input.userId }, data: { updatedAt: new Date() } });
+
+    // Idempotency check: an existing row for this exact key means this
+    // adjustment was already applied — do NOT create anything and do NOT
+    // re-send the notification.
     const existing = await tx.walletTxn.findUnique({
       where: { idempotencyKey: walletIdemKey },
       select: { id: true },
     });
     if (!existing) {
-      // Serialize concurrent wallet mutations for this user (C-04): the
-      // row write on User takes the DB row lock (MariaDB InnoDB) so two
-      // concurrent adjustments cannot interleave their read-modify-write
-      // balance computations (SQLite's single writer already serializes).
-      await tx.user.update({ where: { id: input.userId }, data: { updatedAt: new Date() } });
-      const prev = await tx.walletTxn.findMany({
-        where: { userId: input.userId },
-        select: { amountRials: true, direction: true },
-      });
-      let running = 0;
-      for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
+      const running = await latestBalanceFor(tx, input.userId);
       const balanceAfter = running + (direction === "credit" ? amountAbs : -amountAbs);
 
       // C-04 — BALANCE GUARD: spendable wallet balances are defined to be
@@ -220,14 +239,9 @@ export async function adminAdjustWallet(input: {
       });
     }
 
-    // Always report the TRUE derived balance (addendum §8): recomputed
-    // from the WalletTxn sum inside the same transaction.
-    const postTxns = await tx.walletTxn.findMany({
-      where: { userId: input.userId },
-      select: { amountRials: true, direction: true },
-    });
-    let actualBalance = 0;
-    for (const t of postTxns) actualBalance += t.direction === "credit" ? t.amountRials : -t.amountRials;
+    // Always report the TRUE derived balance — the checkpoint of the
+    // latest row inside the same transaction (V4 H-6).
+    const actualBalance = await latestBalanceFor(tx, input.userId);
 
     // M-04: the wallet-adjust audit JOINS the transaction (critical) —
     // the money move and its audit trail commit atomically; a failed
@@ -284,8 +298,12 @@ export async function refund(input: {
   //     entry, one per order) — debiting the wallet here would corrupt the
   //     spendable balance with money the user never received.
   const isWalletKind = order.kind === "wallet_credit";
-  const walletIdemKey = `wallet:refund:${input.idempotencyKey}`;
-  const ledgerIdemKey = `ledger:refund:${input.idempotencyKey}`;
+  // V4 H-6/M-8 — refund idempotency keys are scoped by ORDER so a reused
+  // key on a different order can never silently collide (the
+  // one-refund-per-order invariant itself is enforced by the refundKey
+  // UNIQUE below, independently of these keys).
+  const walletIdemKey = `wallet:refund:${order.id}:${input.idempotencyKey}`;
+  const ledgerIdemKey = `ledger:refund:${order.id}:${input.idempotencyKey}`;
 
   // C-03 — the ONE-REFUND-PER-ORDER invariant is now enforced by the
   // DATABASE, not by a countable query. LedgerEntry.refundKey is a UNIQUE
@@ -295,17 +313,14 @@ export async function refund(input: {
   // winner's already-committed refund (exact idempotency on replay).
   const refundInvariantKey = `refund:${order.id}`;
 
-  const computeBalance = async (tx: Prisma.TransactionClient): Promise<number> => {
-    const txns = await tx.walletTxn.findMany({
-      where: { userId: order.userId },
-      select: { amountRials: true, direction: true },
-    });
-    let bal = 0;
-    for (const t of txns) bal += t.direction === "credit" ? t.amountRials : -t.amountRials;
-    return bal;
-  };
-
   const result = await db.$transaction(async (tx) => {
+    if (isWalletKind) {
+      // Serialize concurrent wallet mutations for this user FIRST (see
+      // adminAdjustWallet — V4 H-6 snapshot ordering), then apply the
+      // balance guard BEFORE any write: derived balance must never go
+      // negative; throwing rolls the whole transaction back.
+      await tx.user.update({ where: { id: order.userId }, data: { updatedAt: new Date() } });
+    }
     // Idempotent re-entry: an existing ledger row for this exact key means
     // this refund was already applied — report the true balance, change
     // nothing.
@@ -314,16 +329,12 @@ export async function refund(input: {
       select: { id: true },
     });
     if (existingLedger) {
-      return { balanceAfter: await computeBalance(tx), duplicate: true as const };
+      return { balanceAfter: await latestBalanceFor(tx, order.userId), duplicate: true as const };
     }
 
     let balanceAfter = 0;
     if (isWalletKind) {
-      // Serialize concurrent wallet mutations for this user, then apply the
-      // balance guard BEFORE any write: derived balance must never go
-      // negative; throwing rolls the whole transaction back.
-      await tx.user.update({ where: { id: order.userId }, data: { updatedAt: new Date() } });
-      const running = await computeBalance(tx);
+      const running = await latestBalanceFor(tx, order.userId);
       balanceAfter = running - input.amount;
       if (balanceAfter < 0) {
         throw new Error("موجودی کیف پول برای بازگشت این مبلغ کافی نیست.");
@@ -349,7 +360,7 @@ export async function refund(input: {
     } catch (err) {
       const msg = (err as { code?: string; message?: string })?.message ?? "";
       if (/unique|UNIQUE|constraint/i.test(msg)) {
-        return { balanceAfter: await computeBalance(tx), duplicate: true as const };
+        return { balanceAfter: await latestBalanceFor(tx, order.userId), duplicate: true as const };
       }
       throw err;
     }
@@ -380,14 +391,9 @@ export async function refund(input: {
       },
     });
 
-    // Recompute the ACTUAL derived balance so callers never see a
-    // hypothetical value (addendum §8).
-    const postTxns = await tx.walletTxn.findMany({
-      where: { userId: order.userId },
-      select: { amountRials: true, direction: true },
-    });
-    let actualBalance = 0;
-    for (const t of postTxns) actualBalance += t.direction === "credit" ? t.amountRials : -t.amountRials;
+    // Report the ACTUAL derived balance so callers never see a
+    // hypothetical value (V4 H-6 checkpoint read).
+    const actualBalance = await latestBalanceFor(tx, order.userId);
 
     // M-04: the refund audit JOINS the transaction (critical) — one
     // refund converges on exactly one ledger event, one wallet mutation
@@ -409,4 +415,90 @@ export async function refund(input: {
   });
 
   return { balanceRials: result.balanceAfter };
+}
+
+// ---------------------------------------------------------------------
+// V4 H-6 — reconciliation + recovery capability
+// ---------------------------------------------------------------------
+export interface WalletIntegrityReport {
+  userId: string;
+  /** The derived balance per the latest row's checkpoint. */
+  checkpointBalance: number;
+  /** The exact sum over the append-only history (source of truth). */
+  historySum: number;
+  consistent: boolean;
+  txnCount: number;
+}
+
+/**
+ * Prove exact reconciliation: sum(append-only history) MUST equal the
+ * latest row's balanceAfter checkpoint. Used by tests and by operators
+ * to verify the checkpoint invariant on live data.
+ */
+export async function verifyWalletIntegrity(userId: string): Promise<WalletIntegrityReport> {
+  const [txns, checkpointBalance] = await Promise.all([
+    db.walletTxn.findMany({
+      where: { userId },
+      select: { amountRials: true, direction: true },
+      orderBy: { id: "asc" },
+    }),
+    latestBalanceFor(db, userId),
+  ]);
+  let historySum = 0;
+  for (const t of txns) historySum += t.direction === "credit" ? t.amountRials : -t.amountRials;
+  return { userId, checkpointBalance, historySum, consistent: historySum === checkpointBalance, txnCount: txns.length };
+}
+
+/**
+ * Recovery path (V4 H-6): recompute the balance from the append-only
+ * history and repair the latest row's checkpoint when it diverges.
+ * Runs inside a user-row-serialized transaction and writes a critical,
+ * transaction-joined audit row so a repair can never happen silently.
+ */
+export async function rebuildWalletCheckpoint(userId: string, opts: { actorId: string; ip?: string } = { actorId: "system" }): Promise<WalletIntegrityReport & { repaired: boolean }> {
+  const report = await db.$transaction(async (tx) => {
+    // Lock the user row FIRST (same serialization contract as the write
+    // paths — V4 H-6 snapshot ordering).
+    await tx.user.update({ where: { id: userId }, data: { updatedAt: new Date() } });
+    const txns = await tx.walletTxn.findMany({
+      where: { userId },
+      select: { id: true, amountRials: true, direction: true },
+      orderBy: { id: "asc" },
+    });
+    let historySum = 0;
+    for (const t of txns) historySum += t.direction === "credit" ? t.amountRials : -t.amountRials;
+    const latest = txns.length > 0 ? txns[txns.length - 1] : null;
+    const checkpointBalance = latest ? await latestBalanceFor(tx, userId) : 0;
+    const consistent = historySum === checkpointBalance;
+    let repaired = false;
+    if (!consistent && latest) {
+      await tx.walletTxn.update({
+        where: { id: latest.id },
+        data: { balanceAfter: historySum },
+      });
+      repaired = true;
+    }
+    await audit({
+      userId,
+      actor: "admin",
+      action: "wallet_checkpoint_rebuild",
+      targetType: "wallet",
+      targetId: userId,
+      ip: opts.ip,
+      tx,
+      critical: true,
+      meta: {
+        actorId: opts.actorId,
+        historySum,
+        previousCheckpoint: checkpointBalance,
+        repaired,
+        txnCount: txns.length,
+      },
+    });
+    // Post-state: after a repair the checkpoint equals the history sum,
+    // so the report reflects the (now consistent) end state.
+    const finalBalance = repaired ? historySum : checkpointBalance;
+    return { userId, checkpointBalance: finalBalance, historySum, consistent: historySum === finalBalance, txnCount: txns.length, repaired };
+  });
+  return report;
 }

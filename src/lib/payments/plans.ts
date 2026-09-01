@@ -8,6 +8,7 @@
 // =====================================================================
 import { db } from "@/lib/db";
 import { formatRials, toPersianDigits } from "@/lib/persian";
+import { latestBalanceFor } from "@/lib/payments/wallet";
 import type { Prisma } from "@prisma/client";
 
 // ---------------------------------------------------------------------
@@ -56,6 +57,7 @@ export {
   countEnabledFeatures,
   parsePlanQuota,
   findUnknownFeatureKeys,
+  findImpossibleFeatureCombinations,
   parsePlanFeatures,
   PAYABLE_STATUSES,
 } from "./plan-catalog";
@@ -628,14 +630,9 @@ export async function activateSubscription(input: {
     let fulfilledPlanCode = "";
     if (order.kind === "wallet_credit") {
       const walletIdemKey = `wallet:payment:${order.id}`;
-      const prevTxns = await tx.walletTxn.findMany({
-        where: { userId: order.userId },
-        select: { amountRials: true, direction: true },
-      });
-      let runningBalance = 0;
-      for (const t of prevTxns) {
-        runningBalance += t.direction === "credit" ? t.amountRials : -t.amountRials;
-      }
+      // V4 H-6 — O(1) checkpoint read (the user row is already locked
+      // above, pinning the snapshot after the write lock).
+      const runningBalance = await latestBalanceFor(tx, order.userId);
       const balanceAfter = runningBalance + order.amountRials;
 
       const existingWalletTxn = await tx.walletTxn.findUnique({
@@ -784,14 +781,8 @@ export async function activateSubscription(input: {
             const refLedgerIdemKey = `ledger:referral:${user.id}`;
             // Serialize the referrer's wallet mutation too.
             await lockUserWalletRow(tx, user.referredById);
-            const prevR = await tx.walletTxn.findMany({
-              where: { userId: user.referredById },
-              select: { amountRials: true, direction: true },
-            });
-            let runningR = 0;
-            for (const t of prevR) {
-              runningR += t.direction === "credit" ? t.amountRials : -t.amountRials;
-            }
+            // V4 H-6 — O(1) checkpoint read.
+            const runningR = await latestBalanceFor(tx, user.referredById);
             const balAfterR = runningR + referralRewardRials;
             try {
               await tx.referralReward.upsert({

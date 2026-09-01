@@ -151,7 +151,7 @@ export async function savePrivateFile(
   opts: SaveOpts,
 ): Promise<{ storagePath: string; publicId: string; absolutePath: string; sizeBytes: number }> {
   await ensureStorage();
-  if (!Buffer.isBuffer(buf)) throw new Error("buf must be a Buffer");
+  if (!Buffer.isBuffer(buf)) throw new Error("ورودی نامعتبر است.");
   if (buf.byteLength === 0) throw new Error("فایل خالی است.");
   if (buf.byteLength > opts.maxSizeBytes) {
     throw new Error(
@@ -165,7 +165,13 @@ export async function savePrivateFile(
   const publicId = randomPublicId(opts.ext);
   const storagePath = resolveRelative(opts.subdir, publicId);
   const absolutePath = resolveAbsolute(opts.subdir, publicId);
-  await fs.writeFile(absolutePath, buf);
+  // V4 M-13 — fs errors carry absolute paths; they never reach the client.
+  try {
+    await fs.writeFile(absolutePath, buf);
+  } catch (err) {
+    console.error("file persist failed:", err instanceof Error ? err.message : err);
+    throw new Error("ذخیره‌سازی فایل ناموفق بود. لطفاً بعداً تلاش کنید.");
+  }
   // Zero out the buffer to discourage lingering references — best-effort.
   buf.fill(0);
   return { storagePath, publicId, absolutePath, sizeBytes: buf.byteLength };
@@ -214,7 +220,7 @@ export interface ProcessedImage {
 }
 
 export async function processImageUpload(buf: Buffer, declaredMime: string): Promise<ProcessedImage> {
-  if (!Buffer.isBuffer(buf)) throw new Error("buf must be a Buffer");
+  if (!Buffer.isBuffer(buf)) throw new Error("ورودی نامعتبر است.");
   if (buf.byteLength === 0) throw new Error("فایل خالی است.");
   if (buf.byteLength > IMAGE_MAX_BYTES) {
     throw new Error("حجم تصویر بیشتر از ۵ مگابایت است.");
@@ -245,18 +251,32 @@ export async function processImageUpload(buf: Buffer, declaredMime: string): Pro
   }
 
   // Re-encode to WebP, quality 80. Original buffer discarded after.
-  const webpBuf = await sharp(buf, { failOn: "truncated" })
-    .rotate() // honor EXIF orientation
-    .resize(2000, 2000, { fit: "inside", withoutEnlargement: true })
-    .webp({ quality: 80 })
-    .toBuffer();
+  // V4 M-13 — raw sharp errors never leave the server: bounded Persian
+  // only (internal details are logged server-side).
+  let webpBuf: Buffer;
+  try {
+    webpBuf = await sharp(buf, { failOn: "truncated" })
+      .rotate() // honor EXIF orientation
+      .resize(2000, 2000, { fit: "inside", withoutEnlargement: true })
+      .webp({ quality: 80 })
+      .toBuffer();
+  } catch (err) {
+    console.error("image re-encode failed:", err instanceof Error ? err.message : err);
+    throw new Error("پردازش تصویر ناموفق بود؛ فایل معتبر نیست یا پشتیبانی نمی‌شود.");
+  }
 
   const after = await sharp(webpBuf).metadata();
   const publicId = randomPublicId("webp");
   const storagePath = resolveRelative("images", publicId);
   const absolutePath = resolveAbsolute("images", publicId);
-  await ensureStorage();
-  await fs.writeFile(absolutePath, webpBuf);
+  // V4 M-13 — fs errors carry absolute paths; they never reach the client.
+  try {
+    await ensureStorage();
+    await fs.writeFile(absolutePath, webpBuf);
+  } catch (err) {
+    console.error("image persist failed:", err instanceof Error ? err.message : err);
+    throw new Error("ذخیره‌سازی فایل ناموفق بود. لطفاً بعداً تلاش کنید.");
+  }
   // Zero out original + intermediate buffers — best-effort
   buf.fill(0);
   webpBuf.fill(0);
@@ -279,7 +299,7 @@ export interface ProcessedVideo {
 }
 
 export async function processVideoUpload(buf: Buffer, declaredMime: string): Promise<ProcessedVideo> {
-  if (!Buffer.isBuffer(buf)) throw new Error("buf must be a Buffer");
+  if (!Buffer.isBuffer(buf)) throw new Error("ورودی نامعتبر است.");
   if (buf.byteLength === 0) throw new Error("فایل خالی است.");
   if (buf.byteLength > VIDEO_MAX_BYTES) {
     throw new Error(
@@ -298,8 +318,14 @@ export async function processVideoUpload(buf: Buffer, declaredMime: string): Pro
   const publicId = randomPublicId(ext);
   const storagePath = resolveRelative("videos", publicId);
   const absolutePath = resolveAbsolute("videos", publicId);
-  await ensureStorage();
-  await fs.writeFile(absolutePath, buf);
+  // V4 M-13 — fs errors carry absolute paths; they never reach the client.
+  try {
+    await ensureStorage();
+    await fs.writeFile(absolutePath, buf);
+  } catch (err) {
+    console.error("video persist failed:", err instanceof Error ? err.message : err);
+    throw new Error("ذخیره‌سازی فایل ناموفق بود. لطفاً بعداً تلاش کنید.");
+  }
   buf.fill(0);
   return { storagePath, publicId, sizeBytes: buf.byteLength, mime: labelMime };
 }

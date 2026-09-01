@@ -12,7 +12,7 @@ const Schema = z.object({
 
 export async function POST(req: Request) {
   const ip = clientIp(req);
-  const rl = await rateLimit({ key: `login:${ip}`, limit: 10, windowMs: 15 * 60 * 1000 });
+  const rl = await rateLimit({ key: `login:${ip}`, limit: 10, windowMs: 15 * 60 * 1000, critical: true });
   if (!rl.ok) return NextResponse.json({ errorFa: "تلاش بیش از حد. ۱۵ دقیقه بعد امتحان کنید." }, { status: 429 });
 
   let body: unknown;

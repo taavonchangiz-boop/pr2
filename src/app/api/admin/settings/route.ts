@@ -284,24 +284,33 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, unchanged: true });
   }
   const storedValue = prepareStoredValue(parsed.data.key, parsed.data.value);
-  const updated = await db.systemSetting.upsert({
-    where: { key: parsed.data.key },
-    create: { key: parsed.data.key, value: storedValue },
-    update: { value: storedValue },
+  // V4 H-9 — the settings change and its audit row commit ATOMICALLY
+  // (critical, tx-bound): a committed settings change can never exist
+  // without its audit trail. Cache invalidation + epoch bump happen only
+  // AFTER a successful commit.
+  const updated = await db.$transaction(async (tx) => {
+    const row = await tx.systemSetting.upsert({
+      where: { key: parsed.data.key },
+      create: { key: parsed.data.key, value: storedValue },
+      update: { value: storedValue },
+    });
+    await audit({
+      userId: user.id,
+      actor: "admin",
+      action: "system_setting_updated",
+      targetType: "system_setting",
+      targetId: row.key,
+      ip,
+      tx,
+      critical: true,
+      meta: { key: row.key, mode: "single" },
+    });
+    return row;
   });
   invalidateSettingsCache();
   // C-05: bump the shared settings-cache epoch so EVERY app instance
   // re-reads this setting within the explicit 3s window.
   await bumpSettingsEpoch();
-  await audit({
-    userId: user.id,
-    actor: "admin",
-    action: "system_setting_updated",
-    targetType: "system_setting",
-    targetId: updated.key,
-    ip,
-    meta: { key: updated.key, mode: "single" },
-  });
   return NextResponse.json({
     ok: true,
     setting: {
@@ -357,6 +366,19 @@ export async function PATCH(req: Request) {
           update: { value: storedValue },
         });
       }
+      // V4 H-9 — the coherent batch audit JOINS the transaction
+      // (critical): all-or-nothing persistence includes its audit trail.
+      await audit({
+        userId: user.id,
+        actor: "admin",
+        action: "system_setting_updated",
+        targetType: "system_setting",
+        targetId: items[0]?.key,
+        ip,
+        tx,
+        critical: true,
+        meta: { keys: items.map((i) => i.key), mode: "batch", count: items.length },
+      });
     });
   } catch {
     return NextResponse.json({ errorFa: "ذخیره‌سازی تنظیمات ناموفق بود؛ هیچ تغییری اعمال نشد." }, { status: 500 });
@@ -364,15 +386,6 @@ export async function PATCH(req: Request) {
   invalidateSettingsCache();
   // C-05: one shared-epoch bump covers the whole batch.
   await bumpSettingsEpoch();
-  await audit({
-    userId: user.id,
-    actor: "admin",
-    action: "system_setting_updated",
-    targetType: "system_setting",
-    targetId: items[0]?.key,
-    ip,
-    meta: { keys: items.map((i) => i.key), mode: "batch", count: items.length },
-  });
   return NextResponse.json({ ok: true, count: items.length });
 }
 
@@ -396,21 +409,27 @@ export async function DELETE(req: Request) {
   if (!ALLOWED_KEYS.includes(parsed.data.key)) {
     return NextResponse.json({ errorFa: "این کلید تنظیمات پشتیبانی نمی‌شود." }, { status: 400 });
   }
-  try {
-    await db.systemSetting.delete({ where: { key: parsed.data.key } });
-  } catch {
-    // Row doesn't exist — that's the same end-state (revert to env/default).
-  }
+  // V4 H-9 — delete (best-effort: a missing row is the same end-state)
+  // and its critical audit commit atomically.
+  await db.$transaction(async (tx) => {
+    try {
+      await tx.systemSetting.delete({ where: { key: parsed.data.key } });
+    } catch {
+      // Row doesn't exist — that's the same end-state (revert to env/default).
+    }
+    await audit({
+      userId: user.id,
+      actor: "admin",
+      action: "system_setting_reset",
+      targetType: "system_setting",
+      targetId: parsed.data.key,
+      ip,
+      tx,
+      critical: true,
+      meta: { key: parsed.data.key },
+    });
+  });
   invalidateSettingsCache();
   await bumpSettingsEpoch();
-  await audit({
-    userId: user.id,
-    actor: "admin",
-    action: "system_setting_reset",
-    targetType: "system_setting",
-    targetId: parsed.data.key,
-    ip,
-    meta: { key: parsed.data.key },
-  });
   return NextResponse.json({ ok: true });
 }

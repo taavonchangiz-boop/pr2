@@ -8,6 +8,7 @@ import { db } from "@/lib/db";
 import { refreshRedisLiveness, isRedisConnected } from "@/lib/security/cache";
 import { pingRedis, getRedisUrlMasked, getRedisLastError } from "@/lib/security/redis-client";
 import { listProviderStatus } from "@/lib/providers/ai";
+import { getSetting } from "@/lib/providers/util";
 import { maskToken } from "@/lib/persian";
 import { formatJalaliDateTime } from "@/lib/persian";
 import path from "node:path";
@@ -109,7 +110,8 @@ export async function GET() {
   }
 
   // Gold provider
-  const goldUrl = process.env.POSTYAR_GOLD_PROVIDER_URL ?? "";
+  // V4 M-14 — same authoritative resolver as the runtime reader.
+  const goldUrl = await getSetting("POSTYAR_GOLD_PROVIDER_URL", "");
   checks.push({
     component: "gold",
     status: goldUrl ? "ok" : "warn",
@@ -117,7 +119,7 @@ export async function GET() {
   });
 
   // SMS provider
-  const smsProvider = process.env.POSTYAR_SMS_PROVIDER ?? "";
+  const smsProvider = await getSetting("POSTYAR_SMS_PROVIDER", "");
   checks.push({
     component: "sms",
     status: smsProvider ? "ok" : "warn",

@@ -155,7 +155,20 @@ export async function rateLimit(opts: {
   key: string;
   limit: number;
   windowMs: number;
+  /**
+   * V4 H-7 — account-security throttles (login / OTP / password reset)
+   * are distributed-critical: in PRODUCTION they must FAIL CLOSED when
+   * no real Redis is available instead of silently degrading to a
+   * per-process Map (an attacker spreading requests across instances
+   * would otherwise bypass the throttle entirely). Dev/preview/CI
+   * (NODE_ENV !== "production") keeps the in-memory fallback so the
+   * preview never needs Redis.
+   */
+  critical?: boolean;
 }): Promise<{ ok: boolean; count: number; resetMs: number }> {
+  if (opts.critical && process.env.NODE_ENV === "production" && !isRedisActive()) {
+    return { ok: false, count: opts.limit + 1, resetMs: opts.windowMs };
+  }
   const count = await cache.incr(opts.key, opts.windowMs);
   const resetMs = opts.windowMs;
   return { ok: count <= opts.limit, count, resetMs };

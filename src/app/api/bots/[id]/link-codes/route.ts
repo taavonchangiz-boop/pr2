@@ -23,10 +23,12 @@ export async function GET(
     const items = await listLinkCodesForBot(id, user.id);
     return NextResponse.json({ items });
   } catch (err) {
-    const e = err as AuthError;
-    return NextResponse.json(
-      { errorFa: e.message ?? "دریافت کدها ناموفق بود." },
-      { status: e.status ?? 400 },
-    );
+    // V4 M-13 — only intentional AuthError messages reach the client;
+    // anything else is logged server-side and answered generically.
+    if (err instanceof AuthError) {
+      return NextResponse.json({ errorFa: err.message }, { status: err.status });
+    }
+    console.error("list link codes failed:", err instanceof Error ? err.message : err);
+    return NextResponse.json({ errorFa: "دریافت کدها ناموفق بود." }, { status: 500 });
   }
 }

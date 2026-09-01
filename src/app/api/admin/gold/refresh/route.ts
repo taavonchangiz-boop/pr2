@@ -12,6 +12,7 @@ import { requireRole, clientIp, audit, AuthError } from "@/lib/server/auth";
 import { db } from "@/lib/db";
 import { decryptString } from "@/lib/security/crypto";
 import { assertSafeOutboundUrl, outboundUrlErrorFa } from "@/lib/security/net-guard";
+import { pinnedFetchJson } from "@/lib/security/http";
 import { formatJalaliDateTime, formatRials, toPersianDigits } from "@/lib/persian";
 
 // Built-in instrument list (mirrors lib/providers/gold/index.ts).
@@ -92,16 +93,18 @@ export async function POST(req: Request) {
     return NextResponse.json({ errorFa: outboundUrlErrorFa(e) }, { status: 400 });
   }
 
-  // Fetch.
-  let resp: Response;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10_000);
-    const headers: Record<string, string> = { Accept: "application/json" };
-    if (bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
-    resp = await fetch(endpoint, { method: "GET", headers, signal: controller.signal, redirect: "error" });
-    clearTimeout(timer);
-  } catch {
+  // V4 M-3 — DNS-rebinding TOCTOU closed: the request is PINNED to the
+  // address validated above (SNI + Host preserved, no second DNS
+  // resolution between validation and connection) and the response body
+  // is hard-capped (a lying/chunked server cannot over-commit memory).
+  const fetched = await pinnedFetchJson<unknown>(endpoint, {
+    allowedPorts: [443],
+    method: "GET",
+    headers: bearerToken ? { Authorization: `Bearer ${bearerToken}` } : undefined,
+    timeoutMs: 10_000,
+    maxBytes: 1024 * 1024,
+  });
+  if (!fetched.ok) {
     await audit({
       userId: user.id,
       actor: "admin",
@@ -109,38 +112,19 @@ export async function POST(req: Request) {
       targetType: "gold_config",
       targetId: cfg?.id,
       ip,
-      meta: { reason: "network_error", endpoint },
+      meta: {
+        reason: fetched.status ? "http_error" : "network_error",
+        status: fetched.status,
+        endpoint,
+      },
     });
-    return NextResponse.json(
-      { errorFa: "ارتباط با ارائه‌دهنده داده طلا برقرار نشد." },
-      { status: 502 },
-    );
-  }
-  if (!resp.ok) {
-    await audit({
-      userId: user.id,
-      actor: "admin",
-      action: "gold_refresh_failed",
-      targetType: "gold_config",
-      targetId: cfg?.id,
-      ip,
-      meta: { reason: "http_error", status: resp.status, endpoint },
-    });
-    return NextResponse.json(
-      { errorFa: `ارائه‌دهنده داده طلا کد ${toPersianDigits(resp.status)} بازگرداند.` },
-      { status: 502 },
-    );
+    const errorFa = fetched.status
+      ? `ارائه‌دهنده داده طلا کد ${toPersianDigits(fetched.status)} بازگرداند.`
+      : fetched.errorFa;
+    return NextResponse.json({ errorFa }, { status: 502 });
   }
 
-  let payload: unknown;
-  try {
-    payload = await resp.json();
-  } catch {
-    return NextResponse.json(
-      { errorFa: "پاسخ ارائه‌دهنده داده طلا قابل تجزیه نیست." },
-      { status: 502 },
-    );
-  }
+  const payload: unknown = fetched.data;
 
   const now = new Date();
   const prices = INSTRUMENTS.map((inst) => {

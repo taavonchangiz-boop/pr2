@@ -17,6 +17,7 @@ import type {
   OrderLike,
 } from "@/lib/payments/engine";
 import { activateSubscription } from "@/lib/payments/plans";
+import { PAYABLE_STATUSES } from "@/lib/payments/plan-catalog";
 
 // ---------------------------------------------------------------------
 // createPaymentRequest — for card-to-card, we show the available bank cards
@@ -24,11 +25,16 @@ import { activateSubscription } from "@/lib/payments/plans";
 export async function cardCreatePaymentRequest(input: {
   order: OrderLike;
 }): Promise<CreatePaymentRequestResult> {
-  // Mark the order as awaiting_payment and link destination cards.
-  await db.order.update({
-    where: { id: input.order.id },
+  // V4 M-7 — conditional expected-state transition: only a genuinely
+  // payable order may move to awaiting_payment. A paid/rejected/expired
+  // order can NEVER be regressed by a late re-invocation.
+  const moved = await db.order.updateMany({
+    where: { id: input.order.id, status: { in: PAYABLE_STATUSES } },
     data: { status: "awaiting_payment", provider: "card" },
   });
+  if (moved.count === 0) {
+    throw new AuthError("این سفارش در وضعیت قابل پرداختی نیست.", 400);
+  }
   // Get all active admin-configured destination bank cards (shared across users)
   const cards = await db.bankCard.findMany({
     where: { active: true },
@@ -88,27 +94,41 @@ export async function submitCardReceipt(input: {
   if (existing && existing.status === "approved") {
     throw new AuthError("رسید این سفارش قبلاً تأیید شده است.", 400);
   }
-  let receipt;
-  if (existing) {
-    // Update with new media path (replace previous receipt)
-    receipt = await db.cardTransferReceipt.update({
-      where: { id: existing.id },
-      data: {
-        storagePath: media.storagePath,
-        publicId: media.publicId,
-        status: "pending",
-        reviewedBy: null,
-        reviewedAt: null,
-        adminNotes: null,
-      },
-    });
-    // Move order back to awaiting_review
-    await db.order.update({
-      where: { id: order.id },
-      data: { status: "awaiting_review" },
-    });
-  } else {
-    receipt = await db.cardTransferReceipt.create({
+  // V4 M-7 — the receipt reset and the order status write are CAS-guarded
+  // inside ONE transaction: a re-submission racing a concurrent admin
+  // approval can no longer regress paid→awaiting_review or
+  // approved→pending (the loser observes the CAS miss and fails).
+  const receipt = await db.$transaction(async (tx) => {
+    if (existing) {
+      // Replace the previous receipt — but only while NOT approved
+      // (an approved receipt is terminal; the preflight above re-checked
+      // it, and the CAS below makes the check race-proof).
+      const updated = await tx.cardTransferReceipt.updateMany({
+        where: { id: existing.id, status: { not: "approved" } },
+        data: {
+          storagePath: media.storagePath,
+          publicId: media.publicId,
+          status: "pending",
+          reviewedBy: null,
+          reviewedAt: null,
+          adminNotes: null,
+        },
+      });
+      if (updated.count === 0) {
+        throw new AuthError("رسید این سفارش قبلاً تأیید شده است.", 400);
+      }
+      // Move order back to awaiting_review — only from genuinely payable
+      // states; a concurrently-paid order can never be regressed.
+      const moved = await tx.order.updateMany({
+        where: { id: order.id, status: { in: PAYABLE_STATUSES } },
+        data: { status: "awaiting_review" },
+      });
+      if (moved.count === 0) {
+        throw new AuthError("این سفارش قبلاً پرداخت شده است.", 400);
+      }
+      return { id: existing.id, status: "pending" };
+    }
+    const created = await tx.cardTransferReceipt.create({
       data: {
         orderId: order.id,
         storagePath: media.storagePath,
@@ -116,11 +136,15 @@ export async function submitCardReceipt(input: {
         status: "pending",
       },
     });
-    await db.order.update({
-      where: { id: order.id },
+    const moved = await tx.order.updateMany({
+      where: { id: order.id, status: { in: PAYABLE_STATUSES } },
       data: { status: "awaiting_review" },
     });
-  }
+    if (moved.count === 0) {
+      throw new AuthError("این سفارش در وضعیت قابل پرداختی نیست.", 400);
+    }
+    return { id: created.id, status: "pending" as string };
+  });
   await audit({
     userId: input.userId,
     actor: "user",

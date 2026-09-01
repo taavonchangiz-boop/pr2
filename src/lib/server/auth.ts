@@ -155,7 +155,7 @@ export async function requestOtp(mobileRaw: string, purpose: "login" | "register
   if (!isValidIranMobile(mobile)) return { sent: false, cooldownSec: 0, errorFa: "شماره موبایل نامعتبر است." };
 
   const mobileKey = `otp:req:${mobile}`;
-  const rl = await rateLimit({ key: mobileKey, limit: OTP_REQUEST_LIMIT, windowMs: OTP_REQUEST_WINDOW_MS });
+  const rl = await rateLimit({ key: mobileKey, limit: OTP_REQUEST_LIMIT, windowMs: OTP_REQUEST_WINDOW_MS, critical: true });
   if (!rl.ok) return { sent: false, cooldownSec: 600, errorFa: "تعداد درخواست کد بیش از حد مجاز است. یک ساعت بعد تلاش کنید." };
 
   const existing = await db.user.findUnique({ where: { mobile } });
@@ -194,7 +194,7 @@ export async function verifyOtp(mobileRaw: string, codeRaw: string, purpose: "lo
 
   // IP-level brute-force throttle (per IP, across all mobiles)
   if (ip) {
-    const ipRl = await rateLimit({ key: `otp:ver:${ip}`, limit: 30, windowMs: 15 * 60 * 1000 });
+    const ipRl = await rateLimit({ key: `otp:ver:${ip}`, limit: 30, windowMs: 15 * 60 * 1000, critical: true });
     if (!ipRl.ok) return { ok: false, errorFa: "تعداد تلاش از این نشانی بیش از حد مجاز بود. ۱۵ دقیقه بعد تلاش کنید." };
   }
 

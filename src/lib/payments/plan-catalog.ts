@@ -289,6 +289,45 @@ export function findUnknownFeatureKeys(input: Record<string, unknown>): string[]
   return Object.keys(input ?? {}).filter((k) => !known.has(k));
 }
 
+/**
+ * V4 M-2 — semantic pairing between boolean capability toggles and the
+ * numeric quota dimensions that make them usable. A boolean set to true
+ * while its linked quota is explicitly 0 (disabled) is an IMPOSSIBLE
+ * combination: the gating engine reads the numeric dimension with
+ * fallback 0, so the capability could never actually be used.
+ */
+export const BOOLEAN_FEATURE_QUOTA_PAIRS: ReadonlyArray<{
+  booleanKey: PlanBooleanFeatureKey;
+  quotaKey: PlanNumericFeatureKey;
+}> = [
+  { booleanKey: "publish", quotaKey: "publishPerMonth" },
+  { booleanKey: "multiChannel", quotaKey: "channels" },
+  { booleanKey: "bot", quotaKey: "bots" },
+  { booleanKey: "workflow", quotaKey: "workflowSteps" },
+  { booleanKey: "glassButtons", quotaKey: "glassButtonsPerDest" },
+  { booleanKey: "caption", quotaKey: "aiPerMonth" },
+  { booleanKey: "smartText", quotaKey: "aiPerMonth" },
+  { booleanKey: "smartReply", quotaKey: "aiPerMonth" },
+  { booleanKey: "autoResponder", quotaKey: "aiPerMonth" },
+];
+
+/** V4 M-2 — reject impossible feature/quota combinations:
+ *  a capability toggled ON whose linked quota is explicitly 0.
+ *  Returns the human-readable list of offending pairs (empty = valid). */
+export function findImpossibleFeatureCombinations(
+  features: Record<string, unknown>,
+): string[] {
+  const out: string[] = [];
+  for (const pair of BOOLEAN_FEATURE_QUOTA_PAIRS) {
+    const boolV = features[pair.booleanKey];
+    const quotaV = features[pair.quotaKey];
+    if (boolV === true && typeof quotaV === "number" && Number.isFinite(quotaV) && Math.max(0, Math.floor(quotaV)) === 0 && quotaV >= 0) {
+      out.push(`${pair.booleanKey}+${pair.quotaKey}`);
+    }
+  }
+  return out;
+}
+
 /** Parse + validate a raw features JSON string into a PlanFeatures object.
  *  Numeric values accept the UNLIMITED_QUOTA (-1) sentinel; anything else
  *  is floored at 0 (disabled). */

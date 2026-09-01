@@ -13,7 +13,7 @@ const Schema = z.object({
 
 export async function POST(req: Request) {
   const ip = clientIp(req);
-  const rl = await rateLimit({ key: `otp-req:${ip}`, limit: 10, windowMs: 60 * 60 * 1000 });
+  const rl = await rateLimit({ key: `otp-req:${ip}`, limit: 10, windowMs: 60 * 60 * 1000, critical: true });
   if (!rl.ok) return NextResponse.json({ errorFa: "تعداد درخواست کد بیش از حد مجاز بود." }, { status: 429 });
 
   let body: unknown;

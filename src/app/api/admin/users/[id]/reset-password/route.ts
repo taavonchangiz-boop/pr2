@@ -96,20 +96,23 @@ export async function POST(
       where: { userId: id, revokedAt: null },
       data: { revokedAt: new Date() },
     });
-  });
-
-  await audit({
-    userId: admin.id,
-    actor: "admin",
-    action: "user_password_reset",
-    targetType: "user",
-    targetId: id,
-    ip,
-    meta: {
-      // Do NOT log the new password. Only who reset whose password, and when.
-      targetEmail: existing.email,
-      targetName: `${existing.firstName ?? ""} ${existing.lastName ?? ""}`.trim(),
-    },
+    // V4 H-9 — the credential change's audit JOINS the transaction
+    // (critical). Never logs the new password.
+    await audit({
+      userId: admin.id,
+      actor: "admin",
+      action: "user_password_reset",
+      targetType: "user",
+      targetId: id,
+      ip,
+      tx,
+      critical: true,
+      meta: {
+        // Do NOT log the new password. Only who reset whose password, and when.
+        targetEmail: existing.email,
+        targetName: `${existing.firstName ?? ""} ${existing.lastName ?? ""}`.trim(),
+      },
+    });
   });
 
   return NextResponse.json({ ok: true });

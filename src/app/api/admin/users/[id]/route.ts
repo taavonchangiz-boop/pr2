@@ -125,6 +125,9 @@ export async function PATCH(
   // same instant its sessions die (previously the suspension relied
   // solely on lazy per-request revocation, leaving live session rows
   // valid until each happened to be used again).
+  // V4 H-9 — the state change + session revocation + its critical audit
+  // commit as ONE unit: a suspension can never exist without its audit
+  // trail, and an audit failure rolls the whole operation back.
   const updated = await db.$transaction(async (tx) => {
     const u = await tx.user.update({ where: { id }, data });
     if (data.status) {
@@ -133,16 +136,18 @@ export async function PATCH(
         data: { revokedAt: new Date() },
       });
     }
+    await audit({
+      userId: user.id,
+      actor: "admin",
+      action: "user_updated",
+      targetType: "user",
+      targetId: id,
+      ip,
+      tx,
+      critical: true,
+      meta: { from: { status: existing.status, role: existing.role }, to: data },
+    });
     return u;
-  });
-  await audit({
-    userId: user.id,
-    actor: "admin",
-    action: "user_updated",
-    targetType: "user",
-    targetId: id,
-    ip,
-    meta: { from: { status: existing.status, role: existing.role }, to: data },
   });
   return NextResponse.json({
     ok: true,

@@ -9,13 +9,14 @@
 // no SystemSetting row exists — the env value is used.
 import { rateLimit } from "@/lib/security/cache";
 import { getSetting } from "@/lib/providers/util";
+import { isPlaceholderSecret } from "@/lib/security/placeholder";
 
 export type SmsProvider = "kavenegar" | "farapayamak" | "smsir" | "melipayamak" | "nikpayamak" | "mock";
 
 export async function dispatchOtp(mobile: string, code: string, purpose: string): Promise<{ ok: boolean; errorFa?: string }> {
   const provider = ((await getSetting("POSTYAR_SMS_PROVIDER", "")) || "") as SmsProvider | "";
   if (!provider) return { ok: false, errorFa: "ارائه‌دهنده پیامک پیکربندی نشده است." };
-  const rl = await rateLimit({ key: `sms:out:${mobile}`, limit: 10, windowMs: 60 * 60 * 1000 });
+  const rl = await rateLimit({ key: `sms:out:${mobile}`, limit: 10, windowMs: 60 * 60 * 1000, critical: true });
   if (!rl.ok) return { ok: false, errorFa: "نرخ ارسال پیامک به این شماره بیش از حد مجاز بود." };
   const apiKey = await getSetting("POSTYAR_SMS_API_KEY", "");
   const sender = await getSetting("POSTYAR_SMS_SENDER", "");
@@ -23,8 +24,18 @@ export async function dispatchOtp(mobile: string, code: string, purpose: string)
   const password = await getSetting("POSTYAR_SMS_PASSWORD", "");
   const needsApiKey = provider === "kavenegar" || provider === "smsir";
   const needsUserPass = provider === "farapayamak" || provider === "melipayamak" || provider === "nikpayamak";
-  if (needsApiKey && !apiKey) return { ok: false, errorFa: "کلید API پیامک پیکربندی نشده است." };
-  if (needsUserPass && (!username || !password)) return { ok: false, errorFa: "نام کاربری/رمز پیامک پیکربندی نشده است." };
+  // V4 M-10 — placeholder credentials copied from .env.example are NOT
+  // configured credentials: they must never reach a real provider API.
+  if (needsApiKey && (!apiKey || isPlaceholderSecret(apiKey))) return { ok: false, errorFa: "کلید API پیامک پیکربندی نشده است." };
+  if (needsUserPass && (!username || !password || isPlaceholderSecret(username) || isPlaceholderSecret(password))) return { ok: false, errorFa: "نام کاربری/رمز پیامک پیکربندی نشده است." };
+  // V4 M-10 — preview/dev side-effect safety: outside production the SMS
+  // channel NEVER issues a real outbound request unless the operator
+  // explicitly opts in via POSTYAR_ALLOW_REAL_SMS_IN_DEV=1. The OTP flow
+  // still works end-to-end via the dev OTP retrieval route.
+  if (process.env.NODE_ENV !== "production" && process.env.POSTYAR_ALLOW_REAL_SMS_IN_DEV !== "1") {
+    console.log(`[sms] dev/preview suppression: no real SMS sent (provider=${provider})`);
+    return { ok: true };
+  }
   const text = `کد یکبار مصرف پُست‌یار شما: ${code}`;
   switch (provider) {
     case "kavenegar": {
@@ -33,6 +44,8 @@ export async function dispatchOtp(mobile: string, code: string, purpose: string)
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ receptor: mobile, message: text, sender }).toString(),
+        // V4 M-12 — bounded outbound call.
+        signal: AbortSignal.timeout(15_000),
       });
       if (!r.ok) return { ok: false, errorFa: "ارسال پیامک ناموفق بود." };
       return { ok: true };
@@ -46,6 +59,7 @@ export async function dispatchOtp(mobile: string, code: string, purpose: string)
         method: "POST",
         headers: { "Content-Type": "application/json", "x-api-key": apiKey },
         body: JSON.stringify({ PhoneNumber: mobile, TemplateId: templateId, Parameters: [{ Name: "Code", Value: code }] }),
+        signal: AbortSignal.timeout(15_000),
       });
       if (!r.ok) return { ok: false, errorFa: "ارسال پیامک ناموفق بود." };
       return { ok: true };
@@ -56,6 +70,7 @@ export async function dispatchOtp(mobile: string, code: string, purpose: string)
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password, from: sender, to: mobile, message: text }),
+        signal: AbortSignal.timeout(15_000),
       });
       if (!r.ok) return { ok: false, errorFa: "ارسال پیامک ناموفق بود." };
       return { ok: true };
@@ -68,7 +83,7 @@ export async function dispatchOtp(mobile: string, code: string, purpose: string)
       url.searchParams.set("from", sender);
       url.searchParams.set("to", mobile);
       url.searchParams.set("text", text);
-      const r = await fetch(url, { method: "GET" });
+      const r = await fetch(url, { method: "GET", signal: AbortSignal.timeout(15_000) });
       if (!r.ok) return { ok: false, errorFa: "ارسال پیامک ناموفق بود." };
       return { ok: true };
     }
@@ -78,6 +93,7 @@ export async function dispatchOtp(mobile: string, code: string, purpose: string)
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password, from: sender, to: mobile, text }),
+        signal: AbortSignal.timeout(15_000),
       });
       if (!r.ok) return { ok: false, errorFa: "ارسال پیامک ناموفق بود." };
       return { ok: true };

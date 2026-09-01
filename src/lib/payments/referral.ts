@@ -7,6 +7,7 @@
 // Persian error strings.
 // =====================================================================
 import { db } from "@/lib/db";
+import { latestBalanceFor } from "@/lib/payments/wallet";
 import { audit } from "@/lib/server/auth";
 import { maskMobile, formatRials, toPersianDigits } from "@/lib/persian";
 
@@ -147,6 +148,12 @@ export async function getRewardForNewActiveSubscription(input: {
 
   try {
     const result = await db.$transaction(async (tx) => {
+      // Serialize the referrer's wallet mutation FIRST — the user-row
+      // write takes the DB write lock and pins the snapshot after it, so
+      // the checkpoint read below can never observe a stale balance
+      // (V4 H-6 snapshot ordering).
+      await tx.user.update({ where: { id: input.referrerId }, data: { updatedAt: new Date() } });
+
       // Check for existing reward for this referred user (UNIQUE constraint)
       const existing = await tx.referralReward.findUnique({
         where: { referredId: input.newUserId },
@@ -155,13 +162,8 @@ export async function getRewardForNewActiveSubscription(input: {
         return { alreadyPaid: true as const };
       }
 
-      // Compute current referrer balance
-      const prev = await tx.walletTxn.findMany({
-        where: { userId: input.referrerId },
-        select: { amountRials: true, direction: true },
-      });
-      let running = 0;
-      for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
+      // V4 H-6 — O(1) checkpoint read of the referrer's balance.
+      const running = await latestBalanceFor(tx, input.referrerId);
       const balanceAfter = running + rewardRials;
 
       await tx.referralReward.upsert({

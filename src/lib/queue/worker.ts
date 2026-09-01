@@ -31,6 +31,7 @@ import { safeJsonParse } from "@/lib/server/auth";
 import { signMediaUrlToken } from "@/lib/security/crypto";
 import { assertTransition, isContentStatus } from "@/lib/publishing/state";
 import type { GlassButton } from "@/lib/types/glass-button";
+import { getSetting } from "@/lib/providers/util";
 
 export interface WorkerSummary {
   processed: number;
@@ -283,7 +284,8 @@ async function processJob(
       // NOTE: Telegram and Bale fetch by URL; if our app is behind a
       // domain, set POSTYAR_PUBLIC_BASE_URL. Otherwise we fall back to
       // sending text-only with the caption referring to the media.
-      const publicBase = process.env.POSTYAR_PUBLIC_BASE_URL;
+      // V4 M-14 — authoritative settings-aware resolver.
+      const publicBase = (await getSetting("POSTYAR_PUBLIC_BASE_URL", "")).trim() || undefined;
       if (publicBase) {
         const { exp, sig } = signMediaUrlToken(m.id, 10 * 60);
         mediaUrl = `${publicBase.replace(/\/$/, "")}/api/media/${m.id}?exp=${exp}&sig=${sig}`;
