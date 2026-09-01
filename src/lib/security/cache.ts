@@ -120,6 +120,37 @@ export const cache = {
     }
     store.delete(key);
   },
+  /**
+   * V6 C-08 — atomic compare-and-delete for SINGLE-USE tokens.
+   * Deletes `key` ONLY when its current value equals `expected`, and
+   * returns whether THIS caller consumed it. On Redis the compare+delete
+   * runs as one Lua script (atomic across instances); on the in-process
+   * fallback the get/compare/delete sequence contains no await, so it is
+   * atomic within the event loop. Two concurrent holders of the same
+   * token can no longer both pass — exactly one consumes it.
+   */
+  async deleteIfValue(key: string, expected: string): Promise<boolean> {
+    await maybeRefresh();
+    const client = getRedis();
+    if (client && _isRedisLive) {
+      const rKey = `cache:${key}`;
+      const script = `
+local v = redis.call('GET', KEYS[1])
+if v and v == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return 1
+end
+return 0`;
+      const res = (await client.eval(script, 1, rKey, JSON.stringify(expected))) as number | string;
+      return String(res) === "1";
+    }
+    const e = store.get(key);
+    if (!e) return false;
+    if (e.expiresAt && e.expiresAt < now()) { store.delete(key); return false; }
+    if (e.value !== expected) return false;
+    store.delete(key);
+    return true;
+  },
   async incr(key: string, ttlMs: number): Promise<number> {
     await maybeRefresh();
     const client = getRedis();

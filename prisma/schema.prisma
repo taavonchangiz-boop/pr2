@@ -832,7 +832,7 @@ model BotWorkflowRun {
   event       BotInboundEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
   workflowId  String
   workflow    BotWorkflow     @relation(fields: [workflowId], references: [id], onDelete: Cascade)
-  status      String          @default("pending") // pending|completed|failed
+  status      String          @default("pending") // pending|processing|completed|failed|dead (V6 C-01: claim enters processing; completed immutable; dead terminal at max attempts)
   attempts    Int             @default(0)
   // V4 H-01 — per-workflow execution lease (same duration as the parent
   // event lease, renewed by a live worker): a claimed run cannot be

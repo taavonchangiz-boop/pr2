@@ -368,7 +368,12 @@ describe("V4 — durable inbox: execution contract, lease, backoff, payload, his
     // The truncated payload must never be handed to the processor.
     expect(processCalls).toBe(0);
     const after = await db.botInboundEvent.findUniqueOrThrow({ where: { id: ev.id } });
-    expect(after.status).toBe("failed");
+    // V6 C-04 — a non-replayable payload goes DEAD immediately: it must
+    // not burn the retry budget on input that can never succeed (pre-V6
+    // this was `failed` with a nextRetryAt, so recovery retried it up to
+    // BOT_EVENT_MAX_ATTEMPTS times before converging on dead).
+    expect(after.status).toBe("dead");
+    expect(after.nextRetryAt).toBeNull();
     expect(after.lastError).toContain("بازیابی");
   });
 
@@ -382,9 +387,11 @@ describe("V4 — durable inbox: execution contract, lease, backoff, payload, his
     const row = await db.botInboundEvent.findUniqueOrThrow({ where: { id: ev.id } });
     expect(row.payloadTruncated).toBe(false);
     expect(row.payload).not.toBeNull();
-    // The stored payload is the COMPLETE sanitized representation.
+    // V6 C-04 — the stored payload is the COMPLETE replay envelope: no
+    // per-string sanitize cap (the pre-V6 4096+marker slice corrupted
+    // recovery input), no array slicing, no depth cap.
     const parsed = JSON.parse(row.payload!);
-    expect(parsed.message.text.length).toBe(4096 + "...[truncated]".length); // per-string sanitize cap, not byte truncation
+    expect(parsed.message.text.length).toBe(20000);
     expect(Object.keys(parsed.meta).length).toBe(6);
     expect(row.payload!.endsWith("...[truncated]")).toBe(false);
 
@@ -420,7 +427,9 @@ describe("V4 — durable inbox: execution contract, lease, backoff, payload, his
     });
     expect(processCalls).toBe(0);
     const after = await db.botInboundEvent.findUniqueOrThrow({ where: { id: ev.id } });
-    expect(after.status).toBe("failed");
+    // V6 C-04 — legacy-marker rows are non-replayable: dead immediately.
+    expect(after.status).toBe("dead");
+    expect(after.nextRetryAt).toBeNull();
   });
 
   // ------------------------------------------------------------------

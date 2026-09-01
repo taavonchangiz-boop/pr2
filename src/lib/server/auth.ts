@@ -9,6 +9,7 @@ import {
 } from "@/lib/security/crypto";
 import { rateLimit } from "@/lib/security/cache";
 import { normalizeMobile, isValidIranMobile } from "@/lib/persian";
+import { AuthError } from "@/lib/auth-error";
 import type { User, Prisma } from "@prisma/client";
 
 export const SESSION_COOKIE = "postyar_sid";
@@ -111,14 +112,12 @@ export async function requireRole(roles: string[]): Promise<AuthUser> {
   return u;
 }
 
-export class AuthError extends Error {
-  status: number;
-  constructor(message: string, status: number = 400) {
-    super(message);
-    this.status = status;
-    this.name = "AuthError";
-  }
-}
+// V6 M-01 — AuthError moved to the dependency-free canonical module
+// `@/lib/auth-error` (plans.ts previously had to define a DUPLICATE class
+// because importing this server module from the client-safe plan boundary
+// was forbidden — two classes broke instanceof across that boundary).
+// Re-exported here so every existing import path keeps its identity.
+export { AuthError } from "@/lib/auth-error";
 
 // M-4 — EXPLICIT PROXY TRUST. X-Forwarded-For is attacker-controlled
 // whenever the Node server port is directly reachable (it is only safe

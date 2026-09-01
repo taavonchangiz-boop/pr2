@@ -301,10 +301,17 @@ export async function submitAdForReview(input: {
   if (ad.status !== "pending" && ad.status !== "rejected") {
     throw new AuthError("این تبلیغ قابل ارسال مجدد نیست.", 400);
   }
-  const updated = await db.adCampaign.update({
-    where: { id: input.id },
+  // V6 M-03 — the resubmit is a CAS on the exact status the read saw: an
+  // admin approval/rejection racing this submit can no longer be
+  // overwritten back to `pending` by a lost unconditional update.
+  const cas = await db.adCampaign.updateMany({
+    where: { id: input.id, status: { in: ["pending", "rejected"] } },
     data: { status: "pending", reviewedAt: null, reviewedBy: null, adminNotes: null },
   });
+  if (cas.count !== 1) {
+    throw new AuthError("این تبلیغ قابل ارسال مجدد نیست.", 400);
+  }
+  const updated = await db.adCampaign.findUniqueOrThrow({ where: { id: input.id } });
   await audit({
     userId: input.userId,
     actor: "user",

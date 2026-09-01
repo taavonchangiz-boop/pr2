@@ -46,6 +46,17 @@ can never contact a real payment gateway" holds for the **bank gateway
 channels** (hard dev-gated) but is a **deliberate-operator exception** for
 the Bale bot wallet-invoice path.
 
+### Second documented exception (V6): AI/gold keys entered in the preview UI
+
+The AI provider keys and the gold-price provider key are **DB-token gated**
+the same way: `getSetting` resolves `SystemSetting` rows first, so an
+operator who deliberately pastes a REAL AI/gold API key into the preview
+settings UI can trigger real billable provider calls (these two channels
+are not hard NODE_ENV-gated like SMS/bank/email). The preview env ships
+every such key empty and `POSTYAR_AI_*` env keys are unset by the
+`preview-dev.sh` sandbox, so nothing happens unless the operator takes
+that deliberate action — keep preview keys empty to stay side-effect-free.
+
 ### V5 neutralization guarantees (preview-dev.sh sandbox overrides)
 
 On top of the V4 channel neutralization, the preview script now forces:

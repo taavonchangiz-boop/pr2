@@ -368,10 +368,39 @@ export async function processBaleUpdate(bot: Bot, update: BaleUpdate): Promise<{
     const payload = sp.invoice_payload ?? "";
     const [orderId, secret] = payload.split(":");
     if (!orderId || !secret) {
+      // V6 C-11 — a captured payment that cannot be matched to an order
+      // still leaves a DURABLE audit trace (money was likely taken; the
+      // operator must be able to find it). No raw payload is stored.
+      await audit({
+        actor: "provider",
+        action: "bale_successful_payment_unmatched",
+        targetType: "bale_payment",
+        targetId: sp.telegram_payment_charge_id ?? String(update.update_id ?? ""),
+        meta: sanitizeRaw({
+          reason: "invalid_payload",
+          chargeId: sp.telegram_payment_charge_id ?? null,
+          totalAmount: sp.total_amount ?? null,
+          currency: sp.currency ?? null,
+        }) as Record<string, unknown>,
+      });
       return { handled: false, reason: "invalid_payload_on_success" };
     }
     const ref = await db.balePaymentRef.findUnique({ where: { orderId } });
     if (!ref) {
+      // V6 C-11 — same durable trace for a captured payment with no ref.
+      await audit({
+        actor: "provider",
+        action: "bale_successful_payment_unmatched",
+        targetType: "bale_payment",
+        targetId: sp.telegram_payment_charge_id ?? String(update.update_id ?? ""),
+        meta: sanitizeRaw({
+          reason: "order_not_found",
+          orderIdHint: orderId.slice(0, 64),
+          chargeId: sp.telegram_payment_charge_id ?? null,
+          totalAmount: sp.total_amount ?? null,
+          currency: sp.currency ?? null,
+        }) as Record<string, unknown>,
+      });
       return { handled: false, reason: "order_not_found" };
     }
     // IDEMPOTENCY EARLY-PATH: if chargeId is already set, this is a
@@ -398,10 +427,40 @@ export async function processBaleUpdate(bot: Bot, update: BaleUpdate): Promise<{
     let storedSecret = "";
     try { storedSecret = ref.rawPayload ? decryptString(ref.rawPayload) : ""; } catch { storedSecret = ""; }
     if (!storedSecret || !constantTimeEqual(storedSecret, secret)) {
+      // V6 C-11 — a secret mismatch on a REAL captured payment (e.g. the
+      // invoice was re-keyed between pre_checkout and success) is money in
+      // flight with no matching claim: durable audit, never silent.
+      await audit({
+        actor: "provider",
+        action: "bale_successful_payment_unmatched",
+        targetType: "bale_payment",
+        targetId: sp.telegram_payment_charge_id ?? String(update.update_id ?? ""),
+        meta: sanitizeRaw({
+          reason: "secret_mismatch",
+          orderId,
+          chargeId: sp.telegram_payment_charge_id ?? null,
+          totalAmount: sp.total_amount ?? null,
+          currency: sp.currency ?? null,
+        }) as Record<string, unknown>,
+      });
       return { handled: false, reason: "secret_mismatch_on_success" };
     }
     const order = await db.order.findUnique({ where: { id: orderId } });
-    if (!order) return { handled: false, reason: "order_not_found" };
+    if (!order) {
+      await audit({
+        actor: "provider",
+        action: "bale_successful_payment_unmatched",
+        targetType: "bale_payment",
+        targetId: sp.telegram_payment_charge_id ?? String(update.update_id ?? ""),
+        meta: sanitizeRaw({
+          reason: "order_not_found_after_secret",
+          orderId,
+          chargeId: sp.telegram_payment_charge_id ?? null,
+          totalAmount: sp.total_amount ?? null,
+        }) as Record<string, unknown>,
+      });
+      return { handled: false, reason: "order_not_found" };
+    }
 
     // HARD AMOUNT CHECK
     const totalAmount = typeof sp.total_amount === "number" ? sp.total_amount : -1;
@@ -423,6 +482,20 @@ export async function processBaleUpdate(bot: Bot, update: BaleUpdate): Promise<{
       return { handled: true, reason: "amount_mismatch_on_success" };
     }
     if (sp.currency && sp.currency !== "IRR") {
+      // V6 C-11 — non-IRR success: durable audit before refusing.
+      await audit({
+        actor: "provider",
+        action: "bale_successful_payment_unmatched",
+        targetType: "bale_payment",
+        targetId: sp.telegram_payment_charge_id ?? String(update.update_id ?? ""),
+        meta: sanitizeRaw({
+          reason: "currency_mismatch",
+          orderId,
+          chargeId: sp.telegram_payment_charge_id ?? null,
+          totalAmount: sp.total_amount ?? null,
+          currency: sp.currency ?? null,
+        }) as Record<string, unknown>,
+      });
       return { handled: false, reason: "currency_mismatch_on_success" };
     }
 

@@ -40,12 +40,12 @@ export async function POST(req: Request) {
   if (!isValidIranMobile(mobile)) return NextResponse.json({ errorFa: "موبایل نامعتبر است." }, { status: 400 });
   if (!isValidEmail(email)) return NextResponse.json({ errorFa: "ایمیل نامعتبر است." }, { status: 400 });
 
-  // Verify the OTP token
-  const stored = await cache.get<string>(`verify:register:${mobile}`);
-  if (!stored || stored !== hashToken(verifyToken)) {
+  // V6 C-08 — the OTP token is consumed ATOMICALLY (compare-and-delete):
+  // two concurrent holders of the same token can no longer both register.
+  const consumed = await cache.deleteIfValue(`verify:register:${mobile}`, hashToken(verifyToken));
+  if (!consumed) {
     return NextResponse.json({ errorFa: "توکن تأیید نامعتبر یا منقضی است." }, { status: 403 });
   }
-  await cache.del(`verify:register:${mobile}`);
 
   const dupEmail = await db.user.findUnique({ where: { email: email.toLowerCase() } });
   if (dupEmail) return NextResponse.json({ errorFa: "این ایمیل قبلاً ثبت شده است." }, { status: 409 });

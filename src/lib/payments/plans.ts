@@ -74,14 +74,14 @@ export {
 // MUST NOT import from `@/lib/server/auth` (which pulls next/headers + ioredis)
 // or any other server-only module here. The two helpers below are inlined
 // copies of the ones in lib/server/auth.ts — kept local on purpose.
-export class AuthError extends Error {
-  status: number;
-  constructor(message: string, status: number = 400) {
-    super(message);
-    this.status = status;
-    this.name = "AuthError";
-  }
-}
+// V6 M-01 — AuthError moved to the dependency-free canonical module
+// `@/lib/auth-error`. plans.ts must stay client-safe (no server imports),
+// which is exactly why this module is dependency-free; re-exporting keeps
+// every existing `import { AuthError } from "@/lib/payments/plans"` path
+// working AND makes instanceof work across the plans/server boundary
+// (previously two distinct classes with the same shape broke identity).
+import { AuthError } from "@/lib/auth-error";
+export { AuthError };
 
 export interface PublicPlanView {
   id: string;
@@ -586,6 +586,7 @@ export async function activateSubscription(input: {
       where: { id: order.id, status: { in: PAYABLE_STATUSES } },
       data: { status: "paid" },
     });
+    const firstFinalize = claimed.count === 1;
     if (claimed.count === 0) {
       const fresh = await tx.order.findUnique({
         where: { id: order.id },
@@ -848,25 +849,29 @@ export async function activateSubscription(input: {
     // retry (financial truth also lives in the LedgerEntry UNIQUE keys).
     // NOTE: written via tx.auditLog.create directly — plans.ts is also
     // imported by client components and must NOT import server auth.
-    await tx.auditLog.create({
-      data: {
-        userId: order.userId,
-        actor: "system",
-        action: "subscription_fulfilled",
-        targetType: "order",
-        targetId: order.id,
-        ip: null,
-        meta: JSON.stringify({
-          orderId: order.id,
-          planId: fulfilledPlanId,
-          planCode: fulfilledPlanCode,
-          amountRials: order.amountRials,
-          subscriptionId,
-          endsAt: endsAt.toISOString(),
-          referralRewardRials,
-        }),
-      },
-    });
+    // V6 C-16 — written ONCE per order (the CAS winner): a healing
+    // re-entry must not append a duplicate audit row on every pass.
+    if (firstFinalize) {
+      await tx.auditLog.create({
+        data: {
+          userId: order.userId,
+          actor: "system",
+          action: "subscription_fulfilled",
+          targetType: "order",
+          targetId: order.id,
+          ip: null,
+          meta: JSON.stringify({
+            orderId: order.id,
+            planId: fulfilledPlanId,
+            planCode: fulfilledPlanCode,
+            amountRials: order.amountRials,
+            subscriptionId,
+            endsAt: endsAt.toISOString(),
+            referralRewardRials,
+          }),
+        },
+      });
+    }
 
     return { subscriptionId, endsAt, referralRewardRials };
   });

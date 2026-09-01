@@ -100,7 +100,7 @@ set +a
 # with a real-world side effect. These win over BOTH .env.preview and any
 # production .env, so the preview is side-effect-safe by construction.
 export NODE_ENV=development
-export DATABASE_URL="file:${DB_FILE}"
+export DATABASE_URL="file:${DB_FILE}?socket_timeout=30000&busy_timeout=30000"
 export POSTYAR_SMS_PROVIDER=""
 export POSTYAR_SMS_API_KEY=""
 export POSTYAR_SMS_USERNAME=""

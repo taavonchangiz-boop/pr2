@@ -216,6 +216,13 @@ const TICKET_CATEGORIES: readonly TicketCategory[] = [
   "general", "billing", "technical", "ai", "gold", "woo", "bot", "security",
 ];
 const TICKET_PRIORITIES: readonly TicketPriority[] = ["low", "normal", "high", "urgent"];
+// V6 C-15 — create_notification.category is persisted raw by notify();
+// it must be validated against the NotificationCategory union at SAVE
+// time (the runtime cast at the performAction site is not validation).
+const NOTIFICATION_CATEGORIES: readonly string[] = [
+  "publish", "payment", "subscription", "referral", "ad", "ticket",
+  "gold", "woo", "security", "system",
+];
 const GOLD_INSTRUMENTS: readonly GoldInstrument[] = ["18k", "emami", "bahar_azadi", "ounce"];
 
 async function assertActionEntitlement(
@@ -1329,6 +1336,12 @@ export async function validateWorkflowDef(steps: unknown): Promise<{ ok: boolean
     if (!s || typeof s !== "object") return { ok: false, errorFa: "گام نامعتبر است." };
     const step = s as WorkflowStep;
     if (!step.id || typeof step.id !== "string") return { ok: false, errorFa: "شناسه گام الزامی است." };
+    // V6 C-15 — bound the step id the same way as every other persisted
+    // identifier: 100 steps × unbounded ids would bloat the persisted
+    // JSON and the engine's stepMap.
+    if (step.id.length > 64 || /[\u0000-\u001f\u007f]/.test(step.id)) {
+      return { ok: false, errorFa: "شناسه گام نامعتبر است (حداکثر ۶۴ نویسه، بدون نویسه کنترلی)." };
+    }
     if (ids.has(step.id)) return { ok: false, errorFa: `شناسه گام تکراری: ${step.id}` };
     ids.add(step.id);
     if (!["start", "message", "condition", "action", "end"].includes(step.type)) {
@@ -1524,6 +1537,15 @@ export async function validateWorkflowDef(steps: unknown): Promise<{ ok: boolean
           if (!title) return { ok: false, errorFa: `عنوان اعلان در گام «${step.id}» الزامی است.` };
           if (title.length > 200) {
             return { ok: false, errorFa: `عنوان اعلان در گام «${step.id}» بیش از حد طولانی است.` };
+          }
+          // V6 C-15 — the notification category is persisted raw by
+          // notify(); validate it against the NotificationCategory union
+          // at save time instead of blind-casting at execution time.
+          if (cfg.category !== undefined) {
+            const ncat = String(cfg.category);
+            if (!NOTIFICATION_CATEGORIES.includes(ncat)) {
+              return { ok: false, errorFa: `دسته اعلان در گام «${step.id}» نامعتبر است.` };
+            }
           }
           // M-07: previously unbounded fields.
           const nBody = String(cfg.bodyFa ?? "");

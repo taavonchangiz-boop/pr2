@@ -196,10 +196,15 @@ describe("V5 — dispatchAi (AI dispatch pipeline)", () => {
     expect(res.errorFa).toBe("فراخوانی هوش مصنوعی ناموفق بود. لطفاً دوباره تلاش کنید.");
     expect(res.errorFa).not.toContain("simulated");
 
-    const job = await db.aiJob.findUnique({ where: { idempotencyKey: "k-fail" } });
+    const job = await db.aiJob.findFirst({ where: { idempotencyKey: { startsWith: "k-fail" } } });
     expect(job).not.toBeNull();
     expect(job!.status).toBe("failed");
     expect(job!.failureReason).toContain("simulated provider outage");
+    // V6 C-10 — the failed job is RE-KEYED off the logical key: the logical
+    // key is free again, so a genuine retry can create a fresh job instead
+    // of being permanently poisoned by the dead row.
+    expect(job!.idempotencyKey).not.toBe("k-fail");
+    expect(await db.aiJob.count({ where: { idempotencyKey: "k-fail" } })).toBe(0);
 
     const quota = await getQuotaState(user.id);
     expect(quota.aiPerMonth.used).toBe(1);

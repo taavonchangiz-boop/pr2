@@ -39,11 +39,18 @@ export async function POST(req: Request) {
   // V5 H-12 — uniformity gate: the create_ticket workflow action requires
   // the `tickets` plan feature, but this UI/API boundary did not. Every
   // privileged action boundary must call the capability check (P0.15).
+  // V6 M-01 — AuthError-only response: requirePlanFeature performs DB
+  // reads, so a non-AuthError failure (e.g. a Prisma driver error) must
+  // NEVER be echoed to the client (raw driver text + status undefined →
+  // HTTP 200). Anything else becomes a generic 500.
   try {
     await requirePlanFeature(user.id, "tickets");
   } catch (e) {
-    const err = e as AuthError;
-    return NextResponse.json({ errorFa: err.message }, { status: err.status });
+    if (e instanceof AuthError) {
+      return NextResponse.json({ errorFa: e.message }, { status: e.status });
+    }
+    console.error("tickets plan gate failed:", e instanceof Error ? e.message : e);
+    return NextResponse.json({ errorFa: "خطای داخلی سرور." }, { status: 500 });
   }
   const ip = clientIp(req);
   let body: unknown;

@@ -23,6 +23,27 @@
 //     completion — a failed child keeps the event retryable and
 //     recovery re-runs ONLY the failed child (V4 C-01/C-02).
 //
+// Child-run state machine (V6 C-01) — enforced by the claim itself:
+//
+//     pending ──claim──▶ processing ──ok──▶ completed (IMMUTABLE)
+//        ▲                  │  │
+//        │                  │  └─failure─▶ failed (retryable)
+//        └──retry───────────┘                  │ attempts ≥ max
+//        failed ──claim──▶ processing          ▼
+//                            │               dead (terminal)
+//     processing + EXPIRED lease ──stale takeover──▶ processing
+//
+//   * the atomic claim SETS status="processing" — a run is never
+//     executed while its row still reads pending/failed;
+//   * the claim sets a unique owner (lockedBy fencing token);
+//   * the heartbeat renews ONLY processing rows owned by that token;
+//   * stale takeover requires an EXPIRED lease — a live worker is
+//     never stealable; a zombie worker cannot complete/fail/renew a
+//     run that was taken over (owner-fenced writes);
+//   * completed is immutable (no claim, no completion, no failure can
+//     regress it); failures stay retryable until BOT_RUN_MAX_ATTEMPTS,
+//     then converge on the terminal dead state.
+//
 // Execution-result contract (V4 C-01):
 //   * a run's callback returns { ok: true }  → legitimate (incl. no-op);
 //   * { ok: false, errorFa } or a throw      → genuine failure: the run
@@ -35,7 +56,7 @@
 // correctness stays owned by BalePaymentRef.
 // =====================================================================
 import { db } from "@/lib/db";
-import { sanitizeRaw } from "@/lib/providers/util";
+import { isTokenishKey } from "@/lib/providers/util";
 import type { Bot, BotInboundEvent } from "@prisma/client";
 import { randomUUID } from "node:crypto";
 
@@ -43,6 +64,9 @@ export const BOT_EVENT_LEASE_MS = 5 * 60 * 1000;
 export const BOT_EVENT_MAX_ATTEMPTS = 5;
 export const BOT_EVENT_RECOVER_LIMIT = 3;
 export const BOT_EVENT_RECOVER_MIN_AGE_MS = 60 * 1000;
+
+/** V6 C-01 — a child run retries at most this many times, then dies. */
+export const BOT_RUN_MAX_ATTEMPTS = BOT_EVENT_MAX_ATTEMPTS;
 
 // V4 H-02 — bounded exponential backoff: attempt N waits
 // min(30s * 2^(N-1), 60min) plus up to 30s of jitter.
@@ -106,15 +130,47 @@ export function parseRunCursor(raw: string | null | undefined): WorkflowResumeCo
   }
 }
 
-/** Sanitized, size-capped payload + explicit truncation flag (H-03). */
-function sanitizePayload(raw: unknown): { payload: string | null; truncated: boolean } {
+/**
+ * V6 C-04 — the canonical REPLAY envelope.
+ *
+ * Recovery re-executes the ORIGINAL delivery: the stored payload must be
+ * a COMPLETE, faithful representation of the raw provider update. The
+ * forensic sanitizer (`sanitizeRaw`) is deliberately lossy (4KB string
+ * slicing, 32-element array slicing, depth capping, token-pattern text
+ * masking) — running replay payloads through it made recovery execute
+ * on silently corrupted data (e.g. a 40-photo album lost entries, a
+ * long post text was replayed truncated WITHOUT any marker).
+ *
+ * The replay envelope is therefore raw JSON with exactly ONE lossy
+ * transformation: object keys that are token/secret carriers get their
+ * value redacted (M-02 — no credentials at rest). Real provider update
+ * structures (message/callback_query/successful_payment/…) never use
+ * those key names, so replay fidelity is preserved. Input arrives from
+ * `request.json()` — acyclic and JSON-safe by construction; the size
+ * bound is the ONLY bound, with an explicit truncation flag.
+ */
+function redactTokenishKeysDeep(input: unknown, depth = 0): unknown {
+  if (depth > 64) return "[max depth]";
+  if (input === null || input === undefined) return input;
+  if (typeof input !== "object") return input;
+  if (Array.isArray(input)) return input.map((v) => redactTokenishKeysDeep(v, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    out[k] = isTokenishKey(k) ? "<REDACTED>" : redactTokenishKeysDeep(v, depth + 1);
+  }
+  return out;
+}
+
+/** Complete replay envelope (tokenish keys redacted) + truncation flag. */
+function serializeReplayPayload(raw: unknown): { payload: string | null; truncated: boolean } {
   try {
-    const s = JSON.stringify(sanitizeRaw(raw) ?? null);
+    const s = JSON.stringify(redactTokenishKeysDeep(raw) ?? null);
     if (!s || s === "null") return { payload: null, truncated: false };
     if (s.length > PAYLOAD_MAX_CHARS) {
       // Deliberately NOT valid JSON — combined with the flag and the
       // recovery gate below, a truncated payload can never be replayed
-      // as though it were the original update.
+      // as though it were the original update (V6 C-04: it goes DEAD,
+      // it does not burn retry attempts).
       return { payload: s.slice(0, PAYLOAD_MAX_CHARS), truncated: true };
     }
     return { payload: s, truncated: false };
@@ -125,8 +181,16 @@ function sanitizePayload(raw: unknown): { payload: string | null; truncated: boo
 
 /**
  * Create-or-fetch the durable event row (UNIQUE per bot+provider+event).
- * Safe under concurrency: the UNIQUE constraint collapses races; the
- * loser's upsert degenerates to a no-op refresh of the payload.
+ *
+ * V6 C-03 — the FIRST persisted canonical replay payload for an event
+ * identity is AUTHORITATIVE and IMMUTABLE: a duplicate delivery (same
+ * bot+provider+externalEventId) can never overwrite it, never reset its
+ * truncation state. A duplicate whose payload DIFFERS from the canonical
+ * one is recorded as an anomaly (AuditLog, best-effort) while the
+ * original payload is preserved for recovery. The only permitted
+ * write-back is backfilling a first delivery that stored NO valid
+ * payload at all (null) — done as a CAS on `payload: null` so two
+ * concurrent duplicates can never clobber each other.
  */
 export async function ensureBotEvent(
   bot: Pick<Bot, "id">,
@@ -134,18 +198,60 @@ export async function ensureBotEvent(
   externalEventId: string,
   rawUpdate: unknown,
 ): Promise<BotInboundEvent> {
-  const { payload, truncated } = sanitizePayload(rawUpdate);
-  return db.botInboundEvent.upsert({
-    where: {
-      botId_provider_externalEventId: {
-        botId: bot.id,
-        provider,
-        externalEventId,
+  const { payload, truncated } = serializeReplayPayload(rawUpdate);
+  try {
+    return await db.botInboundEvent.create({
+      data: { botId: bot.id, provider, externalEventId, payload, payloadTruncated: truncated },
+    });
+  } catch (err) {
+    if ((err as { code?: string })?.code !== "P2002") throw err;
+    // Duplicate delivery — converge on the EXISTING row, never mutate it.
+    const existing = await db.botInboundEvent.findUnique({
+      where: {
+        botId_provider_externalEventId: { botId: bot.id, provider, externalEventId },
       },
-    },
-    create: { botId: bot.id, provider, externalEventId, payload, payloadTruncated: truncated },
-    update: payload ? { payload, payloadTruncated: truncated } : {},
-  });
+    });
+    if (!existing) throw err; // unique says it exists — defensive only
+    if (payload && !existing.payload) {
+      // First delivery had no usable payload (storage hiccup): backfill
+      // the canonical payload with a CAS so a racing duplicate can't
+      // double-write; a row that already HAS a payload is never touched.
+      const backfilled = await db.botInboundEvent.updateMany({
+        where: { id: existing.id, payload: null },
+        data: { payload, payloadTruncated: truncated },
+      });
+      if (backfilled.count === 1) {
+        return { ...existing, payload, payloadTruncated: truncated };
+      }
+      return (await db.botInboundEvent.findUnique({ where: { id: existing.id } })) ?? existing;
+    }
+    if (payload && existing.payload !== payload) {
+      // Duplicate with a DIFFERENT payload — anomaly: the original stays
+      // authoritative (recovery keeps replaying the first payload); the
+      // mismatch is recorded for forensics and never replaces it.
+      console.error(
+        "bot inbound duplicate payload anomaly:",
+        JSON.stringify({ eventId: existing.id, botId: bot.id, provider, externalEventId }),
+      );
+      try {
+        await db.auditLog.create({
+          data: {
+            actor: "webhook",
+            action: "bot_inbound_duplicate_payload_anomaly",
+            targetType: "BotInboundEvent",
+            targetId: existing.id,
+            meta: JSON.stringify({ botId: bot.id, provider, externalEventId }),
+          },
+        });
+      } catch (auditErr) {
+        console.error(
+          "duplicate-payload anomaly audit failed:",
+          auditErr instanceof Error ? auditErr.message : auditErr,
+        );
+      }
+    }
+    return existing;
+  }
 }
 
 /**
@@ -271,18 +377,24 @@ function computeNextRetryAt(attempts: number): Date {
  * instance can hot-loop the failure. Transitions to `dead` once
  * attempts reach BOT_EVENT_MAX_ATTEMPTS (bounded retry, observable
  * terminal state).
+ *
+ * V6 C-04 — `opts.terminal` marks a DELIBERATE dead transition for
+ * events that can never be replayed (truncated / missing / unparseable
+ * payload): they go dead immediately instead of burning the retry
+ * budget on a permanently non-replayable input.
  */
 export async function failBotEvent(
   eventId: string,
   errorFa: string,
   holder?: string,
+  opts?: { terminal?: boolean },
 ): Promise<"failed" | "dead"> {
   const ev = await db.botInboundEvent.findUnique({
     where: { id: eventId },
     select: { attempts: true, status: true },
   });
   if (!ev || ev.status !== "processing") return "failed";
-  const dead = ev.attempts >= BOT_EVENT_MAX_ATTEMPTS;
+  const dead = opts?.terminal === true || ev.attempts >= BOT_EVENT_MAX_ATTEMPTS;
   await db.botInboundEvent.updateMany({
     where: {
       id: eventId,
@@ -300,17 +412,118 @@ export async function failBotEvent(
 }
 
 /**
- * Per-workflow execution record. Guarantees (V4 C-01/H-01):
+ * V6 C-01 — atomic claim of a child run. THE state-machine entry point.
+ *
+ * Claimable (attempts < BOT_RUN_MAX_ATTEMPTS):
+ *   * pending   with no lease or an EXPIRED lease;
+ *   * failed    (lease is always cleared on failure) — retry;
+ *   * processing with an EXPIRED lease — stale/crashed takeover.
+ * A live-lease processing run is NEVER stealable; completed/dead are
+ * terminal and never claimable. On success the row is transitioned to
+ * `processing` in the SAME atomic update that sets the owner fencing
+ * token and increments attempts exactly once.
+ *
+ * Returns the owner token, or null when this caller did not win.
+ */
+export async function claimBotWorkflowRunForOwner(runId: string): Promise<string | null> {
+  const now = new Date();
+  const holder = randomUUID();
+  const res = await db.botWorkflowRun.updateMany({
+    where: {
+      id: runId,
+      attempts: { lt: BOT_RUN_MAX_ATTEMPTS },
+      OR: [
+        { status: "pending", OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }] },
+        { status: "failed", OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }] },
+        { status: "processing", leaseUntil: { lt: now } },
+      ],
+    },
+    data: {
+      // V6 C-01 — the claim itself enters `processing`; the row is never
+      // executed while it still reads pending/failed.
+      status: "processing",
+      attempts: { increment: 1 },
+      leaseUntil: new Date(now.getTime() + BOT_EVENT_LEASE_MS),
+      lockedBy: holder,
+      lastError: null,
+    },
+  });
+  return res.count === 1 ? holder : null;
+}
+
+/**
+ * V6 C-01 — heartbeat renewal of a run lease. Renews ONLY a row that is
+ * still `processing` AND still owned by `holder`: a live worker can
+ * never be stolen, and a zombie worker whose run was taken over can no
+ * longer renew the lease it lost. Returns true when the renewal landed.
+ */
+export async function renewBotWorkflowRunLease(runId: string, holder: string): Promise<boolean> {
+  const res = await db.botWorkflowRun.updateMany({
+    where: { id: runId, status: "processing", lockedBy: holder },
+    data: { leaseUntil: new Date(Date.now() + BOT_EVENT_LEASE_MS) },
+  });
+  return res.count === 1;
+}
+
+/**
+ * V6 C-01 — commit `completed`. Allowed ONLY from `processing` AND only
+ * by the current owner: `completed` is immutable (never regressed) and a
+ * zombie worker cannot complete a run taken over by another worker.
+ */
+export async function completeBotWorkflowRun(runId: string, holder: string): Promise<boolean> {
+  const res = await db.botWorkflowRun.updateMany({
+    where: { id: runId, status: "processing", lockedBy: holder },
+    data: { status: "completed", lastError: null, leaseUntil: null },
+  });
+  return res.count === 1;
+}
+
+/**
+ * V6 C-01 — fail a claimed run. Allowed ONLY from `processing` AND only
+ * by the current owner. The run becomes `failed` (retryable) until
+ * attempts reach BOT_RUN_MAX_ATTEMPTS, then converges on the terminal
+ * `dead` state — bounded retries, observable terminal, no infinite
+ * resurrection. The resume cursor (V5 H-04) is persisted atomically.
+ */
+export async function failBotWorkflowRun(
+  runId: string,
+  holder: string,
+  errorFa: string,
+  cursor?: unknown,
+): Promise<"failed" | "dead"> {
+  const row = await db.botWorkflowRun.findUnique({
+    where: { id: runId },
+    select: { attempts: true },
+  });
+  const dead = (row?.attempts ?? BOT_RUN_MAX_ATTEMPTS) >= BOT_RUN_MAX_ATTEMPTS;
+  await db.botWorkflowRun.updateMany({
+    where: { id: runId, status: "processing", lockedBy: holder },
+    data: {
+      status: dead ? "dead" : "failed",
+      lastError: errorFa.slice(0, 500),
+      leaseUntil: null,
+      ...(cursor !== undefined ? { cursorJson: JSON.stringify(cursor) } : {}),
+    },
+  });
+  return dead ? "dead" : "failed";
+}
+
+/**
+ * Per-workflow execution record. Guarantees (V4 C-01/H-01, V6 C-01):
  *   * one run row per (event, workflow) — UNIQUE;
+ *   * the claim transitions the row pending/failed → `processing`
+ *     atomically (owner token + lease + one attempts increment);
  *   * a completed run NEVER executes again and is IMMUTABLE (a late
  *     failure cannot regress it);
  *   * the run carries its own lease: a claimed run whose worker is
  *     alive is renewed by a heartbeat and can never be stolen; a
  *     crashed run's lease expires and the run becomes claimable again
  *     (stale takeover); concurrent workers converge on the CAS;
+ *   * the heartbeat renews ONLY processing rows owned by the token, so
+ *     a zombie worker cannot keep a lost run alive;
  *   * `completed` is committed ONLY when the callback returns
  *     ok:true — an ok:false result or a thrown error keeps the run
- *     `failed` (retryable), never recorded as success;
+ *     retryable (`failed`), never recorded as success;
  *   * the parent event's lease is renewed by the same heartbeat so the
  *     event lease and the child run lease can never contradict.
  */
@@ -327,22 +540,11 @@ export async function runWorkflowOnceForEvent(
   });
   if (run.status === "completed") return { executed: false, ok: true };
 
-  const now = new Date();
-  const runHolder = randomUUID();
-  const claimed = await db.botWorkflowRun.updateMany({
-    where: {
-      id: run.id,
-      status: { in: ["pending", "failed"] },
-      OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }],
-    },
-    data: {
-      attempts: { increment: 1 },
-      leaseUntil: new Date(now.getTime() + BOT_EVENT_LEASE_MS),
-      lockedBy: runHolder,
-      lastError: null,
-    },
-  });
-  if (claimed.count === 0) {
+  // V6 C-01 — the claim IS the state transition: pending/failed →
+  // processing (and processing+expired-lease → processing takeover),
+  // with a fresh owner fencing token, in one atomic CAS.
+  const runHolder = await claimBotWorkflowRunForOwner(run.id);
+  if (runHolder === null) {
     // V5 C-02 (Hole 1) — a contended claim is NOT a legitimate no-op.
     // The run's lease outliving the parent event's lease (mid-sequence
     // crash window, or a partially-failed heartbeat tick) means another
@@ -354,6 +556,22 @@ export async function runWorkflowOnceForEvent(
       select: { status: true },
     });
     if (current?.status === "completed") return { executed: false, ok: true };
+    if (current?.status === "processing") {
+      // V6 C-01 — an abandoned `processing` row past the attempt cap can
+      // never be claimed again; converge it on the terminal dead state
+      // (CAS on expired lease: a worker that JUST took it over no-ops
+      // this cleanup). A dead child keeps the parent event un-completed
+      // and bounded-retryable until the event itself goes dead.
+      await db.botWorkflowRun.updateMany({
+        where: {
+          id: run.id,
+          status: "processing",
+          leaseUntil: { lt: new Date() },
+          attempts: { gte: BOT_RUN_MAX_ATTEMPTS },
+        },
+        data: { status: "dead", leaseUntil: null, lockedBy: null },
+      });
+    }
     return {
       executed: false,
       ok: false,
@@ -368,14 +586,12 @@ export async function runWorkflowOnceForEvent(
   // H-01 heartbeat: keep BOTH this run's lease and the parent event's
   // lease alive while the worker is alive. The timer is always cleared
   // (finally) and failures inside a tick are logged, never unhandled.
-  // V5 C-03 — both renewals are FENCED on their owners so a zombie
-  // worker whose run/event was taken over can no longer renew them.
+  // V6 C-01 — the run renewal is FENCED to `processing` rows owned by
+  // this holder (renewBotWorkflowRunLease); the event renewal is fenced
+  // on its owner so a zombie worker can no longer renew either lease.
   const heartbeat = setInterval(() => {
     Promise.all([
-      db.botWorkflowRun.updateMany({
-        where: { id: run.id, status: "pending", lockedBy: runHolder },
-        data: { leaseUntil: new Date(Date.now() + BOT_EVENT_LEASE_MS) },
-      }),
+      renewBotWorkflowRunLease(run.id, runHolder),
       opts?.eventHolder
         ? renewBotEventLease(eventId, opts.eventHolder)
         : Promise.resolve(),
@@ -391,26 +607,15 @@ export async function runWorkflowOnceForEvent(
   try {
     const outcome = await execute(resume);
     if (outcome && outcome.ok === true) {
-      await db.botWorkflowRun.updateMany({
-        where: { id: run.id, status: { not: "completed" }, lockedBy: runHolder },
-        data: { status: "completed", lastError: null, leaseUntil: null },
-      });
+      // V6 C-01 — completed is committed ONLY from processing, only by
+      // the owner; a zombie (taken-over) worker cannot complete it.
+      await completeBotWorkflowRun(run.id, runHolder);
       return { executed: true, ok: true };
     }
     // C-01: an explicit ok:false is a GENUINE failure — the run stays
-    // retryable and is never recorded as completed.
+    // retryable (or dies at the attempt cap) and is never completed.
     const errorFa = (outcome && outcome.errorFa ? outcome.errorFa : "اجرای گردش کار ناموفق بود.").slice(0, 500);
-    await db.botWorkflowRun.updateMany({
-      where: { id: run.id, status: { not: "completed" }, lockedBy: runHolder },
-      data: {
-        status: "failed",
-        lastError: errorFa,
-        leaseUntil: null,
-        ...(outcome?.cursor
-          ? { cursorJson: JSON.stringify(outcome.cursor) }
-          : {}),
-      },
-    });
+    await failBotWorkflowRun(run.id, runHolder, errorFa, outcome?.cursor);
     return { executed: true, ok: false };
   } catch (err) {
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : "unknown error";
@@ -418,15 +623,7 @@ export async function runWorkflowOnceForEvent(
     // error; persist it so the retry resumes from the interrupted step
     // instead of re-sending every already-delivered step.
     const carried = (err as { workflowCursor?: unknown } | null)?.workflowCursor;
-    await db.botWorkflowRun.updateMany({
-      where: { id: run.id, status: { not: "completed" }, lockedBy: runHolder },
-      data: {
-        status: "failed",
-        lastError: msg.slice(0, 500),
-        leaseUntil: null,
-        ...(carried ? { cursorJson: JSON.stringify(carried) } : {}),
-      },
-    });
+    await failBotWorkflowRun(run.id, runHolder, msg, carried);
     return { executed: true, ok: false };
   } finally {
     clearInterval(heartbeat);
@@ -510,26 +707,35 @@ export async function recoverBotEvents(
   for (const ev of events) {
     const holder = await claimBotEventForOwner(ev.id);
     if (!holder) continue;
-    // V4 H-03 — a deliberately truncated payload is NEVER replayed as
-    // though it were the original update. Both the explicit flag and
-    // the legacy byte-slice marker gate here; the event fails with a
-    // clear diagnostic instead of executing on corrupt input.
+    // V4 H-03 / V6 C-04 — a payload that can NEVER be replayed
+    // (truncated, missing, unparseable) goes DEAD immediately: a
+    // non-replayable event must not burn its retry budget (or any
+    // recovery pass) on input that can never succeed.
     if (
       ev.payloadTruncated ||
       (ev.payload != null && ev.payload.endsWith(LEGACY_TRUNCATION_MARKER))
     ) {
-      await failBotEvent(ev.id, "payload رویداد بیش از حد مجاز بزرگ است و برای بازیابی امن قابل استفاده نیست.");
+      await failBotEvent(
+        ev.id,
+        "payload رویداد بیش از حد مجاز بزرگ است و برای بازیابی امن قابل استفاده نیست.",
+        holder,
+        { terminal: true },
+      );
       continue;
     }
     if (!ev.payload) {
-      await failBotEvent(ev.id, "رویداد بدون payload قابل بازیابی است.");
+      await failBotEvent(ev.id, "رویداد بدون payload قابل بازیابی است.", holder, {
+        terminal: true,
+      });
       continue;
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(ev.payload);
     } catch {
-      await failBotEvent(ev.id, "payload رویداد قابل تجزیه نیست.");
+      await failBotEvent(ev.id, "payload رویداد قابل تجزیه نیست.", holder, {
+        terminal: true,
+      });
       continue;
     }
     try {

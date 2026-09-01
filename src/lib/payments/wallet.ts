@@ -176,7 +176,14 @@ export async function adminAdjustWallet(input: {
   const ledgerIdemKey = `ledger:admin_adjust:${scopedKey}`;
   const walletIdemKey = `wallet:admin_adjust:${scopedKey}`;
 
-  const result = await db.$transaction(async (tx) => {
+  // V6 C-16 — a CONCURRENT identical adjustment racing the in-tx
+  // findUnique can still land first (SQLite WAL: the second tx's INSERT
+  // hits the UNIQUE key). Surface it as the idempotent no-op it truly is
+  // (the winner already moved the money) instead of a raw P2002/500 —
+  // mirroring the refund() convergence below.
+  let result: { balanceAfter: number };
+  try {
+    result = await db.$transaction(async (tx) => {
     // Serialize concurrent wallet mutations for this user FIRST — the row
     // write on User takes the DB write lock and (on SQLite/WAL) pins the
     // transaction snapshot AFTER the lock, so the checkpoint read below
@@ -268,6 +275,16 @@ export async function adminAdjustWallet(input: {
 
     return { balanceAfter: actualBalance };
   });
+  } catch (err) {
+    const msg = (err as { code?: string; message?: string })?.message ?? "";
+    if (/unique|UNIQUE|constraint/i.test(msg) || (err as { code?: string })?.code === "P2002") {
+      // Idempotent convergence: the concurrent winner applied this exact
+      // adjustment — report the true balance, move nothing.
+      const actualBalance = await latestBalanceFor(db, input.userId);
+      return { balanceRials: actualBalance };
+    }
+    throw err;
+  }
 
   return { balanceRials: result.balanceAfter };
 }

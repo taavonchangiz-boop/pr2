@@ -344,6 +344,19 @@ const ollamaProvider: AiProvider = {
     if (!baseUrl) return Promise.reject(new Error("ارائه‌دهنده Ollama پیکربندی نشده است."));
     const model = req.model ?? "llama3.2";
     validateModel("ollama", model);
+    // V6 C-20 — the Ollama URL is operator/env-configured; validate the
+    // scheme before it is ever fetched (no file:/data:/ftp: endpoints).
+    // Private/loopback hosts stay ALLOWED here on purpose: Ollama is a
+    // self-hosted local inference server and its URL is env-only (never
+    // user/admin-settable via the settings API).
+    try {
+      const u = new URL(`${baseUrl.replace(/\/$/, "")}/api/chat`);
+      if (u.protocol !== "http:" && u.protocol !== "https:") {
+        return Promise.reject(new Error("آدرس Ollama نامعتبر است (فقط http/https مجاز است)."));
+      }
+    } catch {
+      return Promise.reject(new Error("آدرس Ollama نامعتبر است."));
+    }
     const endpoint = `${baseUrl.replace(/\/$/, "")}/api/chat`;
     return (async () => {
       const controller = new AbortController();
@@ -373,7 +386,18 @@ const ollamaProvider: AiProvider = {
       if (!res.ok) {
         throw new Error(`فراخوانی Ollama ناموفق بود: کد HTTP ${res.status}`);
       }
-      const data = (await res.json()) as { message?: { content?: string }; prompt_eval_count?: number; eval_count?: number };
+      // V6 C-20 — bound the response read (a misconfigured endpoint must
+      // not be able to exhaust memory with an endless body).
+      const text = await res.text();
+      if (text.length > 4 * 1024 * 1024) {
+        throw new Error("پاسخ Ollama بیش از حد مجاز بزرگ است.");
+      }
+      let data: { message?: { content?: string }; prompt_eval_count?: number; eval_count?: number };
+      try {
+        data = JSON.parse(text) as typeof data;
+      } catch {
+        throw new Error("پاسخ Ollama قابل تجزیه نیست.");
+      }
       const content = data.message?.content ?? "";
       if (!content) throw new Error("پاسخ خالی از Ollama دریافت شد.");
       return {

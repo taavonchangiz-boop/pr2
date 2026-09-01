@@ -48,15 +48,16 @@ export async function POST(req: Request) {
     return NextResponse.json({ errorFa: "شماره موبایل نامعتبر است." }, { status: 400 });
   }
 
-  // Consume the reset token — SINGLE-USE, atomic on the shared cache
-  // (delete returns whether THIS caller removed it).
+  // Consume the reset token — V6 C-08: SINGLE-USE is now ATOMIC
+  // (compare-and-delete as one Redis Lua script / event-loop-atomic
+  // memory op): two concurrent holders of the same token can no longer
+  // both pass — exactly one consumes it.
   const { cache } = await import("@/lib/security/cache");
   const tokenKey = `verify:reset:${mobile}`;
-  const storedHash = await cache.get<string>(tokenKey);
-  if (!storedHash || !constantTimeEqualSafe(storedHash, hashToken(verifyToken))) {
+  const consumed = await cache.deleteIfValue(tokenKey, hashToken(verifyToken));
+  if (!consumed) {
     return NextResponse.json({ errorFa: "توکن بازیابی نامعتبر است یا منقضی شده است." }, { status: 400 });
   }
-  await cache.del(tokenKey);
 
   const user = await db.user.findUnique({ where: { mobile } });
   if (!user) {
@@ -92,10 +93,3 @@ export async function POST(req: Request) {
   return NextResponse.json({ ok: true });
 }
 
-/** Constant-time compare that never throws on length mismatch. */
-function constantTimeEqualSafe(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}

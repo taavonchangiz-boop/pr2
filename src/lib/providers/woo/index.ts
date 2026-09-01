@@ -13,7 +13,8 @@ import { db } from "@/lib/db";
 import { encryptString, decryptString } from "@/lib/security/crypto";
 import { assertSafeOutboundUrl, outboundUrlErrorFa } from "@/lib/security/net-guard";
 import { pinnedFetchJson } from "@/lib/security/http";
-import { audit } from "@/lib/server/auth";
+import { audit, AuthError } from "@/lib/server/auth";
+import { requirePlanFeature, requireFeatureCapacity } from "@/lib/payments/plans";
 
 // ---------------------------------------------------------------------
 // Public shapes
@@ -196,6 +197,19 @@ export async function syncProducts(storeId: string, userId: string): Promise<{
   if (!row) return { ok: false, errorFa: "فروشگاه یافت نشد." };
   if (row.userId !== userId) return { ok: false, errorFa: "دسترسی غیرمجاز." };
 
+  // V6 M-03 — execution-time entitlement: the STORE row surviving a
+  // downgrade must not keep minting content. The sync is the operation
+  // that consumes the `woo` feature AND the plan's contentItems capacity,
+  // so both are enforced HERE (service layer — every caller inherits the
+  // gate), not only at store creation. AuthError propagates to the route
+  // (403), mirroring the plan gates on POST /api/content.
+  try {
+    await requirePlanFeature(userId, "woo");
+  } catch (e) {
+    if (e instanceof AuthError) return { ok: false, errorFa: e.message };
+    throw e;
+  }
+
   const consumerKey = decryptString(row.consumerKeyEnc);
   const consumerSecret = decryptString(row.consumerSecretEnc);
   const r = await wooFetch<WooProduct[]>(
@@ -206,6 +220,24 @@ export async function syncProducts(storeId: string, userId: string): Promise<{
   if (!r.ok) return r;
 
   const drafts: ContentDraftFromWoo[] = r.data.map((p) => transformWooProductToContent(p));
+
+  // V6 M-03 — plan capacity: creating `drafts.length` rows must stay
+  // within contentItems (requireFeatureCapacity throws when
+  // `currentCount >= limit`, so pass currentCount + drafts.length - 1 —
+  // the same semantics a loop of single creations would enforce).
+  try {
+    const currentCount = await db.content.count({ where: { ownerId: userId } });
+    await requireFeatureCapacity(
+      userId,
+      "publish",
+      "contentItems",
+      currentCount + Math.max(drafts.length - 1, 0),
+      "محتوای ذخیره‌شده",
+    );
+  } catch (e) {
+    if (e instanceof AuthError) return { ok: false, errorFa: e.message };
+    throw e;
+  }
 
   // Persist as Content drafts owned by the user
   await db.content.createMany({

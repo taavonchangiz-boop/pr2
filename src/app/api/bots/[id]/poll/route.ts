@@ -6,6 +6,13 @@
 //
 // Rate-limited: max 1 call / 10 sec per bot — prevents accidental
 // hot-polling loops.
+//
+// V6 C-20 — the self-dispatch to the inbound handler carries the bot's
+// webhook secret, so the outbound call is hardened: the base URL must be
+// an absolute http(s) URL, plaintext http is allowed ONLY for loopback
+// (dev self-call), redirects are NEVER followed (a 3xx cannot launder
+// the secret header to another host), and every dispatch failure is
+// audited.
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { rateLimit } from "@/lib/security/cache";
@@ -156,14 +163,59 @@ export async function POST(
       // Use POSTYAR_PUBLIC_BASE_URL if set, otherwise fall back to a
       // relative call to the dev server.
       // V4 M-14 — authoritative settings-aware resolver.
-      const base = (await getSetting("POSTYAR_PUBLIC_BASE_URL", "")).trim().replace(/\/$/, "") || "http://localhost:3000";
+      // V6 C-20 — hardened self-dispatch:
+      //   * absolute http(s) URL only;
+      //   * plaintext http ONLY for loopback — a non-loopback dispatch
+      //     MUST be https (the headers carry the webhook secret);
+      //   * redirects are never followed — a 3xx is a failure, so a
+      //     compromised/redirecting base host can never receive the
+      //     secret header via a forwarding hop.
+      const rawBase = (await getSetting("POSTYAR_PUBLIC_BASE_URL", "")).trim().replace(/\/$/, "");
+      const base = rawBase || "http://localhost:3000";
+      let baseUri: URL;
+      try {
+        baseUri = new URL(base);
+      } catch {
+        return NextResponse.json(
+          { ok: false, errorFa: "POSTYAR_PUBLIC_BASE_URL تنظیم‌شده معتبر نیست (باید یک URL کامل http/https باشد)." },
+          { status: 500 },
+        );
+      }
+      if (baseUri.protocol !== "https:" && baseUri.protocol !== "http:") {
+        return NextResponse.json(
+          { ok: false, errorFa: "POSTYAR_PUBLIC_BASE_URL فقط می‌تواند http یا https باشد." },
+          { status: 500 },
+        );
+      }
+      const isLoopback = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(baseUri.hostname);
+      if (baseUri.protocol === "http:" && !isLoopback) {
+        return NextResponse.json(
+          { ok: false, errorFa: "به دلایل امنیتی، آدرس عمومی باید https باشد (http تنها برای localhost مجاز است)." },
+          { status: 500 },
+        );
+      }
       const resp = await fetch(`${base}${webhookPath}`, {
         method: "POST",
         headers,
         body: bodyJson,
+        redirect: "manual",
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
-      if (resp.ok) processed++;
+      if (resp.status >= 300 && resp.status < 400) {
+        // Never chase a redirect: the secret header must not be replayed
+        // to another origin.
+        await audit({
+          userId: user.id,
+          actor: "admin",
+          action: "bot_poll_dispatch_failed",
+          targetType: "bot",
+          targetId: bot.id,
+          ip,
+          meta: { updateId: uid, reason: "redirect_rejected", status: resp.status },
+        });
+      } else if (resp.ok) {
+        processed++;
+      }
     } catch (err) {
       await audit({
         userId: user.id,

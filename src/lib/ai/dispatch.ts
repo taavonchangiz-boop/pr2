@@ -203,6 +203,19 @@ export async function dispatchAi(input: DispatchAiInput): Promise<DispatchAiResu
           where: { id: aiJob.id },
           data: { status: "failed", failureReason: errMsg.slice(0, 1000) },
         });
+        // V6 C-10 — a FAILED provider call must not permanently poison the
+        // logical idempotency key: the UNIQUE key is re-keyed to a
+        // failure-scoped value so a genuine retry of the same logical
+        // operation can create a fresh job. (The idempotency guarantee the
+        // key protects is "one side effect per logical SUCCESS" — a failed
+        // call had no side effect to protect.) The caller still gets its
+        // honest ok:false for THIS attempt.
+        await db.aiJob
+          .update({
+            where: { id: aiJob.id },
+            data: { idempotencyKey: `${input.idempotencyKey}:failed:${aiJob.id}` },
+          })
+          .catch(() => undefined);
         await audit({
           userId: input.userId,
           actor: "system",
@@ -295,6 +308,16 @@ async function persistFailed(
       },
     });
     aiJobId = job.id;
+    // V6 C-10 — validation failures run BEFORE any side effect (no quota,
+    // no provider call), so the failed row must not permanently occupy the
+    // logical idempotency key: re-key it so the caller can retry the same
+    // logical operation (e.g. after an admin configures the provider).
+    await db.aiJob
+      .update({
+        where: { id: job.id },
+        data: { idempotencyKey: `${input.idempotencyKey}:failed:${job.id}` },
+      })
+      .catch(() => undefined);
   } catch {
     // If the AiJob row can't be created (e.g., duplicate idempotencyKey),
     // we still return the error to the caller.

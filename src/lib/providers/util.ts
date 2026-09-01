@@ -20,7 +20,7 @@ import { decryptString } from "@/lib/security/crypto";
 
 const MAX_STR_LEN = 4096;
 
-function isTokenishKey(key: string): boolean {
+export function isTokenishKey(key: string): boolean {
   const k = key.toLowerCase();
   return (
     k === "token" ||
@@ -176,20 +176,45 @@ export async function bumpSettingsEpoch(): Promise<void> {
       return;
     }
   }
-  // Fallback (3 lost CAS races or missing row): upsert a value strictly
-  // greater than the freshly-read stored one, so a bump is never lost —
-  // and never moves the epoch BACKWARD.
+  // Fallback (3 lost CAS races or missing row): V6 C-09 — the fallback is
+  // ITSELF a CAS. The unconditional upsert update-branch could overwrite
+  // a concurrent bump BACKWARD (write racing between the read above and
+  // the write below). Instead: compute a next value from the freshly-read
+  // stored one and CAS on it; count 0 ⇒ someone else bumped concurrently
+  // → their strictly-greater value stands (the bump is NOT lost — theirs
+  // IS a bump). The create branch only fires for the missing-row case.
   const current = await db.systemSetting.findUnique({
     where: { key: SETTINGS_EPOCH_KEY },
     select: { value: true },
   });
-  const fallback = current ? computeNextEpochValue(current.value) : String(Date.now());
-  await db.systemSetting.upsert({
-    where: { key: SETTINGS_EPOCH_KEY },
-    create: { key: SETTINGS_EPOCH_KEY, value: fallback },
-    update: { value: fallback },
+  if (!current) {
+    const created = String(Date.now());
+    await db.systemSetting.upsert({
+      where: { key: SETTINGS_EPOCH_KEY },
+      create: { key: SETTINGS_EPOCH_KEY, value: created },
+      update: {}, // a concurrent first bump won — keep theirs
+    });
+    epochLocal = { value: created, exp: Date.now() + EPOCH_LOCAL_TTL_MS };
+    return;
+  }
+  const fallback = computeNextEpochValue(current.value);
+  const casFallback = await db.systemSetting.updateMany({
+    where: { key: SETTINGS_EPOCH_KEY, value: current.value },
+    data: { value: fallback },
   });
-  epochLocal = { value: fallback, exp: Date.now() + EPOCH_LOCAL_TTL_MS };
+  if (casFallback.count === 1) {
+    epochLocal = { value: fallback, exp: Date.now() + EPOCH_LOCAL_TTL_MS };
+  } else {
+    // A concurrent bump won the fallback race: converge on the winner by
+    // re-reading (never write backward, never lose the bump).
+    const winner = await db.systemSetting.findUnique({
+      where: { key: SETTINGS_EPOCH_KEY },
+      select: { value: true },
+    });
+    if (winner) {
+      epochLocal = { value: winner.value, exp: Date.now() + EPOCH_LOCAL_TTL_MS };
+    }
+  }
 }
 
 /**
