@@ -288,7 +288,7 @@ export async function claimBotEventForOwner(eventId: string): Promise<string | n
           attempts: { lt: BOT_EVENT_MAX_ATTEMPTS },
           OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: now } }],
         },
-        { status: "processing", leaseUntil: { lt: now } },
+        { status: "processing", attempts: { lt: BOT_EVENT_MAX_ATTEMPTS }, leaseUntil: { lt: now } },
       ],
     },
     data: {
