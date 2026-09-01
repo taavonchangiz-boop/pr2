@@ -592,7 +592,13 @@ export async function runWorkflowOnceForEvent(
 
   // V5 H-04 — load the durable per-step resume cursor from the previous
   // attempt (if any) so the engine resumes instead of re-sending.
-  const resume = parseRunCursor(run.cursorJson);
+  const freshRun = await db.botWorkflowRun.findUnique({ where: { id: run.id }, select: { cursorJson: true, status: true, lockedBy: true, workflowVersion: true } });
+  if (!freshRun || freshRun.status !== "processing" || freshRun.lockedBy !== runHolder) return { executed: false, ok: false, contended: true };
+  if (freshRun.workflowVersion && freshRun.workflowVersion !== workflowVersion) {
+    await failBotWorkflowRun(run.id, runHolder, "نسخه گردش کار در میانه اجرا تغییر کرده است.");
+    return { executed: false, ok: false };
+  }
+  const resume = parseRunCursor(freshRun.cursorJson);
 
   // H-01 heartbeat: keep BOTH this run's lease and the parent event's
   // lease alive while the worker is alive. The timer is always cleared
