@@ -107,14 +107,26 @@ export async function POST(req: Request) {
   }
 
   // Idempotency at the handler level (atomic claim — audit W2).
+  //
+  // P0.11 ROOT-CAUSE FIX — the volatile INCR claim is AT-MOST-ONCE: if the
+  // process crashed after claiming a `successful_payment` but before
+  // processBaleUpdate persisted the charge, the provider's retry was
+  // dropped as a "duplicate" and a REAL payment was lost forever. Payment-
+  // bearing updates therefore BYPASS the volatile claim entirely:
+  // processBaleUpdate is durably idempotent (BalePaymentRef.chargeId CAS +
+  // activateSubscription healing upserts) and safe to run on every
+  // delivery. Non-payment updates keep the volatile claim (chat UX only).
   const updateId = update.update_id;
-  const firstDelivery = await claimUpdateOnce(bot.id, bot.provider, String(updateId));
-  if (!firstDelivery) {
-    return NextResponse.json({ ok: true, duplicate: true });
+  const isPaymentUpdate = !!(update.pre_checkout_query || update.message?.successful_payment);
+  if (!isPaymentUpdate) {
+    const firstDelivery = await claimUpdateOnce(bot.id, bot.provider, String(updateId));
+    if (!firstDelivery) {
+      return NextResponse.json({ ok: true, duplicate: true });
+    }
   }
 
   // Payment branch — delegate to processBaleUpdate.
-  if (update.pre_checkout_query || update.message?.successful_payment) {
+  if (isPaymentUpdate) {
     try {
       await processBaleUpdate(bot, update);
     } catch (err) {

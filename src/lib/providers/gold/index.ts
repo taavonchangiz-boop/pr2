@@ -11,6 +11,8 @@
 // =====================================================================
 import { db } from "@/lib/db";
 import { cache } from "@/lib/security/cache";
+import { assertSafeOutboundUrl } from "@/lib/security/net-guard";
+import { fetchJsonWithLimit } from "@/lib/security/http";
 
 export type GoldInstrument = "18k" | "emami" | "bahar_azadi" | "ounce";
 
@@ -59,43 +61,12 @@ export async function getGoldPrice(instrument: GoldInstrument): Promise<GoldPric
     };
   }
 
-  let resp: Response;
+  // P0.14 — the provider URL is admin/environment-configured; it still goes
+  // through the egress guard (https-only, public IPs, safe ports) and a
+  // bounded response read so neither an internal address nor an oversized
+  // body can be abused.
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8_000);
-    resp = await fetch(url, {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-  } catch {
-    const stale = await getLastKnown(instrument);
-    const result: GoldPriceResult = {
-      ok: false,
-      instrument,
-      priceRials: null,
-      stalePriceRials: stale,
-      errorFa: "ارتباط با ارائه‌دهنده داده طلا برقرار نشد.",
-    };
-    return result;
-  }
-
-  if (!resp.ok) {
-    const stale = await getLastKnown(instrument);
-    const result: GoldPriceResult = {
-      ok: false,
-      instrument,
-      priceRials: null,
-      stalePriceRials: stale,
-      errorFa: `ارائه‌دهنده داده طلا کد ${resp.status} بازگرداند.`,
-    };
-    return result;
-  }
-
-  let payload: unknown;
-  try {
-    payload = await resp.json();
+    await assertSafeOutboundUrl(url, { allowedPorts: [443] });
   } catch {
     const stale = await getLastKnown(instrument);
     return {
@@ -103,9 +74,26 @@ export async function getGoldPrice(instrument: GoldInstrument): Promise<GoldPric
       instrument,
       priceRials: null,
       stalePriceRials: stale,
-      errorFa: "پاسخ ارائه‌دهنده داده طلا قابل تجزیه نیست.",
+      errorFa: "نشانی ارائه‌دهنده داده طلا مجاز نیست.",
     };
   }
+
+  const parsed = await fetchJsonWithLimit<unknown>(url, {
+    method: "GET",
+    timeoutMs: 8_000,
+    maxBytes: 512 * 1024,
+  });
+  if (!parsed.ok) {
+    const stale = await getLastKnown(instrument);
+    return {
+      ok: false,
+      instrument,
+      priceRials: null,
+      stalePriceRials: stale,
+      errorFa: "ارتباط با ارائه‌دهنده داده طلا برقرار نشد.",
+    };
+  }
+  const payload: unknown = parsed.data;
 
   // Expect: { data: { "18k": 12345678, emami: ..., ounce: ... } } OR flat
   // { "18k": rials, ... } OR { items: [{ instrument, priceRials }] }.

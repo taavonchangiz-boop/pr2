@@ -32,6 +32,7 @@ import {
 import { rateLimit } from "@/lib/security/cache";
 import { audit, AuthError } from "@/lib/server/auth";
 import crypto from "node:crypto";
+import type { Prisma } from "@prisma/client";
 
 const LINK_CODE_TTL_MS = 10 * 60 * 1000; // 10 min
 const LINK_CODE_NONCE_LEN = 6; // 6 base32 chars
@@ -43,7 +44,8 @@ const CONSUME_RATE_WINDOW_MS = 10 * 60 * 1000;
 // ---------------------------------------------------------------------
 const CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
-function base32Encode(bytes: Buffer, len: number): string {
+/** Crockford base32 encoder (exported for security regression tests). */
+export function base32Encode(bytes: Buffer, len: number): string {
   // Build a bit-string from the bytes, then chunk into 5-bit groups.
   let bits = "";
   for (const b of bytes) bits += b.toString(2).padStart(8, "0");
@@ -68,7 +70,8 @@ function randomBase32(len: number): string {
 // ---------------------------------------------------------------------
 // Format: POSTYAR-<6 base32 nonce><8 base32 hmac suffix>
 // Total length: 8 + 6 + 8 = 22 chars.
-const PREFIX = "POSTYAR-";
+export const LINK_CODE_PREFIX = "POSTYAR-";
+const PREFIX = LINK_CODE_PREFIX;
 const NONCE_LEN = 6;
 const HMAC_SUFFIX_LEN = 8;
 
@@ -242,35 +245,120 @@ export async function consumeLinkCode(input: {
     return { ok: false, errorFa: "کد نامعتبر است." };
   }
 
-  // $transaction: mark consumed
-  try {
-    const updated = await db.$transaction(async (tx) => {
-      const r = await tx.botLinkCode.updateMany({
-        where: { id: row.id, consumedAt: null },
-        data: {
-          consumedAt: now,
-          consumedByProviderUserId: input.providerUserId,
-        },
-      });
-      if (r.count === 0) return null; // already consumed by parallel call
-      return row;
-    });
-    if (!updated) {
-      return { ok: false, errorFa: "این کد قبلاً استفاده شده است." };
-    }
+  // P1.3 — identity binding rule: ONE provider identity belongs to at most
+  // ONE POSTYAR account per bot. The UNIQUE `bindingKey` ("<botId>:<providerUserId>")
+  // is set atomically at consume time; a provider identity already bound to a
+  // DIFFERENT account cannot silently relink (that would be a silent account
+  // takeover of the provider identity's workspace access). Re-binding the SAME
+  // account (e.g. the user re-issued a code) stays allowed.
+  const bindingKey = `${input.botId}:${input.providerUserId}`;
+  const currentBinding = await db.botLinkCode.findFirst({
+    where: { botId: input.botId, bindingKey, consumedAt: { not: null } },
+    select: { userId: true },
+  });
+  if (currentBinding && currentBinding.userId && currentBinding.userId !== row.userId) {
     await audit({
       userId: row.userId ?? null,
       actor: "webhook",
-      action: "bot_link_code_consumed",
+      action: "bot_link_rebind_blocked",
       targetType: "bot",
-      targetId: row.botId,
-      meta: { linkCodeId: row.id, providerUserId: input.providerUserId },
+      targetId: input.botId,
+      meta: { linkCodeId: row.id, boundToDifferentAccount: true },
     });
-    return { ok: true, userId: row.userId ?? undefined };
-  } catch (err) {
-    const msg = (err as Error)?.message ?? "";
-    return { ok: false, errorFa: `خطا در اتصال: ${msg}` };
+    return {
+      ok: false,
+      errorFa: "این شناسه کاربر در ربات قبلاً به حساب پُست‌یار دیگری متصل شده است. ابتدا اتصال قبلی را با پشتیبانی لغو کنید.",
+    };
   }
+
+  // $transaction: mark consumed. The UNIQUE bindingKey makes the binding
+  // atomic across concurrent consume attempts. When the binding key is
+  // contested, the CURRENT holder decides:
+  //   * holder is the SAME account → legitimate re-bind: hand the binding
+  //     over to the new code inside a fresh transaction (historical rows
+  //     keep their consumedAt but release the key);
+  //   * holder is a DIFFERENT account → blocked + audited (no takeover).
+  const consumeData = {
+    consumedAt: now,
+    consumedByProviderUserId: input.providerUserId,
+    bindingKey,
+  };
+  const claimNewCode = async (tx: Prisma.TransactionClient): Promise<boolean> => {
+    const r = await tx.botLinkCode.updateMany({
+      where: { id: row.id, consumedAt: null },
+      data: consumeData,
+    });
+    return r.count === 1;
+  };
+
+  try {
+    const claimed = await db.$transaction(async (tx) => claimNewCode(tx));
+    if (!claimed) {
+      return { ok: false, errorFa: "این کد قبلاً استفاده شده است." };
+    }
+  } catch (err) {
+    const msg = (err as { code?: string; message?: string })?.message ?? "";
+    if (!/unique|UNIQUE|constraint/i.test(msg)) {
+      return { ok: false, errorFa: `خطا در اتصال: ${msg}` };
+    }
+    // Binding contested — resolve the current holder.
+    const holder = await db.botLinkCode.findFirst({
+      where: { botId: input.botId, bindingKey, consumedAt: { not: null }, id: { not: row.id } },
+      select: { userId: true },
+    });
+    if (!holder || (holder.userId ?? null) !== (row.userId ?? null)) {
+      await audit({
+        userId: row.userId ?? null,
+        actor: "webhook",
+        action: "bot_link_rebind_blocked",
+        targetType: "bot",
+        targetId: input.botId,
+        meta: { linkCodeId: row.id, reason: "binding_held_by_other_account" },
+      });
+      return {
+        ok: false,
+        errorFa: "این شناسه کاربر در ربات قبلاً به حساب پُست‌یار دیگری متصل شده است. ابتدا اتصال قبلی را با پشتیبانی لغو کنید.",
+      };
+    }
+    // Same-account re-bind: atomic handover (release old key, claim new).
+    try {
+      const handed = await db.$transaction(async (tx) => {
+        await tx.botLinkCode.updateMany({
+          where: { botId: input.botId, bindingKey, id: { not: row.id } },
+          data: { bindingKey: null },
+        });
+        return claimNewCode(tx);
+      });
+      if (!handed) {
+        return { ok: false, errorFa: "این کد قبلاً استفاده شده است." };
+      }
+    } catch (err2) {
+      const msg2 = (err2 as { code?: string; message?: string })?.message ?? "";
+      if (/unique|UNIQUE|constraint/i.test(msg2)) {
+        // Lost a concurrent handover race — treat as contested rebind.
+        await audit({
+          userId: row.userId ?? null,
+          actor: "webhook",
+          action: "bot_link_rebind_blocked",
+          targetType: "bot",
+          targetId: input.botId,
+          meta: { linkCodeId: row.id, reason: "binding_race_lost" },
+        });
+        return { ok: false, errorFa: "این شناسه کاربر در ربات هم‌زمان به حساب دیگری متصل شد." };
+      }
+      return { ok: false, errorFa: `خطا در اتصال: ${msg2}` };
+    }
+  }
+
+  await audit({
+    userId: row.userId ?? null,
+    actor: "webhook",
+    action: "bot_link_code_consumed",
+    targetType: "bot",
+    targetId: input.botId,
+    meta: { linkCodeId: row.id, providerUserId: input.providerUserId, rebind: !!currentBinding },
+  });
+  return { ok: true, userId: row.userId ?? undefined };
 }
 
 // ---------------------------------------------------------------------

@@ -104,6 +104,7 @@ export async function POST(req: Request) {
 
   try {
     let order;
+    let created = false;
     if (kind === "subscription") {
       const r = await createOrderForSubscription({
         userId: user.id,
@@ -112,6 +113,7 @@ export async function POST(req: Request) {
         provider,
       });
       order = r.order;
+      created = r.created;
     } else if (kind === "wallet_credit") {
       const r = await createWalletCreditOrder({
         userId: user.id,
@@ -120,6 +122,7 @@ export async function POST(req: Request) {
         provider,
       });
       order = r.order;
+      created = r.created;
     } else {
       // ad_campaign — handled by /api/ads endpoints (price = amount)
       return NextResponse.json(
@@ -130,13 +133,22 @@ export async function POST(req: Request) {
 
     // If a discount code is provided, validate it and APPLY the server-
     // computed discounted amount to the order (audit §12/§16: preview and
-    // final charge must not have separate trusted amounts — previously the
-    // preview showed a lower amount while every provider charged the FULL
-    // stored amount, and discount usage was never recorded anywhere).
-    // Usage is recorded transactionally HERE, tied to the order id, so a
-    // concurrent redemption race can never over-consume maxUses.
+    // final charge must not have separate trusted amounts).
+    //
+    // P1.8 ROOT-CAUSE FIX: the discount path runs ONLY when this request
+    // actually CREATED the order. The previous code ran it on idempotent
+    // replays too — the replay re-applied the discount on the already-
+    // discounted amount, and when the per-user usage row rejected the
+    // second insert, the route DELETED the (possibly already paid!) order
+    // via the stray-order cleanup. Replay of an order-creation request is
+    // now a pure no-op for discounts.
+    //
+    // The discounted amount and the usage row now commit in ONE
+    // transaction (recordUsage accepts the caller's tx), so a crash can
+    // never leave an order charged at the wrong amount relative to the
+    // consumed usage.
     let discountPreview: { amountOff: number; newAmount: number } | null = null;
-    if (discountCode && order.amountRials > 0) {
+    if (discountCode && created && order.amountRials > 0) {
       const v = await validateAndApply({
         code: discountCode,
         userId: user.id,
@@ -144,42 +156,46 @@ export async function POST(req: Request) {
         orderAmount: order.amountRials,
       });
       if (!v.ok) {
-        // Invalid code ⇒ refuse order creation (previously the invalid code
-        // produced 400 AFTER creating a stray pending order).
+        // Invalid code ⇒ refuse order creation (never create a stray
+        // pending order with a bad code).
         return NextResponse.json({ errorFa: v.errorFa }, { status: 400 });
       }
       if (v.ok && v.discountId && v.amountOff !== undefined && v.newAmount !== undefined) {
-        // Record usage first (atomic cap enforcement). If the race is lost
-        // (cap reached concurrently / per-user limit), remove the stray
-        // pending order and refuse.
-        const used = await recordUsage({
-          discountId: v.discountId,
-          userId: user.id,
-          orderId: order.id,
-          ip,
+        const used = await db.$transaction(async (tx) => {
+          const u = await recordUsage({
+            discountId: v.discountId!,
+            userId: user.id,
+            orderId: order.id,
+            ip,
+            tx,
+          });
+          if (!u.ok) return u;
+          const updatedOrder = await tx.order.update({
+            where: { id: order.id },
+            data: {
+              amountRials: v.newAmount!,
+              metadata: JSON.stringify({
+                discountCode: discountCode.trim().toUpperCase(),
+                discountId: v.discountId,
+                amountOffRials: v.amountOff,
+                originalAmountRials: order.amountRials,
+              }),
+            },
+          });
+          order = {
+            id: updatedOrder.id,
+            amountRials: updatedOrder.amountRials,
+            status: updatedOrder.status,
+            descriptionFa: updatedOrder.descriptionFa,
+          };
+          return { ok: true } as const;
         });
         if (!used.ok) {
+          // Race lost (cap reached concurrently / per-user limit / replay)
+          // → remove only the order THIS request created.
           await db.order.delete({ where: { id: order.id } }).catch(() => undefined);
           return NextResponse.json({ errorFa: used.errorFa }, { status: 400 });
         }
-        const updatedOrder = await db.order.update({
-          where: { id: order.id },
-          data: {
-            amountRials: v.newAmount,
-            metadata: JSON.stringify({
-              discountCode: discountCode.trim().toUpperCase(),
-              discountId: v.discountId,
-              amountOffRials: v.amountOff,
-              originalAmountRials: order.amountRials,
-            }),
-          },
-        });
-        order = {
-          id: updatedOrder.id,
-          amountRials: updatedOrder.amountRials,
-          status: updatedOrder.status,
-          descriptionFa: updatedOrder.descriptionFa,
-        };
         discountPreview = { amountOff: v.amountOff, newAmount: v.newAmount };
       }
     }

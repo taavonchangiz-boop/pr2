@@ -16,6 +16,7 @@
 // pick them up.
 // =====================================================================
 import { db } from "@/lib/db";
+import { decryptString } from "@/lib/security/crypto";
 
 const MAX_STR_LEN = 4096;
 
@@ -102,12 +103,32 @@ export async function getSetting(key: string, fallback: string = ""): Promise<st
     try {
       const row = await db.systemSetting.findUnique({ where: { key }, select: { value: true } });
       settingCache.set(key, { value: row?.value ?? null, exp: now + SETTING_TTL_MS });
-      if (row?.value !== undefined) return row.value;
+      if (row?.value !== undefined) return resolveStoredSecret(row.value);
     } catch {
       // DB error → fall back to env silently. Never throw.
     }
   }
   return process.env[key] ?? fallback;
+}
+
+/**
+ * P1.5 — secrets are encrypted at rest. Sensitive SystemSetting values are
+ * written as `v1:aes-256-gcm:...` envelopes by the admin settings route;
+ * this resolver decrypts them transparently. Legacy plaintext values (rows
+ * written before the encryption change) are returned as-is so existing
+ * deployments keep working; re-saving a secret through the admin UI
+ * re-wraps it.
+ */
+export function resolveStoredSecret(value: string): string {
+  if (!value) return value;
+  if (!value.startsWith("v1:aes-256-gcm:")) return value;
+  try {
+    return decryptString(value);
+  } catch {
+    // Wrong master key or corrupt envelope — return empty rather than
+    // leaking ciphertext fragments into provider calls.
+    return "";
+  }
 }
 
 /**

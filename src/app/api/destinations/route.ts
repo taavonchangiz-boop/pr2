@@ -13,6 +13,8 @@ import {
   getDestinationProvider,
   toDestinationView,
 } from "@/lib/destinations/helpers";
+import { getEffectiveFeatures, getFeatureNumber } from "@/lib/payments/plans";
+import { toPersianDigits } from "@/lib/persian";
 
 const CreateSchema = z.object({
   provider: z.string().min(1),
@@ -93,18 +95,27 @@ export async function POST(req: Request) {
     orderBy: { createdAt: "desc" },
     include: { plan: true },
   });
-  let channelsLimit = 1; // free fallback
-  if (activeSub) {
-    const planQuota = safeJsonParse<{ channels?: number }>(activeSub.plan.quota, {});
-    channelsLimit = typeof planQuota.channels === "number" ? planQuota.channels : 0;
-  }
-  if (channelsLimit > 0) {
-    const destCount = await db.destination.count({ where: { ownerId: user.id } });
-    if (destCount >= channelsLimit) {
+  // P0.15 + P0.2 — effective-features channels quota with explicit
+  // disabled/unlimited semantics (the previous inline read of plan.quota
+  // treated 0 as "no cap", i.e. unlimited — free users were uncapped).
+  // limit > 0 → enforce; limit < 0 → unlimited; limit === 0 → disabled.
+  {
+    const features = await getEffectiveFeatures(user.id);
+    const channelsLimit = getFeatureNumber(features, "channels", 1);
+    if (channelsLimit === 0) {
       return NextResponse.json(
-        { errorFa: `سقف کانال‌های پلن شما (${channelsLimit}) تکمیل شده است. برای افزودن کانال جدید پلن را ارتقا دهید.` },
+        { errorFa: "افزودن مقصد در پلن فعلی شما غیرفعال است. برای استفاده پلن را ارتقا دهید." },
         { status: 403 },
       );
+    }
+    if (channelsLimit > 0) {
+      const destCount = await db.destination.count({ where: { ownerId: user.id } });
+      if (destCount >= channelsLimit) {
+        return NextResponse.json(
+          { errorFa: `سقف کانال‌های پلن شما (${toPersianDigits(channelsLimit)}) تکمیل شده است. برای افزودن کانال جدید پلن را ارتقا دهید.` },
+          { status: 403 },
+        );
+      }
     }
   }
 

@@ -14,6 +14,7 @@ import { decryptString } from "@/lib/security/crypto";
 import { rateLimit } from "@/lib/security/cache";
 import { getDestinationProvider, isValidProviderName } from "@/lib/providers";
 import { formatJalaliDateTime } from "@/lib/persian";
+import { requirePlanFeature } from "@/lib/payments/plans";
 
 const BroadcastSchema = z.object({
   message: z.string().min(1, "متن پیام خالی است.").max(4000),
@@ -32,6 +33,13 @@ export async function POST(
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   const ip = clientIp(req);
+  // P0.15 — server-side plan feature gate (UI hiding is not authorization).
+  try {
+    await requirePlanFeature(user.id, "broadcast");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    return NextResponse.json({ errorFa: (e as AuthError).message }, { status });
+  }
   const { id } = await params;
   const bot = await db.bot.findFirst({ where: { id, ownerId: user.id } });
   if (!bot) {

@@ -9,7 +9,7 @@ import {
 } from "@/lib/security/crypto";
 import { rateLimit } from "@/lib/security/cache";
 import { normalizeMobile, isValidIranMobile } from "@/lib/persian";
-import type { User } from "@prisma/client";
+import type { User, Prisma } from "@prisma/client";
 
 export const SESSION_COOKIE = "postyar_sid";
 export const SESSION_TTL_SEC = 60 * 60 * 24 * 7; // 7 days
@@ -289,9 +289,15 @@ export async function audit(opts: {
   targetId?: string;
   ip?: string;
   meta?: Record<string, unknown>;
+  /** Optional transaction client — when supplied, the audit row JOINS the
+   *  caller's transaction (atomic with it). This also avoids the SQLite
+   *  single-connection deadlock that happens when a global-client write is
+   *  issued from inside an open transaction. */
+  tx?: Prisma.TransactionClient;
 }): Promise<void> {
+  const client = opts.tx ?? db;
   try {
-    await db.auditLog.create({
+    await client.auditLog.create({
       data: {
         userId: opts.userId ?? null,
         actor: opts.actor,

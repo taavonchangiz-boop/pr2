@@ -112,7 +112,10 @@ export async function POST(req: Request) {
   }
   const { title, body: text, mediaIds, destinationIds, status } = parsed.data;
 
-  // Resolve destination IDs to ones actually owned by the user — drop the rest.
+  // Resolve destination/media IDs — P1.4 ROOT-CAUSE FIX: an ID that is not
+  // owned by the user is REJECTED with a clear 403 instead of being
+  // silently dropped ("drop the rest" created a different object than the
+  // client requested and hid authorization failures).
   let validDestIds: string[] = [];
   if (destinationIds && destinationIds.length) {
     const uniq = Array.from(new Set(destinationIds));
@@ -120,10 +123,15 @@ export async function POST(req: Request) {
       where: { id: { in: uniq }, ownerId: user.id, status: { not: "deleted" } },
       select: { id: true },
     });
-    validDestIds = owned.map((d) => d.id);
+    if (owned.length !== uniq.length) {
+      return NextResponse.json(
+        { errorFa: "یک یا چند مقصد یافت نشد یا متعلق به شما نیست." },
+        { status: 403 },
+      );
+    }
+    validDestIds = uniq;
   }
 
-  // Resolve media IDs to ones actually owned by the user — drop the rest.
   let validMediaIds: string[] = [];
   if (mediaIds && mediaIds.length) {
     const uniq = Array.from(new Set(mediaIds));
@@ -131,7 +139,13 @@ export async function POST(req: Request) {
       where: { id: { in: uniq }, ownerId: user.id },
       select: { id: true },
     });
-    validMediaIds = owned.map((m) => m.id);
+    if (owned.length !== uniq.length) {
+      return NextResponse.json(
+        { errorFa: "یک یا چند رسانه یافت نشد یا متعلق به شما نیست." },
+        { status: 403 },
+      );
+    }
+    validMediaIds = uniq;
   }
 
   // Status — only allow `draft` at creation. Other transitions must go through

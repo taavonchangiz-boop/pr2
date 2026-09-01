@@ -471,29 +471,38 @@ export async function processBaleUpdate(bot: Bot, update: BaleUpdate): Promise<{
     });
 
     // Notify + audit only on the first finalize (no duplicate spam).
+    // P0.7.7: delivery failures here must never invalidate the committed
+    // financial success.
     if (firstFinalize) {
-      await db.notification.create({
-        data: {
+      try {
+        await db.notification.create({
+          data: {
+            userId: order.userId,
+            category: "payment",
+            titleFa: "پرداخت موفق",
+            bodyFa: `پرداخت ${formatRials(order.amountRials)} از طریق کیف پول بله با کد پیگیری ${toPersianDigits(chargeId.slice(-12))} تأیید شد.`,
+            link: "/dashboard/wallet",
+          },
+        });
+        await audit({
           userId: order.userId,
-          category: "payment",
-          titleFa: "پرداخت موفق",
-          bodyFa: `پرداخت ${formatRials(order.amountRials)} از طریق کیف پول بله با کد پیگیری ${toPersianDigits(chargeId.slice(-12))} تأیید شد.`,
-          link: "/dashboard/wallet",
-        },
-      });
-      await audit({
-        userId: order.userId,
-        actor: "provider",
-        action: "bale_payment_paid",
-        targetType: "order",
-        targetId: order.id,
-        meta: {
-          chargeId,
-          providerChargeId: sp.provider_payment_charge_id,
-          amountRials: order.amountRials,
-          updateId: updateIdStr,
-        },
-      });
+          actor: "provider",
+          action: "bale_payment_paid",
+          targetType: "order",
+          targetId: order.id,
+          meta: {
+            chargeId,
+            providerChargeId: sp.provider_payment_charge_id,
+            amountRials: order.amountRials,
+            updateId: updateIdStr,
+          },
+        });
+      } catch (err) {
+        console.error(
+          "bale finalize notification/audit failed (financial effects already committed):",
+          err instanceof Error ? err.message : err,
+        );
+      }
     }
     return { handled: true, reason: "successful_payment_processed" };
   }

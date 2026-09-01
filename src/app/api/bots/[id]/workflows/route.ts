@@ -11,6 +11,7 @@ import {
   safeJsonParse,
 } from "@/lib/server/auth";
 import { validateWorkflowDef } from "@/lib/bots/workflow";
+import { requirePlanFeature, getEffectiveFeatures, getFeatureNumber } from "@/lib/payments/plans";
 
 const CreateSchema = z.object({
   name: z.string().min(2, "نام گردالشکار حداقل ۲ نویسه باشد.").max(120),
@@ -75,6 +76,21 @@ export async function POST(
       { errorFa: parsed.error.issues[0]?.message ?? "ورودی نامعتبر است." },
       { status: 400 },
     );
+  }
+  // P0.15 — server-side plan gates: `workflow` feature + steps quota.
+  try {
+    await requirePlanFeature(user.id, "workflow");
+    const features = await getEffectiveFeatures(user.id);
+    const stepLimit = getFeatureNumber(features, "workflowSteps", 0);
+    if (stepLimit > 0 && parsed.data.steps.length > stepLimit) {
+      return NextResponse.json(
+        { errorFa: `سقف گام‌های گردش کار در پلن شما (${stepLimit}) کمتر است. طرح را ارتقا دهید.` },
+        { status: 403 },
+      );
+    }
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    return NextResponse.json({ errorFa: (e as AuthError).message }, { status });
   }
   const wfValidation = validateWorkflowDef(parsed.data.steps);
   if (!wfValidation.ok || !wfValidation.def) {

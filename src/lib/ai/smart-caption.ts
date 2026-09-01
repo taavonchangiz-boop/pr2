@@ -5,7 +5,7 @@
 // alternative variations, and Persian hashtags. Output is editable;
 // the frontend writes it back into a Content row.
 // =====================================================================
-import { randomToken } from "@/lib/security/crypto";
+import crypto from "node:crypto";
 import { dispatchAi } from "./dispatch";
 
 export type CaptionTone = "formal" | "friendly" | "casual" | "promotional" | "educational";
@@ -160,7 +160,24 @@ export async function generateCaption(input: {
     systemPrompt: buildSystemPrompt(),
     temperature: 0.8,
     maxTokens: 1200,
-    idempotencyKey: `caption:${input.userId}:${randomToken(8)}:${Buffer.from(opts.topic).toString("hex").slice(0, 16)}`,
+    // P0.4 — deterministic idempotency key over the authoritative input set
+    // (no random entropy; full SHA-256 digest for collision protection).
+    idempotencyKey: `caption:${crypto
+      .createHash("sha256")
+      .update(
+        [
+          input.userId,
+          opts.topic,
+          opts.tone,
+          opts.audience,
+          opts.length,
+          opts.platform,
+          opts.purpose,
+          opts.provider ?? "auto",
+          opts.model ?? "auto",
+        ].join("\u0000"),
+      )
+      .digest("hex")}`,
     meta: { tone: opts.tone, platform: opts.platform, purpose: opts.purpose, length: opts.length },
   });
 

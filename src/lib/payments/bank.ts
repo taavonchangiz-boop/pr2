@@ -28,6 +28,8 @@
 import { db } from "@/lib/db";
 import { audit } from "@/lib/server/auth";
 import { hmacSign, hmacVerify } from "@/lib/security/crypto";
+import { assertSafeOutboundUrl, UnsafeOutboundUrlError } from "@/lib/security/net-guard";
+import { fetchJsonWithLimit } from "@/lib/security/http";
 import { formatRials } from "@/lib/persian";
 import type { PaymentProvider, OrderLike } from "@/lib/payments/engine";
 import { activateSubscription } from "@/lib/payments/plans";
@@ -161,6 +163,9 @@ export async function bankCreatePaymentRequest(input: {
   try {
     const isDirect = input.mode === "direct";
     const url = isDirect ? cfg!.baseUrl : interC!.baseUrl;
+    // P0.14 — outbound policy: even env/admin-configured endpoints go
+    // through the egress guard (https-only, public IPs, safe ports).
+    await assertSafeOutboundUrl(url, { allowedPorts: [443] });
     const body: Record<string, string | number> = isDirect
       ? {
           Amount: input.order.amountRials,
@@ -178,23 +183,24 @@ export async function bankCreatePaymentRequest(input: {
           Timestamp: Math.floor(Date.now() / 1000),
         };
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
-    const r = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(body),
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-    if (!r.ok) {
+    const parsed = await fetchJsonWithLimit<{ authority?: string; Authority?: string; status?: number | string }>(
+      url,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify(body),
+        timeoutMs: 15_000,
+        maxBytes: 512 * 1024,
+      },
+    );
+    if (!parsed.ok) {
       return {
         providerRef: "",
         mode: input.mode,
         errorFa: "درگاه بانکی پاسخ نامعتبری بازگرداند.",
       };
     }
-    const json = (await r.json()) as { authority?: string; Authority?: string; status?: number | string };
+    const json = parsed.data;
     const authority = json.authority ?? json.Authority;
     if (!authority || typeof authority !== "string") {
       return {
@@ -266,9 +272,14 @@ export async function bankVerifyAndFinalize(input: {
   // Re-query verify endpoint with authority
   try {
     const verifyUrl = baseUrl.replace(/\/Token$/, "/Verify");
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000);
-    const r = await fetch(verifyUrl, {
+    // P0.14 — same egress policy for the verify call.
+    await assertSafeOutboundUrl(verifyUrl, { allowedPorts: [443] });
+    const parsed = await fetchJsonWithLimit<{
+      status?: number | string;
+      RefId?: string;
+      TraceNo?: string;
+      Amount?: number;
+    }>(verifyUrl, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({
@@ -276,22 +287,32 @@ export async function bankVerifyAndFinalize(input: {
         MerchantId: merchantId,
         Amount: input.order.amountRials,
       }),
-      signal: controller.signal,
+      timeoutMs: 15_000,
+      maxBytes: 512 * 1024,
     });
-    clearTimeout(timeout);
-    if (!r.ok) {
+    if (!parsed.ok) {
       return { ok: false, errorFa: "پاسخ در gateway نامعتبر است." };
     }
-    const json = (await r.json()) as {
-      status?: number | string;
-      RefId?: string;
-      TraceNo?: string;
-      Amount?: number;
-    };
+    const json = parsed.data;
     // HARD AMOUNT CHECK
     const returnedAmount = typeof json.Amount === "number"
       ? Math.round(json.Amount)
       : input.order.amountRials; // some gateways omit Amount — trust our stored amount + status
+    if (json.Amount === undefined) {
+      // P1.10.5 — a gateway that omits Amount is an explicit provider
+      // limitation, never proof of correctness. The payment still relies on
+      // the gateway's verify status, but the gap is durably audited so the
+      // operator can see that the amount was NOT provider-confirmed.
+      await audit({
+        userId: input.order.userId,
+        actor: "provider",
+        action: "bank_amount_not_provider_verified",
+        targetType: "order",
+        targetId: input.order.id,
+        ip: input.ip,
+        meta: { authority: input.authority, expectedAmount: input.order.amountRials },
+      });
+    }
     if (json.Amount !== undefined && returnedAmount !== input.order.amountRials) {
       await db.order.update({
         where: { id: input.order.id },
@@ -358,26 +379,34 @@ export async function bankVerifyAndFinalize(input: {
     });
 
     // Notify + audit only on the first finalize (no duplicate spam on
-    // repeated gateway callbacks).
+    // repeated gateway callbacks). P0.7.7: delivery failures here must
+    // never invalidate the committed financial success.
     if (firstFinalize) {
-      await db.notification.create({
-        data: {
+      try {
+        await db.notification.create({
+          data: {
+            userId: input.order.userId,
+            category: "payment",
+            titleFa: "پرداخت موفق",
+            bodyFa: `پرداخت ${formatRials(input.order.amountRials)} با کد پیگیری ${traceNo ?? input.authority.slice(0, 8)} تأیید شد.`,
+            link: "/dashboard/wallet",
+          },
+        });
+        await audit({
           userId: input.order.userId,
-          category: "payment",
-          titleFa: "پرداخت موفق",
-          bodyFa: `پرداخت ${formatRials(input.order.amountRials)} با کد پیگیری ${traceNo ?? input.authority.slice(0, 8)} تأیید شد.`,
-          link: "/dashboard/wallet",
-        },
-      });
-      await audit({
-        userId: input.order.userId,
-        actor: "provider",
-        action: "bank_payment_paid",
-        targetType: "order",
-        targetId: input.order.id,
-        ip: input.ip,
-        meta: { amountRials: input.order.amountRials, authority: input.authority, traceNo },
-      });
+          actor: "provider",
+          action: "bank_payment_paid",
+          targetType: "order",
+          targetId: input.order.id,
+          ip: input.ip,
+          meta: { amountRials: input.order.amountRials, authority: input.authority, traceNo },
+        });
+      } catch (err) {
+        console.error(
+          "bank finalize notification/audit failed (financial effects already committed):",
+          err instanceof Error ? err.message : err,
+        );
+      }
     }
     return {
       ok: true,

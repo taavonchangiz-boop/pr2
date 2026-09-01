@@ -74,173 +74,185 @@ export async function dispatchAi(input: DispatchAiInput): Promise<DispatchAiResu
     throw new AuthError("درخواست‌های هوش مصنوعی بیش از حد مجاز در دقیقه است. اندکی بعد تلاش کنید.", 429);
   }
 
-  // 2) Plan quota RESERVATION (audit §18 — atomic check+reserve). The old
-  //    requireQuota-here / incrementQuotaUsage-later pair was a TOCTOU
-  //    window: N parallel requests all passed the check then overwrote
-  //    each other's JSON counters. consumeQuota CAS-loops the check+reserve
-  //    atomically; a failed provider call keeps the reservation (fail-closed
-  //    semantics, documented) — it can never allow quota overrun.
-  const reserved = await consumeQuota({ userId: input.userId, dimension: "aiPerMonth", amount: 1 });
-  if (!reserved) {
-    throw new AuthError("سهمیه هوش مصنوعی ماهانه کافی نیست.", 403);
-  }
+  // 2) ATOMIC idempotency claim FIRST, quota reservation SECOND
+  //    (P0.3 ROOT-CAUSE FIX — authoritative ordering). The previous
+  //    order (reserve → idempotency) let a duplicate request with the
+  //    same key reserve quota AGAIN even though the AI operation was
+  //    never re-executed. Now the idempotency layer guarantees a single
+  //    concurrent execution per logical operation, and the quota
+  //    reservation lives INSIDE that single execution — exactly one
+  //    reservation per logical AI operation, in every interleaving.
+  return idempotency<DispatchAiResult>(
+    `ai:dispatch:${input.userId}:${input.idempotencyKey}`,
+    async () => {
+      // 3) Resolve provider: pick the configured/preferred one, fall back to
+      //    postyar-zai which is always available. Validation happens BEFORE
+      //    the quota reservation so an invalid request never burns quota.
+      const providerId: AiProviderId = pickProvider(input.provider);
+      const provider = getAiProvider(providerId);
+      if (!provider.available) {
+        // Should never happen for postyar-zai, but defensive.
+        return persistFailed(input, providerId, "ارائه‌دهنده هوش مصنوعی پیکربندی نشده است.");
+      }
 
-  // 3) Idempotency at the dispatch layer — if we've seen this key,
-  //    return the cached result.
-  return idempotency<DispatchAiResult>(`ai:dispatch:${input.userId}:${input.idempotencyKey}`, async () => {
-    // 4) Resolve provider: pick the configured/preferred one, fall back to
-    //    postyar-zai which is always available.
-    const providerId: AiProviderId = pickProvider(input.provider);
-    const provider = getAiProvider(providerId);
-    if (!provider.available) {
-      // Should never happen for postyar-zai, but defensive.
-      return persistFailed(input, providerId, "ارائه‌دهنده هوش مصنوعی پیکربندی نشده است.");
-    }
+      // 4) Resolve & validate model
+      let model = input.model ?? null;
+      const validModels = getValidModels(providerId);
+      if (!model) model = validModels[0] ?? null;
+      if (model) {
+        try {
+          validateModel(providerId, model);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : "مدل نامعتبر است.";
+          return persistFailed(input, providerId, msg);
+        }
+      }
 
-    // 5) Resolve & validate model
-    let model = input.model ?? null;
-    const validModels = getValidModels(providerId);
-    if (!model) model = validModels[0] ?? null;
-    if (model) {
+      // 5) Sanitize prompt(s) before storing — don't trust client
+      const cleanPrompt = sanitizePrompt(input.prompt);
+      const cleanSystem = input.systemPrompt ? sanitizePrompt(input.systemPrompt, 2000) : undefined;
+      if (!cleanPrompt) {
+        return persistFailed(input, providerId, "پرامپت خالی است.");
+      }
+
+      // 6) Plan quota RESERVATION — atomic check+reserve (CAS), inside the
+      //    single idempotent execution. A failed provider call keeps the
+      //    reservation (documented fail-closed semantics: it can never
+      //    allow quota overrun).
+      const reserved = await consumeQuota({ userId: input.userId, dimension: "aiPerMonth", amount: 1 });
+      if (!reserved) {
+        throw new AuthError("سهمیه هوش مصنوعی ماهانه کافی نیست.", 403);
+      }
+
+      // 7) Persist queued AiJob. A concurrent duplicate (same
+      //    idempotencyKey) throws P2002 on the UNIQUE key — degrade to the
+      //    duplicate path instead of a raw 500 (audit §13). This DB-level
+      //    unique constraint is the DURABLE dedup layer beneath the
+      //    atomic cache claim.
+      let aiJob;
       try {
-        validateModel(providerId, model);
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : "مدل نامعتبر است.";
-        return persistFailed(input, providerId, msg);
+        aiJob = await db.aiJob.create({
+          data: {
+            userId: input.userId,
+            provider: providerId,
+            model: model ?? "",
+            task: input.task,
+            prompt: cleanPrompt,
+            status: "queued",
+            idempotencyKey: input.idempotencyKey,
+          },
+        });
+      } catch (err) {
+        const msg = (err as { code?: string; message?: string })?.message ?? "";
+        if (/unique|UNIQUE|constraint/i.test(msg)) {
+          const existing = await db.aiJob.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
+          return {
+            ok: existing?.status === "completed",
+            aiJobId: existing?.id ?? "",
+            content: existing?.output ?? "",
+            provider: providerId,
+            model: model ?? "",
+            tokensIn: existing?.tokensIn ?? 0,
+            tokensOut: existing?.tokensOut ?? 0,
+            errorFa: existing ? undefined : "درخواست تکراری است.",
+          };
+        }
+        throw err;
       }
-    }
 
-    // 6) Sanitize prompt(s) before storing — don't trust client
-    const cleanPrompt = sanitizePrompt(input.prompt);
-    const cleanSystem = input.systemPrompt ? sanitizePrompt(input.systemPrompt, 2000) : undefined;
-    if (!cleanPrompt) {
-      return persistFailed(input, providerId, "پرامپت خالی است.");
-    }
-
-    // 7) Persist queued AiJob. A concurrent duplicate (same idempotencyKey)
-    //    throws P2002 on the UNIQUE key — degrade to the duplicate path
-    //    instead of a raw 500 (audit §13).
-    let aiJob;
-    try {
-      aiJob = await db.aiJob.create({
-        data: {
-          userId: input.userId,
-          provider: providerId,
-          model: model ?? "",
-          task: input.task,
-          prompt: cleanPrompt,
-          status: "queued",
-          idempotencyKey: input.idempotencyKey,
-        },
-      });
-    } catch (err) {
-      const msg = (err as { code?: string; message?: string })?.message ?? "";
-      if (/unique|UNIQUE|constraint/i.test(msg)) {
-        const existing = await db.aiJob.findUnique({ where: { idempotencyKey: input.idempotencyKey } });
-        return {
-          ok: existing?.status === "completed",
-          aiJobId: existing?.id ?? "",
-          content: existing?.output ?? "",
-          provider: providerId,
-          model: model ?? "",
-          tokensIn: existing?.tokensIn ?? 0,
-          tokensOut: existing?.tokensOut ?? 0,
-          errorFa: existing ? undefined : "درخواست تکراری است.",
-        };
-      }
-      throw err;
-    }
-
-    // 8) Mark processing
-    await db.aiJob.update({
-      where: { id: aiJob.id },
-      data: { status: "processing" },
-    });
-
-    // 9) Build messages
-    const messages: AiChatMessage[] = [];
-    if (cleanSystem) messages.push({ role: "system", content: cleanSystem });
-    messages.push({ role: "user", content: cleanPrompt });
-
-    // 10) Invoke provider
-    let resp: AiChatResponse;
-    try {
-      resp = await provider.chat({
-        messages,
-        model: model ?? undefined,
-        temperature: input.temperature,
-        maxTokens: input.maxTokens,
-      });
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : "خطای ناشناخته ارائه‌دهنده هوش مصنوعی.";
+      // 8) Mark processing
       await db.aiJob.update({
         where: { id: aiJob.id },
-        data: { status: "failed", failureReason: errMsg.slice(0, 1000) },
+        data: { status: "processing" },
       });
+
+      // 9) Build messages
+      const messages: AiChatMessage[] = [];
+      if (cleanSystem) messages.push({ role: "system", content: cleanSystem });
+      messages.push({ role: "user", content: cleanPrompt });
+
+      // 10) Invoke provider
+      let resp: AiChatResponse;
+      try {
+        resp = await provider.chat({
+          messages,
+          model: model ?? undefined,
+          temperature: input.temperature,
+          maxTokens: input.maxTokens,
+        });
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : "خطای ناشناخته ارائه‌دهنده هوش مصنوعی.";
+        await db.aiJob.update({
+          where: { id: aiJob.id },
+          data: { status: "failed", failureReason: errMsg.slice(0, 1000) },
+        });
+        await audit({
+          userId: input.userId,
+          actor: "system",
+          action: "ai_dispatch_failed",
+          targetType: "ai_job",
+          targetId: aiJob.id,
+          meta: redactAiPayload({ provider: providerId, model, task: input.task, error: errMsg, ...input.meta }),
+        });
+        return {
+          ok: false,
+          aiJobId: aiJob.id,
+          content: "",
+          provider: providerId,
+          model: model ?? "",
+          tokensIn: 0,
+          tokensOut: 0,
+          // Generic client-facing message — the raw provider exception text
+          // may reveal upstream endpoints/config (audit §34). Full detail
+          // stays in the AiJob row + audit meta (server-side).
+          errorFa: "فراخوانی هوش مصنوعی ناموفق بود. لطفاً دوباره تلاش کنید.",
+        };
+      }
+
+      // 11) Persist completed AiJob
+      await db.aiJob.update({
+        where: { id: aiJob.id },
+        data: {
+          status: "completed",
+          output: resp.content.slice(0, 16_000),
+          tokensIn: resp.tokensIn,
+          tokensOut: resp.tokensOut,
+        },
+      });
+
+      // 12) Audit (no provider keys ever logged — only metadata)
       await audit({
         userId: input.userId,
         actor: "system",
-        action: "ai_dispatch_failed",
+        action: "ai_dispatched",
         targetType: "ai_job",
         targetId: aiJob.id,
-        meta: redactAiPayload({ provider: providerId, model, task: input.task, error: errMsg, ...input.meta }),
+        meta: redactAiPayload({
+          provider: providerId,
+          model: resp.model,
+          task: input.task,
+          tokensIn: resp.tokensIn,
+          tokensOut: resp.tokensOut,
+          ...input.meta,
+        }),
       });
+
       return {
-        ok: false,
+        ok: true,
         aiJobId: aiJob.id,
-        content: "",
-        provider: providerId,
-        model: model ?? "",
-        tokensIn: 0,
-        tokensOut: 0,
-        // Generic client-facing message — the raw provider exception text
-        // may reveal upstream endpoints/config (audit §34). Full detail
-        // stays in the AiJob row + audit meta (server-side).
-        errorFa: "فراخوانی هوش مصنوعی ناموفق بود. لطفاً دوباره تلاش کنید.",
-      };
-    }
-
-    // 11) Persist completed AiJob
-    await db.aiJob.update({
-      where: { id: aiJob.id },
-      data: {
-        status: "completed",
-        output: resp.content.slice(0, 16_000),
-        tokensIn: resp.tokensIn,
-        tokensOut: resp.tokensOut,
-      },
-    });
-
-    // 12) Quota was ALREADY reserved atomically at dispatch entry
-    //     (consumeQuota, step 2) — no further increment here (double-count).
-
-    // 13) Audit (no provider keys ever logged — only metadata)
-    await audit({
-      userId: input.userId,
-      actor: "system",
-      action: "ai_dispatched",
-      targetType: "ai_job",
-      targetId: aiJob.id,
-      meta: redactAiPayload({
+        content: resp.content,
         provider: providerId,
         model: resp.model,
-        task: input.task,
         tokensIn: resp.tokensIn,
         tokensOut: resp.tokensOut,
-        ...input.meta,
-      }),
-    });
-
-    return {
-      ok: true,
-      aiJobId: aiJob.id,
-      content: resp.content,
-      provider: providerId,
-      model: resp.model,
-      tokensIn: resp.tokensIn,
-      tokensOut: resp.tokensOut,
-    };
-  }, 24 * 60 * 60 * 1000);
+      };
+    },
+    24 * 60 * 60 * 1000,
+    // Money-adjacent: fail closed in production without live Redis; the
+    // durable AiJob UNIQUE(idempotencyKey) still prevents double side
+    // effects, but the quota reservation must not run concurrently.
+    { critical: true, claimTtlMs: 90_000, waitTimeoutMs: 120_000 },
+  );
 }
 
 // ---------------------------------------------------------------------

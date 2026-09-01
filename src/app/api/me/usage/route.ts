@@ -6,8 +6,14 @@
 // subscription-gated menu (Item 9 of the dashboard redesign integration).
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
-import { requireUser, AuthError, safeJsonParse } from "@/lib/server/auth";
-import { parsePlanFeatures, type PlanFeatures } from "@/lib/payments/plans";
+import { requireUser, AuthError } from "@/lib/server/auth";
+import {
+  getQuotaState,
+  getActiveSubscription,
+  parsePlanFeatures,
+  getEffectiveFeatures,
+  type PlanFeatures,
+} from "@/lib/payments/plans";
 
 export async function GET() {
   let user;
@@ -19,37 +25,34 @@ export async function GET() {
 
   try {
     const now = Date.now();
-    const [sub, destinationsCount] = await Promise.all([
-      db.subscription.findFirst({
-        where: { userId: user.id, status: "active" },
-        include: { plan: true },
-        orderBy: { createdAt: "desc" },
-      }),
+    // P2.2 — single source of truth: the dashboard usage snapshot comes
+    // from the quota engine (publishPerMonth/aiPerMonth CAS counters), NOT
+    // from the legacy best-effort `publishUsed` key that the old schedule
+    // route wrote non-atomically.
+    const [state, sub, destinationsCount] = await Promise.all([
+      getQuotaState(user.id),
+      getActiveSubscription(user.id),
       db.destination.count({ where: { ownerId: user.id, status: { not: "deleted" } } }),
     ]);
+    const planFeatures = await getEffectiveFeatures(user.id);
 
     if (!sub || !sub.plan) {
       return NextResponse.json({
         hasActivePlan: false,
-        planName: null,
+        planName: state.planNameFa ?? null,
         remainingDays: 0,
-        publishUsed: 0,
-        publishQuota: 0,
-        aiUsed: 0,
-        aiQuota: 0,
+        publishUsed: state.publishPerMonth.used,
+        publishQuota: state.publishPerMonth.limit,
+        aiUsed: state.aiPerMonth.used,
+        aiQuota: state.aiPerMonth.limit,
         channelsUsed: destinationsCount,
-        channelsQuota: 0,
+        channelsQuota: state.channels.limit,
         endsAt: null,
-        // No active subscription → no plan features → the dashboard shows
-        // only the always-on "account essentials" nav items + an upgrade
-        // CTA when the user tries to reach a gated feature.
-        planFeatures: {} as PlanFeatures,
-        planCode: null,
+        // Free-plan features still gate the dashboard nav.
+        planFeatures: planFeatures as PlanFeatures,
+        planCode: "free",
       });
     }
-
-    const used = safeJsonParse<{ publishUsed?: number; aiUsed?: number }>(sub.usedQuota, { publishUsed: 0 });
-    const quota = safeJsonParse<{ publishPerMonth?: number; aiPerMonth?: number; channels?: number }>(sub.plan.quota ?? null, {});
 
     const remainingDays = Math.max(0, Math.ceil((sub.endsAt.getTime() - now) / (24 * 60 * 60 * 1000)));
 
@@ -59,19 +62,16 @@ export async function GET() {
       planCode: sub.plan.code,
       intervalMonths: sub.plan.intervalMonths,
       remainingDays,
-      publishUsed: used.publishUsed ?? 0,
-      publishQuota: quota.publishPerMonth ?? 0,
-      aiUsed: used.aiUsed ?? 0,
-      aiQuota: quota.aiPerMonth ?? 0,
+      publishUsed: state.publishPerMonth.used,
+      publishQuota: state.publishPerMonth.limit,
+      aiUsed: state.aiPerMonth.used,
+      aiQuota: state.aiPerMonth.limit,
       channelsUsed: destinationsCount,
-      channelsQuota: quota.channels ?? 0,
+      channelsQuota: state.channels.limit,
       endsAt: sub.endsAt.toISOString(),
-      // The parsed `PlanFeatures` map (booleans + numerics) from
-      // Plan.features. Used by the dashboard to gate nav items + render the
-      // «ارتقای پلن» upgrade card when the user lands on a gated view.
       planFeatures: parsePlanFeatures(sub.plan.features) as PlanFeatures,
     });
-  } catch (e) {
+    } catch (e) {
     console.error("usage failed:", e instanceof Error ? e.message : e);
     return NextResponse.json({ errorFa: "خطا در خواندن مصرف پلن." }, { status: 500 });
   }

@@ -108,7 +108,8 @@ describe("wallet + ledger: financial integrity (DB-backed)", () => {
   });
 
   test("refund after credit succeeds + is idempotent (no double-debit)", async () => {
-    const order = await seedOrder(userId, 50_000);
+    // Hardened invariant: only a PAID order (captured money) is refundable.
+    const order = await seedOrder(userId, 50_000, { status: "paid" });
     await adminAdjustWallet({ userId, amount: 100_000, reason: "topup", idempotencyKey: "top-1", adminId });
     const r1 = await refund({ orderId: order.id, amount: 50_000, idempotencyKey: "ref-idem-1", adminId });
     expect(r1.balanceRials).toBe(50_000); // 100k - 50k

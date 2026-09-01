@@ -205,12 +205,20 @@ describe("quota engine: getQuotaState + requireQuota + incrementQuotaUsage (DB-b
     });
   });
 
-  test("incrementQuotaUsage is no-op when no active subscription (free plan)", async () => {
-    // No subscription created — free plan fallback
+  test("incrementQuotaUsage provisions the free enforcement row (P0.2 fix)", async () => {
+    // P0.2 ROOT-CAUSE FIX: the old behavior (a no-op for users without a
+    // subscription) made the free plan UNLIMITED while the dashboard
+    // advertised finite limits. Usage for a free user is now recorded on a
+    // lazily provisioned free-plan enforcement row.
     await incrementQuotaUsage({ userId, dimension: "aiPerMonth", amount: 1 });
-    // Should not throw, should not create any subscription row
-    const subCount = await db.subscription.count({ where: { userId } });
-    expect(subCount).toBe(0);
+    const { ensurePlansSeeded } = await import("@/lib/payments/plans");
+    await ensurePlansSeeded();
+    const freePlan = await db.plan.findUnique({ where: { code: "free" } });
+    const row = await db.subscription.findUnique({
+      where: { activeKey: `${userId}:${freePlan!.id}` },
+    });
+    expect(row).not.toBeNull();
+    expect(JSON.parse(row!.usedQuota).aiPerMonth).toBe(1);
   });
 
   test("getActiveSubscription returns null when no active sub", async () => {

@@ -1,12 +1,16 @@
 // =====================================================================
-// POSTYAR — Prisma schema for the DB-backed test tier
+// POSTYAR - Prisma schema for the DB-backed test tier
 // ---------------------------------------------------------------------
+// AUTO-GENERATED from prisma/schema.prisma - do not hand-edit.
 // Identical to schema.prisma EXCEPT the datasource URL is read from
-// TEST_DATABASE_URL so we never touch the dev DB (db/custom.db). The
-// @prisma/client shipped with this repo is generated from schema.prisma
-// (which uses DATABASE_URL). At test time tests/preload.ts points BOTH
-// DATABASE_URL and TEST_DATABASE_URL at file:./db/test.db so the
-// generated client uses the test DB without any regeneration step.
+// TEST_DATABASE_URL so we never touch the dev DB. Regenerate with the
+// same string replace whenever schema.prisma changes.
+// =====================================================================
+
+// =====================================================================
+// POSTYAR — Prisma schema (SQLite dev / MariaDB 10 prod-compatible)
+// All money fields are integer minor units (Rial). No floats.
+// All timestamps UTC. UI converts to Jalali.
 // =====================================================================
 
 generator client {
@@ -31,6 +35,7 @@ model User {
   activityType  String   @default("other")   // personal/business/marketer/...
   businessName  String   @default("")
   role          String   @default("user")    // user | support | admin
+  isSuperAdmin  Boolean  @default(false)    // bootstrap admin (first registered user) — locked from mutations
   status        String   @default("active")  // active | suspended
   referralCode  String   @unique
   referredById  String?
@@ -123,6 +128,7 @@ model Content {
   scheduledAt   DateTime?
   publishedAt   DateTime?
   failureReason  String?
+  views          Int      @default(0) // analytics: post views
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -160,6 +166,8 @@ model Destination {
   status        String   @default("active") // active|inactive|error
   lastError     String?
   lastCheckedAt DateTime?
+  views          Int      @default(0) // analytics: channel/profile views
+  clicks         Int      @default(0) // analytics: aggregate button clicks
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -178,6 +186,7 @@ model GlassButton {
   callbackData  String?
   rowOrder      Int      @default(0)
   enabled       Boolean  @default(true)
+  clicks        Int      @default(0) // analytics: per-button click counter
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   @@index([destinationId])
@@ -220,6 +229,19 @@ model Plan {
   priceRials    Int      @default(0)
   intervalMonths Int     @default(1)
   quota         String   @default("{}") // JSON: { publishPerMonth, aiPerMonth, channels, automation, ... }
+  // Granular feature flags (JSON object of feature-key -> boolean/number).
+  // Keys mirror the dashboard sections so admins can enable exactly the
+  // modules a plan grants (e.g. { caption: true, smartReply: true, woo: false, gold: true, ... }).
+  features      String   @default("{}")
+  // Marketing image for the plan card (public webp under /brand or /assets).
+  imageUrl      String?
+  // Optional percentage discount applied at checkout (0..100).
+  discountPct   Int      @default(0)
+  // Early-renewal discount: if the user renews within `renewalDiscountWindowDays`
+  // days before `endsAt`, this percentage is applied. 0 = no renewal discount.
+  renewalDiscountPct        Int  @default(0)
+  renewalDiscountWindowDays Int  @default(0)
+  sortOrder     Int      @default(0)
   active        Boolean  @default(true)
   isPublic      Boolean  @default(true)
   createdAt     DateTime @default(now())
@@ -240,6 +262,13 @@ model Subscription {
   usedQuota     String   @default("{}") // JSON
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+  // DB-level uniqueness for the "one live subscription per (user, plan)"
+  // invariant (P0.9). The key is "<userId>:<planId>" and is set ONLY on the
+  // active/renewable row for that plan; it is NULL on terminal rows. Both
+  // SQLite and MariaDB treat NULLs as distinct in unique indexes, so any
+  // number of historical rows may coexist while at most ONE live row per
+  // (user, plan) can ever exist - concurrent purchases converge on renewal.
+  activeKey     String?  @unique
   @@index([userId])
 }
 
@@ -382,9 +411,16 @@ model DiscountUsage {
   discount      Discount @relation(fields: [discountId], references: [id], onDelete: Cascade)
   userId        String
   user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  orderId       String?
+  orderId       String?  @unique
   createdAt     DateTime @default(now())
-  @@unique([discountId, userId])
+  // NOTE (P1.8): the previous @@unique([discountId, userId]) silently made
+  // "perUserLimit > 1" unreachable (a user could never redeem the same code
+  // twice regardless of the configured limit). Per-user limits are now
+  // enforced transactionally in recordUsage (increment-first row lock,
+  // count check, rollback on rejection). The orderId unique guarantees a
+  // single usage row per (discount, order) so a retried order creation can
+  // never double-consume the cap for the same order.
+  @@index([discountId, userId])
 }
 
 // ---------------------------------------------------------------------
@@ -413,7 +449,10 @@ model AdCampaign {
   descriptionFa String   @default("")
   link          String?
   imagePath     String?  // public webp under /assets/ads/
-  placement     String   @default("site_sidebar") // site_sidebar|landing|...
+  // Placement key references AdPlacement.key (e.g. user_dashboard_top, sticky_bar, landing_hero, ...).
+  // The admin defines every placement via the AdPlacement table; this string ties a campaign to a slot.
+  placement     String   @default("user_dashboard_top")
+  placementRel  AdPlacement? @relation(fields: [placement], references: [key], onDelete: NoAction)
   startAt       DateTime?
   endAt         DateTime?
   priceRials    Int      @default(0)
@@ -426,6 +465,29 @@ model AdCampaign {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   @@index([status])
+  @@index([placement])
+}
+
+// Admin-defined ad placements. The admin can create any number of slots
+// (e.g. "sticky_bar", "user_dashboard_top", "user_dashboard_sidebar",
+// "landing_hero", "plans_page_banner", ...) and assign campaigns to them.
+model AdPlacement {
+  key           String   @id // unique stable key, e.g. "sticky_bar"
+  labelFa       String
+  descriptionFa String   @default("")
+  // kind: "sticky_bar" | "banner_inline" | "sidebar_card" | "fullscreen" | "slider"
+  kind          String   @default("banner_inline")
+  // Recommended image dimensions (pixels) — shown to advertisers before they
+  // upload, so they can produce an image that fits the slot. 0 means "any".
+  recommendedWidth   Int  @default(0)
+  recommendedHeight  Int  @default(0)
+  // Max upload size in bytes (0 = no special limit, fall back to the global 5 MiB).
+  maxFileBytes Int      @default(0)
+  active        Boolean  @default(true)
+  sortOrder     Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  campaigns     AdCampaign[]
 }
 
 // ---------------------------------------------------------------------
@@ -501,14 +563,32 @@ model Ticket {
   user          User     @relation("UserTickets", fields: [userId], references: [id], onDelete: Cascade)
   subject       String
   category      String   @default("general")
+  departmentId  String?
+  department    TicketDepartment? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
   status        String   @default("open") // open|answered|closed
-  priority      String   @default("normal") // low|normal|high
+  priority      String   @default("normal") // low|normal|high|urgent
   assignedToId  String?
   assignedTo    User?    @relation("SupportAssigned", fields: [assignedToId], references: [id])
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   replies       TicketReply[]
   @@index([userId])
+  @@index([departmentId])
+  @@index([status])
+}
+
+// Admin-defined ticket departments (e.g. "فنی", "مالی", "فروش").
+// Admin can CRUD these, set priority ordering, and assign tickets to them.
+model TicketDepartment {
+  id            String   @id @default(cuid())
+  nameFa        String   @unique
+  descriptionFa String   @default("")
+  // Lower number = higher priority in lists.
+  priority      Int      @default(100)
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  tickets       Ticket[]
 }
 
 model TicketReply {
@@ -520,7 +600,22 @@ model TicketReply {
   body          String
   isStaff       Boolean  @default(false)
   createdAt     DateTime @default(now())
+  attachments   TicketAttachment[]
   @@index([ticketId])
+}
+
+// Image / ZIP attachments on ticket replies. Only these two MIME groups
+// are allowed; max sizes enforced in the upload route (image ≤ 5 MiB, zip ≤ 10 MiB).
+model TicketAttachment {
+  id            String   @id @default(cuid())
+  replyId       String
+  reply         TicketReply @relation(fields: [replyId], references: [id], onDelete: Cascade)
+  fileName      String
+  mime          String   // image/* | application/zip
+  sizeBytes     Int
+  storagePath   String   // under /storage/tickets/
+  createdAt     DateTime @default(now())
+  @@index([replyId])
 }
 
 // ---------------------------------------------------------------------
@@ -537,6 +632,48 @@ model Notification {
   readAt        DateTime?
   createdAt     DateTime @default(now())
   @@index([userId])
+}
+
+// Admin-segmented broadcast notifications. One BroadcastNotification row is
+// the template + audience; the actual per-user rows are fanned out into
+// Notification when the admin sends (or lazily via a worker). Audience can
+// be: "all" | "single" | "plan" | "plans" (multi-plan).
+model BroadcastNotification {
+  id            String   @id @default(cuid())
+  category      String
+  titleFa       String
+  bodyFa        String
+  link          String?
+  // "all" | "single" | "plan" | "plans"
+  audienceType  String   @default("all")
+  // JSON. For "single": { userId }. For "plan": { planId }. For "plans": { planIds: [] }.
+  audienceMeta  String   @default("{}")
+  sentById      String?
+  sentAt        DateTime @default(now())
+  recipientCount Int    @default(0)
+  @@index([sentAt])
+}
+
+// ---------------------------------------------------------------------
+// GOLD PRICE CONFIG
+// ---------------------------------------------------------------------
+// Admin-configurable source for gold prices. Either a custom token/JSON
+// endpoint OR one of the built-in free platforms (selectable).
+model GoldPriceConfig {
+  id            String   @id @default(cuid())
+  // "free_talaapi" | "free_tgju" | "free_bonmarket" | "custom_json" | "custom_token"
+  source        String   @default("free_talaapi")
+  // For custom_json: full URL returning JSON. For custom_token: auth bearer.
+  endpoint      String?
+  token         String?  // encrypted at rest by the crypto layer
+  // JSONPath-like selectors to extract each instrument's price from the response.
+  selector18k      String?
+  selectorEmami    String?
+  selectorBahar    String?
+  selectorOunce    String?
+  refreshMinutes   Int      @default(5)
+  active        Boolean  @default(true)
+  updatedAt    DateTime @updatedAt
 }
 
 // ---------------------------------------------------------------------
@@ -587,6 +724,11 @@ model BotLinkCode {
   expiresAt     DateTime
   consumedAt    DateTime?
   consumedByProviderUserId String?
+  // DB-level identity-binding invariant (P1.3): "<botId>:<providerUserId>"
+  // set atomically at consume time, NULL while unconsumed. Guarantees one
+  // provider identity binds to at most ONE link code (one POSTYAR account)
+  // per bot - concurrent consume attempts cannot silently rebind.
+  bindingKey    String?  @unique
   createdAt     DateTime @default(now())
   @@index([botId])
 }

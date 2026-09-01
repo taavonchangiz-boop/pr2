@@ -4,7 +4,7 @@
 // Single endpoint for free-form text generation/editing. Returns a
 // single text blob. The frontend can drop it into a Content body.
 // =====================================================================
-import { randomToken } from "@/lib/security/crypto";
+import crypto from "node:crypto";
 import { dispatchAi } from "./dispatch";
 
 export type SmartTextMode = "generate" | "rewrite" | "shorten" | "expand" | "tone";
@@ -132,6 +132,34 @@ export async function generateText(input: {
   const prompt = buildUserPrompt(input.mode, inp, opts);
   const systemPrompt = buildSystemPrompt(input.mode, opts);
 
+  // P0.4 ROOT-CAUSE FIX — deterministic idempotency key. The previous key
+  // embedded `randomToken(8)`, so logically IDENTICAL requests were never
+  // idempotent: every retry/replay burned a fresh AI quota unit and
+  // produced a new job. The key is now a cryptographic digest (SHA-256,
+  // full width — collision protection) over the authoritative input set:
+  //   userId | mode | normalized input | canonicalized opts | provider | model
+  // Random entropy is never part of a logical idempotency key.
+  const canonicalOpts = JSON.stringify({
+    tone: opts.tone ?? null,
+    topic: opts.topic ? opts.topic.trim() : null,
+    audience: opts.audience ? opts.audience.trim() : null,
+    maxLength: opts.maxLength ?? null,
+  });
+  const digest = crypto
+    .createHash("sha256")
+    .update(
+      [
+        input.userId,
+        input.mode,
+        inp,
+        canonicalOpts,
+        input.provider ?? "auto",
+        input.model ?? "auto",
+      ].join("\u0000"),
+    )
+    .digest("hex");
+  const idempotencyKey = `text:${digest}`;
+
   const result = await dispatchAi({
     userId: input.userId,
     provider: input.provider ?? null,
@@ -141,7 +169,7 @@ export async function generateText(input: {
     systemPrompt,
     temperature: input.mode === "generate" || input.mode === "expand" ? 0.7 : 0.5,
     maxTokens: opts.maxLength ? Math.max(256, Math.min(2048, Math.ceil(opts.maxLength / 4))) : 1024,
-    idempotencyKey: `text:${input.userId}:${input.mode}:${randomToken(8)}:${Buffer.from(inp).toString("hex").slice(0, 16)}`,
+    idempotencyKey,
     meta: { mode: input.mode, tone: opts.tone, audience: opts.audience },
   });
 

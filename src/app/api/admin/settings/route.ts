@@ -26,6 +26,7 @@ import { requireRole, clientIp, audit, AuthError } from "@/lib/server/auth";
 import { db } from "@/lib/db";
 import { formatJalaliDateTime } from "@/lib/persian";
 import { invalidateSettingsCache } from "@/lib/providers/util";
+import { encryptString } from "@/lib/security/crypto";
 
 // ---------------------------------------------------------------------
 // Allow-list — grouped. Each key appears in exactly one group. The
@@ -240,6 +241,19 @@ function isSensitiveKey(key: string): boolean {
   return GROUPS.some((g) => g.keys.some((it) => it.key === key && it.sensitive === true));
 }
 
+/**
+ * P1.5 — sensitive credentials are ENCRYPTED at rest (AES-256-GCM envelope)
+ * so a DB dump/backup never exposes provider secrets in plaintext. General
+ * (non-sensitive) settings remain plaintext. The masked-placeholder guard
+ * (GET masking preserved) prevents writing the mask over a real secret.
+ */
+function prepareStoredValue(key: string, value: string): string {
+  if (!isSensitiveKey(key)) return value;
+  if (!value) return value;
+  if (value.startsWith("v1:aes-256-gcm:")) return value; // already enveloped
+  return encryptString(value);
+}
+
 export async function POST(req: Request) {
   let user;
   try { user = await requireRole(["admin"]); } catch (e) {
@@ -265,10 +279,11 @@ export async function POST(req: Request) {
   if (isSensitiveKey(parsed.data.key) && parsed.data.value === MASK_PLACEHOLDER) {
     return NextResponse.json({ ok: true, unchanged: true });
   }
+  const storedValue = prepareStoredValue(parsed.data.key, parsed.data.value);
   const updated = await db.systemSetting.upsert({
     where: { key: parsed.data.key },
-    create: { key: parsed.data.key, value: parsed.data.value },
-    update: { value: parsed.data.value },
+    create: { key: parsed.data.key, value: storedValue },
+    update: { value: storedValue },
   });
   invalidateSettingsCache(parsed.data.key);
   await audit({
@@ -322,10 +337,11 @@ export async function PATCH(req: Request) {
   // Upsert each row sequentially (Prisma doesn't have batch upsert for a
   // heterogeneous key set; rows are few — ≤64 — so this is fine).
   for (const it of writable) {
+    const storedValue = prepareStoredValue(it.key, it.value);
     await db.systemSetting.upsert({
       where: { key: it.key },
-      create: { key: it.key, value: it.value },
-      update: { value: it.value },
+      create: { key: it.key, value: storedValue },
+      update: { value: storedValue },
     });
     invalidateSettingsCache(it.key);
   }

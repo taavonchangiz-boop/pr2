@@ -249,18 +249,31 @@ export async function refund(input: {
   if (input.amount > order.amountRials) {
     throw new Error("مبلغ بازگشتی بیشتر از مبلغ سفارش است.");
   }
+  // Order must be refundable: only a PAID order has captured money to return.
+  if (order.status !== "paid") {
+    throw new Error("تنها سفارش پرداخت‌شده قابل بازگشت است.");
+  }
 
+  // KIND-AWARE REFUND MODEL (financial-integrity, P0.5):
+  //   * wallet_credit order → the payment created spendable credit, so the
+  //     refund DEBITS the wallet (bounded by the derived balance).
+  //   * subscription order  → the payment never touched the wallet (P0.5
+  //     fix), so the refund is a LEDGER-ONLY accounting event (negative
+  //     entry, one per order) — debiting the wallet here would corrupt the
+  //     spendable balance with money the user never received.
+  const isWalletKind = order.kind === "wallet_credit";
   const walletIdemKey = `wallet:refund:${input.idempotencyKey}`;
   const ledgerIdemKey = `ledger:refund:${input.idempotencyKey}`;
 
   const result = await db.$transaction(async (tx) => {
-    // Idempotent re-entry: an existing row for this exact key means this
-    // refund was already applied — report the true balance, change nothing.
-    const existing = await tx.walletTxn.findUnique({
-      where: { idempotencyKey: walletIdemKey },
+    // Idempotent re-entry: an existing ledger row for this exact key means
+    // this refund was already applied — report the true balance, change
+    // nothing.
+    const existingLedger = await tx.ledgerEntry.findUnique({
+      where: { idempotencyKey: ledgerIdemKey },
       select: { id: true },
     });
-    if (existing) {
+    if (existingLedger) {
       const txns = await tx.walletTxn.findMany({
         where: { userId: order.userId },
         select: { amountRials: true, direction: true },
@@ -270,45 +283,41 @@ export async function refund(input: {
       return { balanceAfter: bal, duplicate: true as const };
     }
 
-    // Create the debit FIRST: the INSERT takes the database write lock,
-    // which serializes this refund against any concurrent refund/credit
-    // for the remainder of the transaction (audit §14/§36 — the old
-    // code ran its balance guard as a check-then-act OUTSIDE the
-    // transaction, so two concurrent refunds could both pass).
-    const prev = await tx.walletTxn.findMany({
-      where: { userId: order.userId },
-      select: { amountRials: true, direction: true },
+    // Invariant: ONE refund per order regardless of kind.
+    const refundCount = await tx.ledgerEntry.count({
+      where: { orderId: order.id, eventType: "refund" },
     });
-    let running = 0;
-    for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
-    const balanceAfter = running - input.amount;
-
-    await tx.walletTxn.create({
-      data: {
-        userId: order.userId,
-        orderId: order.id,
-        amountRials: input.amount,
-        direction: "debit",
-        reason: "refund",
-        balanceAfter,
-        idempotencyKey: walletIdemKey,
-      },
-    });
-
-    // Invariant (audit §14): ONE refund per order. With the write lock
-    // already held, this count is serialized — a second refund for the
-    // same order under a different key rolls back here.
-    const refundCount = await tx.walletTxn.count({
-      where: { orderId: order.id, reason: "refund" },
-    });
-    if (refundCount > 1) {
+    if (refundCount > 0) {
       throw new Error("این سفارش قبلاً یک بازگشت وجه داشته است.");
     }
 
-    // Balance guard INSIDE the transaction: derived balance must never
-    // go negative. Throwing rolls back the debit created above.
-    if (balanceAfter < 0) {
-      throw new Error("موجودی کیف پول برای بازگشت این مبلغ کافی نیست.");
+    let balanceAfter = 0;
+    if (isWalletKind) {
+      const prev = await tx.walletTxn.findMany({
+        where: { userId: order.userId },
+        select: { amountRials: true, direction: true },
+      });
+      let running = 0;
+      for (const t of prev) running += t.direction === "credit" ? t.amountRials : -t.amountRials;
+      balanceAfter = running - input.amount;
+
+      // Balance guard BEFORE the write: derived balance must never go
+      // negative; throwing rolls the whole transaction back.
+      if (balanceAfter < 0) {
+        throw new Error("موجودی کیف پول برای بازگشت این مبلغ کافی نیست.");
+      }
+
+      await tx.walletTxn.create({
+        data: {
+          userId: order.userId,
+          orderId: order.id,
+          amountRials: input.amount,
+          direction: "debit",
+          reason: "refund",
+          balanceAfter,
+          idempotencyKey: walletIdemKey,
+        },
+      });
     }
 
     await tx.ledgerEntry.create({
@@ -325,8 +334,10 @@ export async function refund(input: {
       data: {
         userId: order.userId,
         category: "payment",
-        titleFa: "بازگاشت وجه",
-        bodyFa: `مبلغ ${formatRials(input.amount)} به کیف پول شما بازگشت داده شد.`,
+        titleFa: "بازگشت وجه",
+        bodyFa: isWalletKind
+          ? `مبلغ ${formatRials(input.amount)} به کیف پول شما بازگشت داده شد.`
+          : `بازگشت وجه به مبلغ ${formatRials(input.amount)} ثبت شد.`,
         link: "/dashboard/wallet",
       },
     });
@@ -350,7 +361,7 @@ export async function refund(input: {
       targetType: "order",
       targetId: order.id,
       ip: input.ip,
-      meta: { adminId: input.adminId, amountRials: input.amount, balanceAfter: result.balanceAfter },
+      meta: { adminId: input.adminId, amountRials: input.amount, balanceAfter: result.balanceAfter, kind: order.kind },
     });
   }
   return { balanceRials: result.balanceAfter };

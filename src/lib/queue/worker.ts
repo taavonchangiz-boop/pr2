@@ -139,7 +139,13 @@ export async function runWorkerOnce(batchSize: number = DEFAULT_BATCH): Promise<
 
   for (const job of candidates) {
     const lockKey = `publish-job:${job.id}`;
-    const holder = await acquireLock(lockKey, 60_000);
+    // P1.12: lock TTL must exceed the provider call timeout (+ margin) so a
+    // LIVE worker never loses its lock while still publishing. Provider
+    // fetches time out at ~30s; 5 minutes gives a wide safety margin. The
+    // 10-minute stale DB lease remains the authoritative crash-recovery
+    // bound (and is longer than this TTL, so an active job can never be
+    // reclaimed by the reaper while its lock is alive).
+    const holder = await acquireLock(lockKey, 5 * 60_000);
     if (!holder) continue; // another worker is on it
     try {
       const result = await processJob(job.id, holder);
@@ -167,14 +173,31 @@ async function processJob(
     return { outcome: "retried", errorFa: undefined };
   }
 
-  // Mark as processing under this lock.
-  await db.publishJob.update({
-    where: { id: jobId },
+  // Mark as processing under this lock — CONDITIONALLY on the job still
+  // being `queued` and unleased (P1.12.6: a stale-lease reaper or another
+  // worker may have moved it between our candidate read and now).
+  const claimed = await db.publishJob.updateMany({
+    where: { id: jobId, status: "queued" },
     data: {
       status: "processing",
       lockedBy: holder.slice(0, 64),
       lockedAt: new Date(),
     },
+  });
+  if (claimed.count === 0) {
+    return { outcome: "retried", errorFa: undefined };
+  }
+
+  // Move the Content into `processing` so the terminal delivered/failed
+  // transitions below are reachable. Previously NOTHING performed
+  // queued→processing, so maybeMarkContentDelivered/Failed hit an
+  // invalid-transition guard and content was stuck in `queued` forever.
+  // `scheduled` is promoted as well: the scheduled→queued→processing chain
+  // collapses at claim time (a due scheduled job IS being processed now;
+  // no other code path performs the scheduled→queued promotion).
+  await db.content.updateMany({
+    where: { id: job.contentId, status: { in: ["queued", "scheduled"] } },
+    data: { status: "processing" },
   });
 
   const [content, destination] = await Promise.all([
@@ -182,22 +205,27 @@ async function processJob(
     db.destination.findUnique({ where: { id: job.destinationId } }),
   ]);
   if (!content || !destination) {
-    await db.publishJob.update({
-      where: { id: jobId },
+    await db.publishJob.updateMany({
+      where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
       data: { status: "failed", failureReason: "محتوا یا مقصد یافت نشد." },
     });
     return { outcome: "failed", errorFa: "محتوا یا مقصد یافت نشد." };
   }
   if (destination.status === "deleted") {
-    await db.publishJob.update({
-      where: { id: jobId },
+    const cancelled = await db.publishJob.updateMany({
+      where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
       data: { status: "cancelled", failureReason: "مقصد حذف شده است." },
     });
+    if (cancelled.count > 0) {
+      // Release the content from `processing` — a cancelled terminal job
+      // means this content will never deliver to a live destination set.
+      await maybeMarkContentFailed(content.id, "مقصد حذف شده است.");
+    }
     return { outcome: "failed", errorFa: "مقصد حذف شده است." };
   }
   if (!isValidProviderName(destination.provider)) {
-    await db.publishJob.update({
-      where: { id: jobId },
+    await db.publishJob.updateMany({
+      where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
       data: { status: "failed", failureReason: "پروایدر نامعتبر است." },
     });
     return { outcome: "failed", errorFa: "پروایدر نامعتبر است." };
@@ -205,7 +233,7 @@ async function processJob(
 
   const botToken = await getDestinationToken(destination.id);
   if (!botToken) {
-    await failJob(job, "توکن قابل رمزگشایی نیست.");
+    await failJob(job, "توکن قابل رمزگشایی نیست.", holder);
     return { outcome: "failed", errorFa: "توکن قابل رمزگشایی نیست." };
   }
 
@@ -264,8 +292,11 @@ async function processJob(
       buttons,
     });
     if (r.ok) {
-      await db.publishJob.update({
-        where: { id: jobId },
+      // Conditional on lease ownership (P1.12.6): if the stale-lease reaper
+      // reclaimed this job while our provider call was in flight, our
+      // late result must not clobber the reclaimed state.
+      const delivered = await db.publishJob.updateMany({
+        where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
         data: {
           status: "delivered",
           deliveredAt: new Date(),
@@ -276,6 +307,10 @@ async function processJob(
           failureReason: null,
         },
       });
+      if (delivered.count === 0) {
+        // Lease lost mid-flight — do not touch terminal/reclaimed state.
+        return { outcome: "retried", errorFa: "اجاره پردازش در میانه راه از دست رفت." };
+      }
       await maybeMarkContentDelivered(content.id);
       await db.notification.create({
         data: {
@@ -293,14 +328,14 @@ async function processJob(
     const attempts = job.attempts + 1;
     const exhausted = attempts >= job.maxAttempts;
     if (exhausted || isHardFailure(r.raw)) {
-      await failJob(job, r.errorFa ?? "ارسال ناموفق بود.");
+      await failJob(job, r.errorFa ?? "ارسال ناموفق بود.", holder);
       return { outcome: "failed", errorFa: r.errorFa };
     }
-    // Re-queue with backoff
+    // Re-queue with backoff — conditional on lease ownership (P1.12.6).
     const backoffSec = computeBackoffSec(attempts);
     const nextRun = new Date(Date.now() + backoffSec * 1000);
-    await db.publishJob.update({
-      where: { id: jobId },
+    const requeued = await db.publishJob.updateMany({
+      where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
       data: {
         status: "queued",
         attempts,
@@ -311,18 +346,21 @@ async function processJob(
         resultPayload: sanitizeResultPayload({ raw: r.raw }),
       },
     });
+    if (requeued.count === 0) {
+      return { outcome: "retried", errorFa: "اجاره پردازش در میانه راه از دست رفت." };
+    }
     return { outcome: "retried", errorFa: r.errorFa };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "خطای ناشناخته";
     const attempts = job.attempts + 1;
     if (attempts >= job.maxAttempts) {
-      await failJob(job, msg);
+      await failJob(job, msg, holder);
       return { outcome: "failed", errorFa: msg };
     }
     const backoffSec = computeBackoffSec(attempts);
     const nextRun = new Date(Date.now() + backoffSec * 1000);
-    await db.publishJob.update({
-      where: { id: jobId },
+    const requeued = await db.publishJob.updateMany({
+      where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
       data: {
         status: "queued",
         attempts,
@@ -332,13 +370,25 @@ async function processJob(
         failureReason: msg,
       },
     });
+    if (requeued.count === 0) {
+      return { outcome: "failed", errorFa: msg };
+    }
     return { outcome: "retried", errorFa: msg };
   }
 }
 
-async function failJob(job: { id: string; contentId: string; attempts: number }, reason: string): Promise<void> {
-  await db.publishJob.update({
-    where: { id: job.id },
+async function failJob(
+  job: { id: string; contentId: string; attempts: number },
+  reason: string,
+  holder?: string,
+): Promise<void> {
+  // Conditional on lease ownership when called from a live worker (P1.12.6).
+  const res = await db.publishJob.updateMany({
+    where: {
+      id: job.id,
+      status: "processing",
+      ...(holder ? { lockedBy: holder.slice(0, 64) } : {}),
+    },
     data: {
       status: "failed",
       failureReason: reason.slice(0, 400),
@@ -352,6 +402,7 @@ async function failJob(job: { id: string; contentId: string; attempts: number },
       attempts: job.attempts + 1,
     },
   });
+  if (res.count === 0) return; // lease lost or state moved — leave alone
   // Mark Content.status = failed too, but ONLY if it was previously in
   // a processing/queued state and no other job is still queued/delivered.
   await maybeMarkContentFailed(job.contentId, reason);

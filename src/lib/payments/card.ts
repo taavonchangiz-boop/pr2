@@ -71,6 +71,12 @@ export async function submitCardReceipt(input: {
   if (order.status === "rejected") {
     throw new AuthError("این سفارش رد شده است. سفارش جدید ثبت کنید.", 400);
   }
+  // Restrict receipt submission to genuinely payable states — a
+  // failed/expired/cancelled order must not be resurrected into
+  // awaiting_review.
+  if (order.status !== "pending" && order.status !== "awaiting_payment" && order.status !== "awaiting_review") {
+    throw new AuthError("این سفارش در وضعیت قابل پرداختی نیست.", 400);
+  }
   const media = await db.media.findUnique({ where: { id: input.mediaId } });
   if (!media) throw new AuthError("فایل رسید یافت نشد.", 404);
   if (media.ownerId !== input.userId) throw new AuthError("دسترسی غیرمجاز به فایل.", 403);
@@ -179,8 +185,11 @@ export async function adminApproveCardOrder(input: {
   });
 
   // Notify + audit only on the first approve (no duplicate spam).
+  // P0.7.7: notification/audit delivery must never invalidate the financial
+  // success already committed above — failures are logged, not thrown.
   if (firstApprove) {
-    await db.notification.create({
+    try {
+      await db.notification.create({
       data: {
         userId: order.userId,
         category: "payment",
@@ -194,20 +203,26 @@ export async function adminApproveCardOrder(input: {
       },
     });
 
-    await audit({
-      userId: order.userId,
-      actor: "admin",
-      action: "order_approve",
-      targetType: "order",
-      targetId: order.id,
-      ip: input.ip,
-      meta: {
-        adminId: input.adminId,
-        amountRials: order.amountRials,
-        receiptId: order.cardReceipt.id,
-        subscriptionId: result.subscriptionId,
-      },
-    });
+      await audit({
+        userId: order.userId,
+        actor: "admin",
+        action: "order_approve",
+        targetType: "order",
+        targetId: order.id,
+        ip: input.ip,
+        meta: {
+          adminId: input.adminId,
+          amountRials: order.amountRials,
+          receiptId: order.cardReceipt.id,
+          subscriptionId: result.subscriptionId,
+        },
+      });
+    } catch (err) {
+      console.error(
+        "card approve notification/audit failed (financial effects already committed):",
+        err instanceof Error ? err.message : err,
+      );
+    }
   }
   return {
     ok: true,
@@ -225,39 +240,47 @@ export async function adminRejectCardOrder(input: {
   ip?: string;
   notes?: string;
 }): Promise<{ ok: boolean }> {
-  const order = await db.order.findUnique({
-    where: { id: input.orderId },
-    include: { cardReceipt: true },
-  });
-  if (!order) throw new AuthError("سفارش یافت نشد.", 404);
-  if (order.status === "paid") {
-    throw new AuthError("سفارش قبلاً پرداخت شده و قابل رد نیست.", 400);
-  }
-  if (order.cardReceipt) {
-    await db.cardTransferReceipt.update({
-      where: { id: order.cardReceipt.id },
-      data: {
-        status: "rejected",
-        reviewedBy: input.adminId,
-        reviewedAt: new Date(),
-        adminNotes: input.notes ?? null,
-      },
+  // P1.9 — approve/reject race-safety: the paid-check AND the receipt-state
+  // check are re-validated INSIDE the transaction, so an approve completing
+  // concurrently can never be flipped into a contradictory
+  // (receipt-approved + order-rejected) state.
+  await db.$transaction(async (tx) => {
+    const order = await tx.order.findUnique({
+      where: { id: input.orderId },
+      include: { cardReceipt: true },
     });
-  }
-  // ROOT-CAUSE FIX (audit TOCTOU): the paid-check above is a plain read;
-  // an approve completing between that read and the write below used to
-  // flip a fully-fulfilled order to rejected. The conditional updateMany
-  // re-checks atomically and refuses to touch paid orders.
-  const rejected = await db.order.updateMany({
-    where: { id: order.id, status: { not: "paid" } },
-    data: { status: "rejected" },
+    if (!order) throw new AuthError("سفارش یافت نشد.", 404);
+    if (order.status === "paid") {
+      throw new AuthError("سفارش قبلاً پرداخت شده و قابل رد نیست.", 400);
+    }
+    if (order.cardReceipt && order.cardReceipt.status === "approved") {
+      throw new AuthError("رسید این سفارش تأیید شده و قابل رد نیست.", 400);
+    }
+    const rejected = await tx.order.updateMany({
+      where: { id: order.id, status: { not: "paid" } },
+      data: { status: "rejected" },
+    });
+    if (rejected.count === 0) {
+      throw new AuthError("سفارش قبلاً پرداخت شده و قابل رد نیست.", 400);
+    }
+    if (order.cardReceipt) {
+      await tx.cardTransferReceipt.update({
+        where: { id: order.cardReceipt.id },
+        data: {
+          status: "rejected",
+          reviewedBy: input.adminId,
+          reviewedAt: new Date(),
+          adminNotes: input.notes ?? null,
+        },
+      });
+    }
   });
-  if (rejected.count === 0) {
-    throw new AuthError("سفارش قبلاً پرداخت شده و قابل رد نیست.", 400);
-  }
+
   await db.notification.create({
     data: {
-      userId: order.userId,
+      userId: (
+        await db.order.findUnique({ where: { id: input.orderId }, select: { userId: true } })
+      )?.userId ?? "",
       category: "payment",
       titleFa: "رد رسید پرداخت",
       bodyFa:
@@ -265,13 +288,16 @@ export async function adminRejectCardOrder(input: {
         (input.notes ? ` دلیل: ${input.notes}` : ""),
       link: "/dashboard/orders",
     },
+  }).catch((err: unknown) => {
+    console.error("reject notification failed:", err instanceof Error ? err.message : err);
   });
+
   await audit({
-    userId: order.userId,
+    userId: (await db.order.findUnique({ where: { id: input.orderId }, select: { userId: true } }))?.userId ?? null,
     actor: "admin",
     action: "order_reject",
     targetType: "order",
-    targetId: order.id,
+    targetId: input.orderId,
     ip: input.ip,
     meta: { adminId: input.adminId, notes: input.notes },
   });

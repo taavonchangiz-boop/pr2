@@ -677,25 +677,71 @@ async function performAction(
 // ---------------------------------------------------------------------
 // Parse workflow buttons config into GlassButton[]
 // ---------------------------------------------------------------------
+// P1.2 — hardened URL/callback policy:
+//   * Only https: URLs are accepted (javascript:, data:, vbscript:,
+//     http:, malformed and control-character tricks are rejected).
+//   * callbackData is bounded (64 chars, printable, no whitespace) —
+//     providers cap callback payload size and it must never smuggle
+//     markup.
+//   * Labels are bounded and stripped of control characters.
+// ---------------------------------------------------------------------
+const BUTTON_URL_MAX = 512;
+const BUTTON_LABEL_MAX = 64;
+const BUTTON_CALLBACK_MAX = 64;
+const BUTTON_MAX_COUNT = 20;
+
+function safeButtonUrl(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > BUTTON_URL_MAX) return undefined;
+  if (/[\u0000-\u001f\u007f]/.test(trimmed)) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return undefined;
+  }
+  if (parsed.protocol !== "https:") return undefined;
+  if (parsed.username || parsed.password) return undefined;
+  return parsed.toString();
+}
+
+function safeCallbackData(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > BUTTON_CALLBACK_MAX) return undefined;
+  if (/[\u0000-\u001f\u007f]/.test(trimmed) || /\s/.test(trimmed)) return undefined;
+  return trimmed;
+}
+
+function safeButtonLabel(raw: string, index: number): string {
+  const cleaned = raw.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  return (cleaned || `گزینه ${index + 1}`).slice(0, BUTTON_LABEL_MAX);
+}
+
 function parseButtons(raw: unknown): GlassButton[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const out: GlassButton[] = [];
   let i = 0;
   for (const r of raw) {
+    if (out.length >= BUTTON_MAX_COUNT) break;
     if (!r || typeof r !== "object") continue;
     const o = r as Record<string, unknown>;
     const callbackData =
-      typeof o.callbackData === "string" ? o.callbackData
-      : typeof o.callback_data === "string" ? o.callback_data
+      typeof o.callbackData === "string" ? safeCallbackData(o.callbackData)
+      : typeof o.callback_data === "string" ? safeCallbackData(o.callback_data)
       : undefined;
     const btn: GlassButton = {
       id: String(o.id ?? `btn-${i}`),
-      label: String(o.label ?? o.text ?? `گزینه ${i + 1}`),
-      url: typeof o.url === "string" ? o.url : undefined,
+      label: safeButtonLabel(String(o.label ?? o.text ?? ""), i),
+      url: safeButtonUrl(o.url),
       callbackData: callbackData ?? undefined,
       rowOrder: typeof o.rowOrder === "number" ? o.rowOrder : i,
       enabled: o.enabled !== false,
     };
+    // A button without a safe URL and without callback data is useless and
+    // potentially a provider-protocol violation — drop it.
+    if (!btn.url && !btn.callbackData) continue;
     out.push(btn);
     i++;
   }
@@ -705,8 +751,17 @@ function parseButtons(raw: unknown): GlassButton[] | undefined {
 // ---------------------------------------------------------------------
 // Workflow validation (used by the API routes)
 // ---------------------------------------------------------------------
+// P1.1 — structural validation beyond step IDs/types:
+//   * every nextStepId / thenStepId / elseStepId MUST reference an existing
+//     step (dangling references previously silently truncated the walk);
+//   * the graph must be acyclic (the runtime visited-guard would otherwise
+//     silently truncate execution mid-flow);
+//   * start-node uniqueness;
+//   * per-kind action configuration validation;
+//   * button URLs/callbacks validated with the same policy as parseButtons.
+// ---------------------------------------------------------------------
 export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: string; def?: WorkflowDef } {
-  if (!Array.isArray(steps)) return { ok: false, errorFa: "گام‌های گردالشکار باید آرایه باشند." };
+  if (!Array.isArray(steps)) return { ok: false, errorFa: "گام‌های گردش کار باید آرایه باشند." };
   if (steps.length === 0 || steps.length > 100) return { ok: false, errorFa: "تعداد گام‌ها باید بین ۱ و ۱۰۰ باشد." };
   const ids = new Set<string>();
   for (const s of steps) {
@@ -738,10 +793,130 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
       }
     }
   }
-  if (!steps.some((s) => (s as WorkflowStep).type === "start")) {
+  const startSteps = steps.filter((s) => (s as WorkflowStep).type === "start");
+  if (startSteps.length === 0) {
     return { ok: false, errorFa: "یک گام از نوع start الزامی است." };
   }
+  if (startSteps.length > 1) {
+    return { ok: false, errorFa: "تنها یک گام start مجاز است." };
+  }
+
+  // --- Reference + config validation ---
+  for (const s of steps) {
+    const step = s as WorkflowStep;
+    const refError = (ref: unknown, label: string): string | null => {
+      if (ref === undefined || ref === null) return null;
+      if (typeof ref !== "string" || !ids.has(ref)) {
+        return `ارجاع ${label} در گام «${step.id}» به گامی ناموجود است.`;
+      }
+      return null;
+    };
+    const e1 = refError(step.nextStepId, "nextStepId");
+    if (e1) return { ok: false, errorFa: e1 };
+    if (step.type === "condition" && step.condition) {
+      const e2 = refError(step.condition.thenStepId, "thenStepId");
+      if (e2) return { ok: false, errorFa: e2 };
+      const e3 = refError(step.condition.elseStepId, "elseStepId");
+      if (e3) return { ok: false, errorFa: e3 };
+    }
+    if (step.type === "action" && step.action) {
+      const e4 = refError(step.action.nextStepId, "nextStepId");
+      if (e4) return { ok: false, errorFa: e4 };
+
+      // Per-kind action config validation.
+      const cfg = (step.action.config ?? {}) as Record<string, unknown>;
+      switch (step.action.kind) {
+        case "send_message": {
+          const text = String(cfg.text ?? cfg.message ?? "");
+          if (!text.trim()) return { ok: false, errorFa: `متن پیام در گام «${step.id}» خالی است.` };
+          if (text.length > 4000) return { ok: false, errorFa: `متن پیام در گام «${step.id}» بیش از حد طولانی است.` };
+          const btns = cfg.buttons;
+          if (btns !== undefined && !Array.isArray(btns)) {
+            return { ok: false, errorFa: `دکمه‌های گام «${step.id}» باید آرایه باشند.` };
+          }
+          if (Array.isArray(btns) && !buttonsAreSafe(btns)) {
+            return { ok: false, errorFa: `دکمه‌های گام «${step.id}» نشانی یا داده نامعتبر دارند.` };
+          }
+          break;
+        }
+        case "show_menu": {
+          if (cfg.items !== undefined && !Array.isArray(cfg.items)) {
+            return { ok: false, errorFa: `آیتم‌های منو در گام «${step.id}» باید آرایه باشند.` };
+          }
+          break;
+        }
+        case "initiate_payment": {
+          const planCode = String(cfg.planCode ?? "").trim();
+          if (!planCode) return { ok: false, errorFa: `کد طرح پرداخت در گام «${step.id}» الزامی است.` };
+          break;
+        }
+        case "invoke_ai": {
+          const prompt = String(cfg.prompt ?? "").trim();
+          // prompt may fall back to the incoming message at runtime; only
+          // validate length when a prompt is configured.
+          if (prompt.length > 8000) return { ok: false, errorFa: `پرامپت هوش مصنوعی در گام «${step.id}» بیش از حد طولانی است.` };
+          break;
+        }
+        case "create_notification": {
+          const title = String(cfg.titleFa ?? "").trim();
+          if (!title) return { ok: false, errorFa: `عنوان اعلان در گام «${step.id}» الزامی است.` };
+          break;
+        }
+        case "show_order":
+        case "send_content": {
+          // Config validated at runtime against ownership; nothing structural.
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+
+  // --- Cycle detection (reachability from start) ---
+  const stepMap = new Map<string, WorkflowStep>();
+  for (const s of steps) stepMap.set((s as WorkflowStep).id, s as WorkflowStep);
+  const start = startSteps[0] as WorkflowStep;
+  const state = new Map<string, 0 | 1 | 2>(); // 0=unvisited 1=in-stack 2=done
+  const dfs = (id: string): string | null => {
+    const st = state.get(id) ?? 0;
+    if (st === 1) return `گردش کار حلقه (cycle) دارد و از گام «${id}» به خود بازمی‌گردد.`;
+    if (st === 2) return null;
+    state.set(id, 1);
+    const step = stepMap.get(id);
+    if (step) {
+      const nexts: string[] = [];
+      if (step.nextStepId) nexts.push(step.nextStepId);
+      if (step.action?.nextStepId) nexts.push(step.action.nextStepId);
+      if (step.condition?.thenStepId) nexts.push(step.condition.thenStepId);
+      if (step.condition?.elseStepId) nexts.push(step.condition.elseStepId);
+      for (const n of nexts) {
+        const err = dfs(n);
+        if (err) return err;
+      }
+    }
+    state.set(id, 2);
+    return null;
+  };
+  const cycleErr = dfs(start.id);
+  if (cycleErr) return { ok: false, errorFa: cycleErr };
+
+  // Unreachable steps are allowed (authors may keep disabled branches), but
+  // dangling references and cycles are hard failures.
   return { ok: true, def: { steps: steps as WorkflowStep[] } };
+}
+
+/** Validate button config arrays against the P1.2 URL/callback policy. */
+function buttonsAreSafe(raw: unknown[]): boolean {
+  for (const r of raw) {
+    if (!r || typeof r !== "object") return false;
+    const o = r as Record<string, unknown>;
+    if (o.url !== undefined && o.url !== null && safeButtonUrl(o.url) === undefined) return false;
+    const cb = o.callbackData ?? o.callback_data;
+    if (cb !== undefined && cb !== null && safeCallbackData(cb) === undefined) return false;
+    if ((o.url === undefined || o.url === null) && (cb === undefined || cb === null)) return false;
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------

@@ -37,11 +37,17 @@ export async function GET(req: Request) {
   }
 
   // If the bank reports the user did NOT pay successfully, redirect with a failure notice.
+  // The failed transition is CAS-guarded: a late failure callback must never
+  // clobber an order that was already verified and marked `paid`.
   if (status && status !== "OK" && status !== "ok" && status !== "100" && status !== "1") {
-    await db.order.update({
-      where: { id: orderId },
+    const failed = await db.order.updateMany({
+      where: { id: orderId, status: { in: ["pending", "awaiting_payment", "awaiting_review"] } },
       data: { status: "failed" },
     });
+    if (failed.count === 0) {
+      // Already paid/fulfilled — do not downgrade; surface success path.
+      return NextResponse.redirect(new URL("/dashboard/payments?status=ok", url.origin));
+    }
     await audit({
       userId: order.userId,
       actor: "provider",

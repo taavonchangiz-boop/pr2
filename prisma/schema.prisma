@@ -253,6 +253,13 @@ model Subscription {
   usedQuota     String   @default("{}") // JSON
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+  // DB-level uniqueness for the "one live subscription per (user, plan)"
+  // invariant (P0.9). The key is "<userId>:<planId>" and is set ONLY on the
+  // active/renewable row for that plan; it is NULL on terminal rows. Both
+  // SQLite and MariaDB treat NULLs as distinct in unique indexes, so any
+  // number of historical rows may coexist while at most ONE live row per
+  // (user, plan) can ever exist - concurrent purchases converge on renewal.
+  activeKey     String?  @unique
   @@index([userId])
 }
 
@@ -395,9 +402,16 @@ model DiscountUsage {
   discount      Discount @relation(fields: [discountId], references: [id], onDelete: Cascade)
   userId        String
   user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  orderId       String?
+  orderId       String?  @unique
   createdAt     DateTime @default(now())
-  @@unique([discountId, userId])
+  // NOTE (P1.8): the previous @@unique([discountId, userId]) silently made
+  // "perUserLimit > 1" unreachable (a user could never redeem the same code
+  // twice regardless of the configured limit). Per-user limits are now
+  // enforced transactionally in recordUsage (increment-first row lock,
+  // count check, rollback on rejection). The orderId unique guarantees a
+  // single usage row per (discount, order) so a retried order creation can
+  // never double-consume the cap for the same order.
+  @@index([discountId, userId])
 }
 
 // ---------------------------------------------------------------------
@@ -701,6 +715,11 @@ model BotLinkCode {
   expiresAt     DateTime
   consumedAt    DateTime?
   consumedByProviderUserId String?
+  // DB-level identity-binding invariant (P1.3): "<botId>:<providerUserId>"
+  // set atomically at consume time, NULL while unconsumed. Guarantees one
+  // provider identity binds to at most ONE link code (one POSTYAR account)
+  // per bot - concurrent consume attempts cannot silently rebind.
+  bindingKey    String?  @unique
   createdAt     DateTime @default(now())
   @@index([botId])
 }

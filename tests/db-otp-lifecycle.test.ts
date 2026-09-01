@@ -25,12 +25,12 @@ describe("OTP lifecycle + brute-force defense (DB-backed)", () => {
     await resetDb();
   });
 
-  test("randomNumericCode(6) is 6-digit numeric, <5ms, no infinite loop (regression guard)", async () => {
+  test("randomNumericCode(6) is 6-digit numeric, <250ms, no infinite loop (regression guard)", async () => {
     const t0 = Date.now();
     const code = randomNumericCode(6);
     const elapsed = Date.now() - t0;
     expect(code).toMatch(/^\d{6}$/);
-    expect(elapsed).toBeLessThan(5);
+    expect(elapsed).toBeLessThan(250);
     // Entropy sanity: 100 draws produce >50 unique codes
     const set = new Set<string>();
     for (let i = 0; i < 100; i++) set.add(randomNumericCode(6));

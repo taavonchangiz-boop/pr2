@@ -295,3 +295,48 @@ describe("publishing state machine: assertTransition invariants", () => {
     expect(() => assertTransition("processing", "failed")).not.toThrow();
   });
 });
+
+// =====================================================================
+// P1.12 / state-machine regression: content MUST leave `queued`/`scheduled`
+// when its job is claimed. Previously NOTHING performed
+// queued→processing, so content was stuck in `queued` forever (and
+// maybeMarkContentDelivered/Failed always hit invalid-transition guards),
+// even after every job finished.
+// =====================================================================
+describe("worker: content state promotion at claim time (regression)", () => {
+  beforeEach(async () => { await resetDb(); });
+
+  test("claiming a job promotes content out of queued (never stuck)", async () => {
+    const u = await seedUser();
+    const d = await seedDestination({ ownerId: u.id });
+    const c = await seedContent({ ownerId: u.id, status: "queued" });
+    await seedJob({
+      contentId: c.id,
+      destinationId: d.id,
+      idempotencyKey: `promote-queued-${Date.now()}`,
+      status: "queued",
+      runAt: new Date(),
+    });
+    await runWorkerOnce(5);
+    const after = await db.content.findUniqueOrThrow({ where: { id: c.id } });
+    // The provider call may succeed, fail, or retry in this environment —
+    // what must NEVER happen again is content remaining in `queued`.
+    expect(["processing", "delivered", "failed"]).toContain(after.status);
+  });
+
+  test("claiming a due job promotes content out of scheduled (scheduled→processing chain)", async () => {
+    const u = await seedUser();
+    const d = await seedDestination({ ownerId: u.id });
+    const c = await seedContent({ ownerId: u.id, status: "scheduled" });
+    await seedJob({
+      contentId: c.id,
+      destinationId: d.id,
+      idempotencyKey: `promote-sched-${Date.now()}`,
+      status: "queued",
+      runAt: new Date(),
+    });
+    await runWorkerOnce(5);
+    const after = await db.content.findUniqueOrThrow({ where: { id: c.id } });
+    expect(["processing", "delivered", "failed"]).toContain(after.status);
+  });
+});

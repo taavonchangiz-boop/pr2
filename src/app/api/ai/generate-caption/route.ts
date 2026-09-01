@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireUser, clientIp, AuthError } from "@/lib/server/auth";
 import { generateCaption, type CaptionTone, type CaptionLength, type CaptionPlatform, type CaptionPurpose } from "@/lib/ai/smart-caption";
+import { requirePlanFeature } from "@/lib/payments/plans";
 
 const Schema = z.object({
   topic: z.string().min(3, "موضوع حداقل ۳ نویسه باشد.").max(800),
@@ -21,6 +22,13 @@ export async function POST(req: Request) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   void clientIp(req);
+  // P0.15 — server-side plan feature gate (UI hiding is not authorization).
+  try {
+    await requirePlanFeature(user.id, "caption");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    return NextResponse.json({ errorFa: (e as AuthError).message }, { status });
+  }
   let body: unknown;
   try { body = await req.json(); } catch {
     return NextResponse.json({ errorFa: "بدنه درخواست نامعتبر است." }, { status: 400 });

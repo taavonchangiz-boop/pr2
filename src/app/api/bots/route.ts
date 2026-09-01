@@ -13,6 +13,7 @@ import {
 import { encryptString } from "@/lib/security/crypto";
 import { getDestinationProvider, isValidProviderName } from "@/lib/providers";
 import { maskToken } from "@/lib/persian";
+import { requireFeatureCapacity } from "@/lib/payments/plans";
 
 const CreateSchema = z.object({
   provider: z.enum(["telegram", "bale", "rubika"]),
@@ -92,6 +93,14 @@ export async function POST(req: Request) {
   const { provider, name, botToken, username, config } = parsed.data;
   if (!isValidProviderName(provider)) {
     return NextResponse.json({ errorFa: "پروایدر نامعتبر است." }, { status: 400 });
+  }
+  // P0.15 — server-side plan gates: `bot` feature + `bots` capacity.
+  try {
+    const botCount = await db.bot.count({ where: { ownerId: user.id } });
+    await requireFeatureCapacity(user.id, "bot", "bots", botCount, "تعداد بات‌ها");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    return NextResponse.json({ errorFa: (e as AuthError).message }, { status });
   }
   // Verify credentials with the destination provider
   const destProvider = getDestinationProvider(provider);

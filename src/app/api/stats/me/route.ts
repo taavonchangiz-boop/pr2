@@ -5,6 +5,7 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { requireUser, AuthError, safeJsonParse } from "@/lib/server/auth";
+import { getQuotaState } from "@/lib/payments/plans";
 
 export async function GET() {
   let user;
@@ -117,18 +118,18 @@ export async function GET() {
       channelsQuota: null,
       endsAt: sub?.endsAt ? sub.endsAt.toISOString() : null,
     };
-    if (sub) {
-      const used = safeJsonParse<{ publishUsed?: number; aiUsed?: number }>(sub.usedQuota, { publishUsed: 0 });
-      const quota = safeJsonParse<{ publishPerMonth?: number; aiPerMonth?: number; channels?: number }>(sub.plan?.quota ?? null, {});
-      usage = {
-        ...usage,
-        publishUsed: used.publishUsed ?? 0,
-        publishQuota: quota.publishPerMonth ?? null,
-        aiUsed: used.aiUsed ?? 0,
-        aiQuota: quota.aiPerMonth ?? null,
-        channelsQuota: quota.channels ?? null,
-      };
-    }
+    // P2.2 — the usage snapshot comes from the quota engine's authoritative
+    // CAS counters (publishPerMonth/aiPerMonth), not the legacy
+    // non-atomic `publishUsed` key.
+    const quotaState = await getQuotaState(user.id);
+    usage = {
+      ...usage,
+      publishUsed: quotaState.publishPerMonth.used,
+      publishQuota: quotaState.publishPerMonth.limit < 0 ? null : quotaState.publishPerMonth.limit,
+      aiUsed: quotaState.aiPerMonth.used,
+      aiQuota: quotaState.aiPerMonth.limit < 0 ? null : quotaState.aiPerMonth.limit,
+      channelsQuota: quotaState.channels.limit < 0 ? null : quotaState.channels.limit,
+    };
 
     return NextResponse.json({
       summary: {

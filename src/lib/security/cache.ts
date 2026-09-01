@@ -205,28 +205,181 @@ export async function releaseLock(key: string, holder: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------
-// Idempotency
-//   Redis: GET/SET with PX ttl. Returns stored result if present.
-//   In-memory: Map (dev only).
+// Idempotency — ATOMIC claim (P0.12 ROOT-CAUSE FIX)
 // ---------------------------------------------------------------------
-export async function idempotency<T>(key: string, fn: () => Promise<T>, ttlMs: number = 24 * 60 * 60 * 1000): Promise<T> {
+// The previous implementation was GET → fn() → SET: N concurrent callers
+// with the same key ALL executed the business function (double quota
+// consumption, double side effects). It was not idempotent.
+//
+// New protocol (works identically on Redis and the dev-only in-memory map):
+//   1. ATOMICALLY claim the key: SET idem:<key> = "__claim__:<holder>" NX PX
+//      <claimTtl>. Only ONE caller wins the claim.
+//   2. The winner runs fn(), stores the JSON result (PX ttlMs), deletes the
+//      claim marker, and returns.
+//   3. Losers POLL for the result (bounded by waitTimeoutMs). When the
+//      winner finishes, every loser returns the SAME result — the business
+//      function executed exactly once.
+//   4. ABANDONED claims (winner crashed mid-flight) are safe: the claim
+//      marker expires after claimTtl; the next caller takes over and
+//      re-executes. This is why claimTtl must exceed the business
+//      function's worst-case duration. Durable correctness for money/
+//      security operations additionally relies on DB-level uniqueness
+//      (e.g. AiJob.idempotencyKey) layered under this claim.
+//
+// `opts.critical`: when true, the function REFUSES to run without a real
+// Redis connection in production (fail closed). The process-local Map is
+// acceptable ONLY for dev/test single-process operation — never silently
+// for production-critical money/security paths.
+// ---------------------------------------------------------------------
+const IDEM_CLAIM_PREFIX = "__claim__:";
+const IDEM_DEFAULT_CLAIM_TTL_MS = 90_000; // > AI provider timeout + margin
+const IDEM_POLL_INTERVAL_MS = 120;
+const IDEM_DEFAULT_WAIT_MS = 120_000;
+
+export interface IdempotencyOptions {
+  /** TTL of the stored result (default 24h). */
+  ttlMs?: number;
+  /** How long the in-flight claim may run before being considered abandoned. */
+  claimTtlMs?: number;
+  /** How long a losing caller waits for the winner's result. */
+  waitTimeoutMs?: number;
+  /** Fail closed without live Redis in production (money/security paths). */
+  critical?: boolean;
+}
+
+async function idempotencyRedis<T>(
+  client: NonNullable<ReturnType<typeof getRedis>>,
+  idemKey: string,
+  fn: () => Promise<T>,
+  opts: Required<Omit<IdempotencyOptions, "critical">>,
+): Promise<T> {
+  const holder = randomToken(12);
+  const claimRes = await client.set(
+    idemKey,
+    `${IDEM_CLAIM_PREFIX}${holder}`,
+    "PX",
+    opts.claimTtlMs,
+    "NX",
+  );
+  if (claimRes === "OK") {
+    // We own the claim — run the function exactly once.
+    try {
+      const result = await fn();
+      await client.set(idemKey + ":result", JSON.stringify(result), "PX", opts.ttlMs);
+      return result;
+    } finally {
+      // Release the claim so late losers read the result (or take over
+      // after claim TTL expiry if fn threw before a result was stored).
+      const current = await client.get(idemKey);
+      if (current === `${IDEM_CLAIM_PREFIX}${holder}`) {
+        await client.del(idemKey);
+      }
+    }
+  }
+
+  // Someone else holds the claim — poll for the result.
+  const deadline = Date.now() + opts.waitTimeoutMs;
+  while (Date.now() < deadline) {
+    const raw = await client.get(idemKey + ":result");
+    if (raw !== null) {
+      try { return JSON.parse(raw) as T; } catch { /* fall through to retry */ }
+    }
+    const current = await client.get(idemKey);
+    if (current === null) {
+      // Claim released but result not visible yet (crash between del and
+      // set, or abandoned). Retry the claim once via the outer loop below.
+      const reClaim = await client.set(idemKey, `${IDEM_CLAIM_PREFIX}${holder}`, "PX", opts.claimTtlMs, "NX");
+      if (reClaim === "OK") {
+        try {
+          // Check again — the previous winner may have stored the result
+          // between our read and our claim.
+          const raw2 = await client.get(idemKey + ":result");
+          if (raw2 !== null) {
+            try { return JSON.parse(raw2) as T; } catch { /* re-run */ }
+          }
+          const result = await fn();
+          await client.set(idemKey + ":result", JSON.stringify(result), "PX", opts.ttlMs);
+          return result;
+        } finally {
+          const cur2 = await client.get(idemKey);
+          if (cur2 === `${IDEM_CLAIM_PREFIX}${holder}`) await client.del(idemKey);
+        }
+      }
+    }
+    await new Promise((r) => setTimeout(r, IDEM_POLL_INTERVAL_MS));
+  }
+  // Wait budget exhausted — refuse rather than execute concurrently.
+  throw new Error("عملیات هم‌زمان با کلید یکتا بیش از حد طول کشید. دوباره تلاش کنید.");
+}
+
+// In-memory fallback claim registry (dev/test only).
+const idemClaims = new Map<string, { holder: string; expiresAt: number }>();
+
+export async function idempotency<T>(
+  key: string,
+  fn: () => Promise<T>,
+  ttlMs: number = 24 * 60 * 60 * 1000,
+  opts: IdempotencyOptions = {},
+): Promise<T> {
+  const cfg = {
+    ttlMs: opts.ttlMs ?? ttlMs,
+    claimTtlMs: opts.claimTtlMs ?? IDEM_DEFAULT_CLAIM_TTL_MS,
+    waitTimeoutMs: opts.waitTimeoutMs ?? IDEM_DEFAULT_WAIT_MS,
+  };
   await maybeRefresh();
   const client = getRedis();
-  const idemKey = `idem:${key}`;
   if (client && _isRedisLive) {
-    const existing = await client.get(idemKey);
-    if (existing !== null) {
-      try { return JSON.parse(existing) as T; } catch { /* fall through */ }
-    }
-    const result = await fn();
-    await client.set(idemKey, JSON.stringify(result), "PX", ttlMs);
-    return result;
+    return idempotencyRedis<T>(client, `idem:${key}`, fn, cfg);
   }
-  const memExisting = idemStore.get(key);
-  if (memExisting && memExisting.expiresAt > now()) return memExisting.result as T;
-  const result = await fn();
-  idemStore.set(key, { result, expiresAt: now() + ttlMs });
-  return result;
+
+  // --- Fallback (dev/test only) ---
+  if (opts.critical && process.env.NODE_ENV === "production") {
+    // Fail closed: production-critical operations must never silently run
+    // on a process-local Map (no cross-process serialization).
+    throw new Error("عملیات حساس مالی نیاز به اتصال واقعی Redis دارد که در این محیط فعال نیست.");
+  }
+
+  const idemKey = `idem:${key}`;
+  const t = now();
+  const existingClaim = idemClaims.get(idemKey);
+  const existingResult = idemStore.get(key);
+
+  if (existingResult && existingResult.expiresAt > t) {
+    return existingResult.result as T;
+  }
+
+  if (!existingClaim || existingClaim.expiresAt < t) {
+    // Claim atomically (single-threaded JS — check+set without await in
+    // between is atomic).
+    idemClaims.set(idemKey, { holder: "self", expiresAt: t + cfg.claimTtlMs });
+    try {
+      const result = await fn();
+      idemStore.set(key, { result, expiresAt: now() + cfg.ttlMs });
+      return result;
+    } finally {
+      idemClaims.delete(idemKey);
+    }
+  }
+
+  // Another in-flight claim — poll for the result.
+  const deadline = Date.now() + cfg.waitTimeoutMs;
+  while (Date.now() < deadline) {
+    const res = idemStore.get(key);
+    if (res && res.expiresAt > now()) return res.result as T;
+    if (!idemClaims.has(idemKey)) {
+      // Claim disappeared (finished with error or evicted) — take over.
+      idemClaims.set(idemKey, { holder: "self", expiresAt: now() + cfg.claimTtlMs });
+      try {
+        const result = await fn();
+        idemStore.set(key, { result, expiresAt: now() + cfg.ttlMs });
+        return result;
+      } finally {
+        idemClaims.delete(idemKey);
+      }
+    }
+    await new Promise((r) => setTimeout(r, IDEM_POLL_INTERVAL_MS));
+  }
+  throw new Error("عملیات هم‌زمان با کلید یکتا بیش از حد طول کشید. دوباره تلاش کنید.");
 }
 
 // ---------------------------------------------------------------------

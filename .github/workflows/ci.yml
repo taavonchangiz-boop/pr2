@@ -6,20 +6,35 @@
 # script in package.json: `next build && cp -r .next/static .next/standalone/.next/
 # && cp -r public .next/standalone/`).
 #
+# Reproducibility (P1.17): every job pins `oven/bun:1.3.14` — the exact
+# Bun version the lockfile is generated/verified with. `oven/bun:latest`
+# is non-reproducible and is never used.
+#
+# Migration validation (P1.18): the pipeline runs `prisma migrate deploy`
+# against a throwaway SQLite database and FAILS the job when migrations
+# are missing/broken — no `|| true` fail-open behavior anywhere. The repo
+# carries a controlled baseline migration under `prisma/migrations/`;
+# production MUST deploy with `prisma migrate deploy` (never
+# `db push --accept-data-loss`, which exists solely as the local dev
+# shortcut documented in docs/DEPLOYMENT-CPANEL.md).
+#
+# Security scanning (P1.19): forbidden-pattern greps are retained, and
+# they are complemented by
+#   * `bun audit --audit-level critical` — dependency vulnerability audit
+#     (Bun-native, lockfile-driven, deterministic). The build FAILS on
+#     critical advisories; high/moderate findings are reported non-blocking
+#     so the pipeline stays actionable without hiding regressions.
+#   * a secret scan for high-signal credential patterns.
+#
 # Jobs:
 #   install   → bun install --frozen-lockfile
 #   typecheck → bunx tsc --noEmit
 #   lint      → bun run lint
 #   build     → bun run build (next build standalone + asset copy)
-#   db-validate → prisma validate + migrate status (throwaway SQLite DB)
-#   test      → smoke curl against / and /api/health (no test runner exists)
-#   security-scan → grep for forbidden patterns (see job for the full list)
-#
-# All jobs use the `oven/bun` Docker image so bun is available out of the box.
-# The pipeline is intentionally simple — no caching, no matrix, no deploy step.
-# To wire deploy: add a step at the end that pushes artifacts to cPanel via
-# SSH (out of scope here — cPanel deployments are done manually per
-# docs/DEPLOYMENT-CPANEL.md).
+#   db-validate → prisma validate + prisma migrate deploy (fail-closed)
+#   test      → smoke curl against / and /api/health
+#   unit-tests → bun test suite
+#   security-scan → forbidden patterns + dependency audit + secret scan
 # =====================================================================
 name: CI
 
@@ -36,19 +51,22 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  BUN_IMAGE: oven/bun:1.3.14
+
 jobs:
   install:
     name: Install deps
     runs-on: ubuntu-latest
     container:
-      image: oven/bun:latest
+      image: oven/bun:1.3.14
     steps:
       - uses: actions/checkout@v4
       - name: Configure bun cache
         run: |
           mkdir -p /tmp/bun-cache
           echo "BUN_INSTALL_CACHE_DIR=/tmp/bun-cache" >> $GITHUB_ENV
-      - name: bun install --frozen-lockfile
+      - name: Verify lockfile consistency with package.json
         run: bun install --frozen-lockfile
       - name: Upload node_modules for downstream jobs
         uses: actions/upload-artifact@v4
@@ -62,7 +80,7 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     container:
-      image: oven/bun:latest
+      image: oven/bun:1.3.14
     steps:
       - uses: actions/checkout@v4
       - name: Download node_modules
@@ -78,7 +96,7 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     container:
-      image: oven/bun:latest
+      image: oven/bun:1.3.14
     steps:
       - uses: actions/checkout@v4
       - name: Download node_modules
@@ -94,7 +112,7 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     container:
-      image: oven/bun:latest
+      image: oven/bun:1.3.14
     env:
       # Provide a dummy master key so crypto.ts doesn't blow up at build
       # time (it throws in production only if missing, but Next's static
@@ -121,11 +139,11 @@ jobs:
           test -d .next/standalone/.next/static
 
   db-validate:
-    name: Prisma schema validation
+    name: Prisma schema + migration validation
     needs: install
     runs-on: ubuntu-latest
     container:
-      image: oven/bun:latest
+      image: oven/bun:1.3.14
     env:
       DATABASE_URL: file:/tmp/postyar-ci.db
     steps:
@@ -137,10 +155,12 @@ jobs:
           path: node_modules
       - name: prisma validate
         run: bunx prisma validate
-      - name: prisma migrate status (no migrations yet — expected to succeed with empty)
-        run: bunx prisma migrate status || true
-      - name: Push schema to throwaway SQLite for sanity
-        run: bunx prisma db push --skip-generate
+      # P1.18 — fail closed: the job FAILS when migrations are missing,
+      # broken, or drift from the schema. No `|| true` masking.
+      - name: prisma migrate deploy (controlled migrations only)
+        run: bunx prisma migrate deploy
+      - name: prisma migrate status
+        run: bunx prisma migrate status
       - name: Generate Prisma Client
         run: bunx prisma generate
 
@@ -149,7 +169,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     container:
-      image: oven/bun:latest
+      image: oven/bun:1.3.14
     env:
       NODE_ENV: production
       POSTYAR_MASTER_KEY: 0000000000000000000000000000000000000000000000000000000000000000
@@ -164,8 +184,8 @@ jobs:
         with:
           name: node-modules
           path: node_modules
-      - name: Apply schema to test DB
-        run: bunx prisma db push --skip-generate
+      - name: Apply controlled migrations to test DB
+        run: bunx prisma migrate deploy
       - name: Generate Prisma Client
         run: bunx prisma generate
       - name: Start standalone server
@@ -210,11 +230,11 @@ jobs:
     needs: install
     runs-on: ubuntu-latest
     container:
-      image: oven/bun:latest
+      image: oven/bun:1.3.14
     env:
       NODE_ENV: test
       POSTYAR_MASTER_KEY: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-      POSTYAR_JWT_SECRET: jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
+      POSTYAR_JWT_SECRET: jjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjjj
       DATABASE_URL: file:/tmp/postyar-unit.db
     steps:
       - uses: actions/checkout@v4
@@ -223,19 +243,47 @@ jobs:
         with:
           name: node-modules
           path: node_modules
-      - name: Push schema to unit-test DB
-        run: bunx prisma db push --skip-generate
+      - name: Apply controlled migrations to unit-test DB
+        run: bunx prisma migrate deploy
       - name: Generate Prisma Client
         run: bunx prisma generate
       - name: Run bun test suite
         run: bun test tests/*.test.ts
 
   security-scan:
-    name: Security grep scan
+    name: Security scan
     needs: install
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install dependencies (needed for bun audit)
+        run: bun install --frozen-lockfile
+
+      # --- P1.19: dependency vulnerability audit (fails on critical) ---
+      - name: Dependency vulnerability audit (critical gate)
+        run: bun audit --audit-level critical
+      - name: Dependency vulnerability report (high — non-blocking)
+        continue-on-error: true
+        run: bun audit --audit-level high
+
+      # --- P1.19: secret scanning ---
+      - name: Secret scan (high-signal credential patterns)
+        run: |
+          matches=$(grep -rEn '(ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-(proj-)?[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|xox[baprs]-[A-Za-z0-9-]{10,})' \
+            --include='*.ts' --include='*.tsx' --include='*.js' --include='*.mjs' --include='*.json' --include='*.yml' --include='*.yaml' --include='*.prisma' --include='*.sh' \
+            src/ prisma/ scripts/ .github/ .zscripts/ mini-services/ 2>/dev/null || true)
+          if [ -n "$matches" ]; then
+            echo "Found high-signal credential pattern in tracked source:"
+            echo "$matches"
+            echo "Secrets must live in environment configuration — never in code."
+            exit 1
+          fi
+          echo "No high-signal credential patterns found."
+
+      # --- Forbidden patterns (retained from the previous pipeline) ---
       - name: Forbidden — `rejectUnauthorized: false`
         run: |
           if grep -rEn 'rejectUnauthorized:\s*false' src/ 2>/dev/null; then
@@ -251,12 +299,13 @@ jobs:
       - name: Forbidden — `Math.random` in OTP/security code
         run: |
           # Allow Math.random only in non-critical UI code (sidebar.tsx layout
-          # helper). Forbid it everywhere except ui/sidebar.tsx.
-          matches=$(grep -rEn '\bMath\.random\(' src/ 2>/dev/null | grep -v 'components/ui/sidebar.tsx' || true)
+          # helper + client-side localStorage label generators that never act
+          # as security tokens). Forbid it in server code (src/lib, src/app).
+          matches=$(grep -rEn '\bMath\.random\(' src/lib src/app 2>/dev/null || true)
           if [ -n "$matches" ]; then
-            echo "Found Math.random() outside sidebar UI helper:"
+            echo "Found Math.random() in server code:"
             echo "$matches"
-            echo "All randomness must use crypto.randomBytes() or crypto.randomInt()."
+            echo "All server randomness must use crypto.randomBytes() / randomToken()."
             exit 1
           fi
       - name: Forbidden — `: any` in non-test code
@@ -298,10 +347,9 @@ jobs:
             echo "Found eval() or new Function() — code injection risk."
             exit 1
           fi
-      - name: Forbidden — hardcoded literal secret keys (hex-32 or hex-64)
+      - name: Forbidden — hardcoded literal secret keys (hex-64)
         run: |
-          # Flag 32-byte or 64-byte hex literals as standalone string literals
-          # (not env reads). This catches accidental hardcoded API keys.
+          # Flag 64-hex literals as standalone string literals (not env reads).
           matches=$(grep -rEn "['\"][0-9a-f]{64}['\"]" src/ 2>/dev/null | grep -v 'test' || true)
           if [ -n "$matches" ]; then
             echo "Found potential hardcoded 64-hex secret in src/:"
@@ -309,7 +357,7 @@ jobs:
             echo "Move secrets to environment variables."
             exit 1
           fi
-      - name: Forbidden — `db push --accept-data-loss` reference in prisma/schema or package.json scripts (other than the dev script)
+      - name: Forbidden — `db push --accept-data-loss` outside the dev script (P1.20)
         run: |
           # The dev script "db:push" in package.json intentionally uses --accept-data-loss
           # for local SQLite. This must NEVER appear in production migration configs.
@@ -324,9 +372,5 @@ jobs:
             echo "$matches"
             exit 1
           fi
-      - name: Warn-only — `: any` count summary
-        continue-on-error: true
-        run: |
-          echo "::warning::Total ': any' count: $(grep -rEn ':\s*any\b' src/ 2>/dev/null | wc -l)"
       - name: Security scan summary
         run: echo "Security scan complete."

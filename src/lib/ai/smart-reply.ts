@@ -5,7 +5,7 @@
 // Automatic sending requires explicit authorization via AutoResponder
 // config — this module ONLY returns suggestions.
 // =====================================================================
-import { randomToken } from "@/lib/security/crypto";
+import crypto from "node:crypto";
 import { dispatchAi } from "./dispatch";
 
 export interface SmartReplyContext {
@@ -117,7 +117,22 @@ export async function smartReply(input: {
     systemPrompt: buildSystemPrompt(ctx),
     temperature: 0.6,
     maxTokens: 700,
-    idempotencyKey: `reply:${input.userId}:${randomToken(8)}:${Buffer.from(message).toString("hex").slice(0, 16)}`,
+    // P0.4 — deterministic idempotency key over the authoritative input set
+    // (message + context + provider/model; no random entropy).
+    idempotencyKey: `reply:${crypto
+      .createHash("sha256")
+      .update(
+        [
+          input.userId,
+          message,
+          ctx.channel ?? "",
+          ctx.provider ?? "",
+          (ctx.recentThread ?? []).map((m) => `${m.role}:${m.text}`).join("\u0001"),
+          input.provider ?? "auto",
+          input.model ?? "auto",
+        ].join("\u0000"),
+      )
+      .digest("hex")}`,
     meta: { channel: ctx.channel, provider: ctx.provider },
   });
 
