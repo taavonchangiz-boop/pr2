@@ -533,12 +533,23 @@ export async function runWorkflowOnceForEvent(
   execute: (resume: WorkflowResumeContext) => Promise<WorkflowExecutionOutcome>,
   opts?: { eventHolder?: string },
 ): Promise<{ executed: boolean; ok: boolean; contended?: boolean }> {
+  const workflowRow = await db.botWorkflow.findUnique({ where: { id: workflowId }, select: { updatedAt: true } });
+  if (!workflowRow) return { executed: false, ok: false };
+  const workflowVersion = workflowRow.updatedAt.toISOString();
   const run = await db.botWorkflowRun.upsert({
     where: { eventId_workflowId: { eventId, workflowId } },
-    create: { eventId, workflowId },
+    create: { eventId, workflowId, workflowVersion },
     update: {},
   });
   if (run.status === "completed") return { executed: false, ok: true };
+  if (run.workflowVersion && run.workflowVersion !== workflowVersion) {
+    await db.botWorkflowRun.updateMany({
+      where: { id: run.id, status: { in: ["pending", "failed"] }, workflowVersion: run.workflowVersion },
+      data: { status: "dead", lastError: "نسخه گردش کار پس از شروع اجرای رویداد تغییر کرده است.", leaseUntil: null, lockedBy: null },
+    });
+    return { executed: false, ok: false };
+  }
+  if (!run.workflowVersion) await db.botWorkflowRun.updateMany({ where: { id: run.id, workflowVersion: null }, data: { workflowVersion } });
 
   // V6 C-01 — the claim IS the state transition: pending/failed →
   // processing (and processing+expired-lease → processing takeover),
