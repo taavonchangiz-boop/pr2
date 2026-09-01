@@ -174,19 +174,23 @@ export const baleProvider: DestinationProvider = {
       const j = (await res.json()) as { ok?: boolean; description?: string; result?: BaleMessage; error_code?: number };
       if (!j.ok || !j.result) {
         const err = j.description ?? "";
+        // V5 H-04 — ambiguity classification (same contract as Telegram):
+        // definite HTTP 4xx refusals are NOT ambiguous; HTTP 5xx is UNKNOWN.
+        const is5xx = res.status >= 500 || (typeof j.error_code === "number" && j.error_code >= 500);
+        const ambiguous = is5xx;
         if (j.error_code === 401) {
-          return { ok: false, errorFa: "توکن نامعتبر است.", raw: sanitizeRaw({ description: err }) };
+          return { ok: false, ambiguous: false, errorFa: "توکن نامعتبر است.", raw: sanitizeRaw({ description: err }) };
         }
         if (j.error_code === 403 || /forbidden/i.test(err)) {
-          return { ok: false, errorFa: "ربات دسترسی به این چت را ندارد.", raw: sanitizeRaw({ description: err }) };
+          return { ok: false, ambiguous: false, errorFa: "ربات دسترسی به این چت را ندارد.", raw: sanitizeRaw({ description: err }) };
         }
         if (j.error_code === 400 || /chat not found/i.test(err)) {
-          return { ok: false, errorFa: "چت یافت نشد.", raw: sanitizeRaw({ description: err }) };
+          return { ok: false, ambiguous: false, errorFa: "چت یافت نشد.", raw: sanitizeRaw({ description: err }) };
         }
         if (j.error_code === 429) {
-          return { ok: false, errorFa: "محدودیت ارسال پیام. کمی بعد تلاش کنید.", raw: sanitizeRaw({ description: err }) };
+          return { ok: false, ambiguous: false, errorFa: "محدودیت ارسال پیام. کمی بعد تلاش کنید.", raw: sanitizeRaw({ description: err }) };
         }
-        return { ok: false, errorFa: "ارسال پیام ناموفق بود.", raw: sanitizeRaw({ description: err }) };
+        return { ok: false, ambiguous, errorFa: "ارسال پیام ناموفق بود.", raw: sanitizeRaw({ description: err }) };
       }
       return {
         ok: true,
@@ -194,8 +198,12 @@ export const baleProvider: DestinationProvider = {
         raw: sanitizeRaw({ message_id: j.result.message_id }),
       };
     } catch (err) {
+      // V5 H-04 — thrown fetch (AbortError/timeout, TypeError/network) or an
+      // unparseable response leaves the delivery outcome UNKNOWN. Never
+      // report false certainty about a possibly-delivered message.
       return {
         ok: false,
+        ambiguous: true,
         errorFa: "اتصال به سرویس ناموفق بود.",
         raw: sanitizeRaw({ name: err instanceof Error ? err.name : "Error" }),
       };

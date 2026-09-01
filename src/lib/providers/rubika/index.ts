@@ -153,8 +153,10 @@ export const rubikaProvider: DestinationProvider = {
       // documented. Rather than fabricate success, we explicitly mark
       // this as unsupported so the user sees a clear Persian error and
       // the worker treats the job as a soft-failure (will not retry).
+      // V5 H-04 — a definitive refusal: nothing was sent, a retry is safe.
       return {
         ok: false,
+        ambiguous: false,
         errorFa: "این قابلیت توسط روبیکا پشتیبانی نمی‌شود.",
         raw: { supported: false, reason: "rubika_send_file_undocumented" },
       };
@@ -168,12 +170,17 @@ export const rubikaProvider: DestinationProvider = {
 
     const r = await rubikaCall<RubikaMessage>(botToken, "send_message", payload);
     if (!r.ok) {
-      if (r.status === 401) return { ok: false, errorFa: "توکن نامعتبر است.", raw: r.raw };
-      if (r.status === 0) return { ok: false, errorFa: "اتصال به سرویس ناموفق بود.", raw: r.raw };
-      if (r.status === 403) return { ok: false, errorFa: "ربات دسترسی به این چت را ندارد.", raw: r.raw };
-      if (r.status === 400) return { ok: false, errorFa: "چت یافت نشد.", raw: r.raw };
-      if (r.status === 429) return { ok: false, errorFa: "محدودیت ارسال پیام. کمی بعد تلاش کنید.", raw: r.raw };
-      return { ok: false, errorFa: "ارسال پیام ناموفق بود.", raw: r.raw };
+      // V5 H-04 — ambiguity classification: status 0 = the request never
+      // completed (network error / timeout / abort) → the delivery outcome
+      // is UNKNOWN. HTTP 5xx → also UNKNOWN (server may have accepted the
+      // message before failing). Definite 4xx refusals are NOT ambiguous.
+      const ambiguous = r.status === 0 || r.status >= 500;
+      if (r.status === 401) return { ok: false, ambiguous: false, errorFa: "توکن نامعتبر است.", raw: r.raw };
+      if (r.status === 0) return { ok: false, ambiguous: true, errorFa: "اتصال به سرویس ناموفق بود.", raw: r.raw };
+      if (r.status === 403) return { ok: false, ambiguous: false, errorFa: "ربات دسترسی به این چت را ندارد.", raw: r.raw };
+      if (r.status === 400) return { ok: false, ambiguous: false, errorFa: "چت یافت نشد.", raw: r.raw };
+      if (r.status === 429) return { ok: false, ambiguous: false, errorFa: "محدودیت ارسال پیام. کمی بعد تلاش کنید.", raw: r.raw };
+      return { ok: false, ambiguous, errorFa: "ارسال پیام ناموفق بود.", raw: r.raw };
     }
     const msg = r.result;
     const providerMessageId = msg

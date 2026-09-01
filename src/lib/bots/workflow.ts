@@ -34,6 +34,7 @@ import { getActiveSubscription, getQuotaState, createOrderForSubscription, getEf
 import { getBalance } from "@/lib/payments/wallet";
 import { processBaleUpdate, baleCreatePaymentRequest } from "@/lib/payments/bale";
 import { dispatchAi } from "@/lib/ai/dispatch";
+import type { WorkflowResumeContext } from "@/lib/bots/event-dedup";
 import { notify, type NotificationCategory } from "@/lib/notifications";
 import { createTicket, type TicketCategory, type TicketPriority } from "@/lib/tickets";
 import { getGoldPrice, type GoldInstrument } from "@/lib/providers/gold";
@@ -132,6 +133,17 @@ export interface WorkflowResult {
   /** Outbound messages persisted (count). */
   outboundCount: number;
   errorFa?: string;
+  /** V5 H-04 — per-step resume cursor (persisted by the run layer on
+   *  failure so a retry resumes from the interrupted step). */
+  cursor?: WorkflowResumeCursor;
+}
+
+/** V5 H-04 — durable per-step progress (stored on BotWorkflowRun). */
+export interface WorkflowResumeCursor {
+  /** stepId → next step id chosen on the previous attempt. */
+  completedNext: Record<string, string>;
+  /** stepId → durable outbound history id recorded on a previous attempt. */
+  outboundHistory: Record<string, string>;
 }
 
 // ---------------------------------------------------------------------
@@ -279,9 +291,12 @@ export async function persistInboundOnce(
       },
     });
   } catch (err) {
-    const msg = (err as { code?: string; message?: string })?.message ?? "";
-    if (/unique|UNIQUE|constraint/i.test(msg)) {
-      // Durable idempotency: the history row for this event already exists.
+    // V5 H-03 — convergence is decided by the DATABASE constraint code,
+    // not by a message regex: P2002 (unique violation) is the durable
+    // duplicate — every OTHER failure (e.g. P2003 FK: the bot was deleted
+    // mid-flight) is a genuine persistence failure and must stay visible,
+    // never swallowed as an "idempotent duplicate".
+    if ((err as { code?: string })?.code === "P2002") {
       return;
     }
     // Never fail the event on observability persistence — but never hide
@@ -291,49 +306,318 @@ export async function persistInboundOnce(
 }
 
 // ---------------------------------------------------------------------
-// Persist outbound BotHistory rows (inbound persistence lives in
-// persistInboundOnce — owned by the webhook layer, once per event).
+// V5 H-04 — DURABLE OUTBOUND DELIVERY STATE MACHINE
 // ---------------------------------------------------------------------
-async function persistOutbound(ctx: WorkflowContext, userId: string | null, text: string): Promise<void> {
-  try {
-    await db.botHistory.create({
-      data: {
+// Every outbound message is recorded in BotHistory BEFORE the provider
+// call as `pending`, then converged to exactly one terminal state:
+//   * `sent`      — provider confirmed (providerMessageId preserved);
+//   * `failed`    — provider DEFINITIVELY refused (HTTP 4xx / invalid
+//                   token / invalid provider) — a retry is safe;
+//   * `uncertain` — the outcome is UNKNOWN (timeout/abort/network, HTTP
+//                   5xx, or a crash before the post-send update) — the
+//                   message may or may not exist at the provider, so it
+//                   is NEVER blindly re-sent (duplicate risk).
+// A crash between a successful send and the post-send update leaves the
+// row `pending` — auditable evidence of a possibly-delivered message
+// instead of the previous silently-lost history row (write-after-send
+// inside `catch {}`).
+//
+// Cross-attempt recovery (workflow retries) resolves a step's durable
+// fate through TWO channels:
+//   1. the run cursor (resume.outboundHistory[stepId] → history row id)
+//      — the authoritative channel, persisted by the run layer;
+//   2. a run-scoped DB lookup fallback for steps that have NO cursor
+//      entry (a definitely-failed send, or a crash that never persisted
+//      a cursor): the latest pending/uncertain/failed outbound row for
+//      (bot, workflow, step, chat) created at or after THIS run's
+//      creation. Rows created by OTHER runs/events are never adopted
+//      (their `sent` rows especially — a new event must re-send).
+// ---------------------------------------------------------------------
+
+/** Resolve the creation time of the durable run row backing this
+ *  execution (via the durable event identity). Returns null for direct
+ *  callers without a durable event/run — the fallback channel is then
+ *  simply inactive. */
+async function resolveRunStart(ctx: WorkflowContext): Promise<Date | null> {
+  const externalId =
+    ctx.updateId !== undefined ? String(ctx.updateId)
+    : ctx.providerMessageId !== undefined ? String(ctx.providerMessageId)
+    : null;
+  if (!externalId || !isValidProviderName(ctx.bot.provider)) return null;
+  const event = await db.botInboundEvent.findUnique({
+    where: {
+      botId_provider_externalEventId: {
         botId: ctx.bot.id,
-        userId: userId ?? null,
-        direction: "outbound",
-        providerUserId: ctx.providerUserId,
-        text: (text ?? "").slice(0, 4000),
+        provider: ctx.bot.provider,
+        externalEventId: externalId,
       },
-    });
-  } catch { /* never fail the workflow on persistence */ }
+    },
+    select: { id: true },
+  });
+  if (!event) return null;
+  const run = await db.botWorkflowRun.findUnique({
+    where: { eventId_workflowId: { eventId: event.id, workflowId: ctx.workflow.id } },
+    select: { createdAt: true },
+  });
+  return run?.createdAt ?? null;
 }
 
-// ---------------------------------------------------------------------
-// Send an outbound message via the bot's provider
-// ---------------------------------------------------------------------
-async function sendOutbound(bot: Bot, chatId: string, text: string, buttons?: GlassButton[]): Promise<{ ok: boolean; errorFa?: string }> {
+async function sendViaProvider(
+  bot: Bot,
+  chatId: string,
+  text: string,
+  buttons?: GlassButton[],
+): Promise<{ ok: boolean; ambiguous?: boolean; providerMessageId?: string; errorFa?: string }> {
   if (!isValidProviderName(bot.provider)) {
-    return { ok: false, errorFa: "پروایدر ربات نامعتبر است." };
+    // Definitive: nothing was sent and no retry can fix a bad provider.
+    return { ok: false, ambiguous: false, errorFa: "پروایدر ربات نامعتبر است." };
   }
   let botToken = "";
   try { botToken = decryptString(bot.botTokenEnc); } catch {
-    return { ok: false, errorFa: "توکن ربات قابل رمزگشایی نیست." };
+    // Definitive: an undecryptable token can never send.
+    return { ok: false, ambiguous: false, errorFa: "توکن ربات قابل رمزگشایی نیست." };
   }
   const provider = getDestinationProvider(bot.provider);
-  const r = await provider.publishMessage({
-    botToken,
-    chatId,
-    text,
-    buttons,
+  const r = await provider.publishMessage({ botToken, chatId, text, buttons });
+  if (!r.ok) {
+    return { ok: false, ambiguous: r.ambiguous === true, errorFa: r.errorFa, providerMessageId: r.providerMessageId };
+  }
+  return { ok: true, providerMessageId: r.providerMessageId };
+}
+
+export interface TrackedSendArgs {
+  workflowId: string;
+  stepId: string;
+  text: string;
+  buttons?: GlassButton[];
+  /** History row id recorded in the run cursor for this step (resume). */
+  priorHistoryId?: string;
+}
+
+export interface TrackedSendResult {
+  /** false ONLY on a DEFINITIVE failure (safe to re-send). */
+  ok: boolean;
+  /** true = no provider call was made (prior row already sent/uncertain). */
+  skipped?: boolean;
+  /** true = delivery outcome unknown (never re-sent automatically). */
+  uncertain?: boolean;
+  /** The durable BotHistory row id tracking this send. */
+  historyId?: string;
+  providerMessageId?: string;
+  errorFa?: string;
+}
+
+/**
+ * Send an outbound workflow message with durable delivery tracking.
+ * Used by the engine for message steps, action outbounds and the
+ * entitlement-refusal reply. See the state-machine note above.
+ */
+async function sendOutboundTracked(
+  ctx: WorkflowContext,
+  userId: string | null,
+  args: TrackedSendArgs,
+  getRunStart: () => Promise<Date | null>,
+): Promise<TrackedSendResult> {
+  const botId = ctx.bot.id;
+
+  // --- 1. Resolve the step's prior durable row (cross-attempt channel).
+  let prior: { id: string; deliveryStatus: string | null } | null = null;
+  if (args.priorHistoryId) {
+    const row = await db.botHistory.findUnique({ where: { id: args.priorHistoryId } });
+    // Never adopt a foreign row (different bot/workflow/direction).
+    if (row && row.botId === botId && row.direction === "outbound" && row.workflowId === args.workflowId) {
+      prior = { id: row.id, deliveryStatus: row.deliveryStatus };
+    }
+  }
+  if (!prior) {
+    // Crash-recovery fallback: a step WITHOUT a cursor entry may still
+    // have a durable row from an earlier attempt of THIS run (crash
+    // before the cursor was persisted, or a definitely-failed send).
+    const runStart = await getRunStart();
+    if (runStart) {
+      const row = await db.botHistory.findFirst({
+        where: {
+          botId,
+          workflowId: args.workflowId,
+          stepId: args.stepId,
+          direction: "outbound",
+          providerUserId: ctx.providerUserId,
+          // "sent" rows from THIS run count too: a crash that lost the
+          // cursor must never turn into a duplicate send of a step this
+          // run already delivered (V5 H-04).
+          deliveryStatus: { in: ["pending", "uncertain", "failed", "sent"] },
+          createdAt: { gte: runStart },
+        },
+        orderBy: { createdAt: "desc" },
+      });
+      if (row) prior = { id: row.id, deliveryStatus: row.deliveryStatus };
+    }
+  }
+
+  // --- 2. Prior-driven decisions (no duplicate sends, ever).
+  if (prior && prior.deliveryStatus === "sent") {
+    // Already delivered on an earlier attempt — do NOT re-send.
+    return { ok: true, skipped: true, historyId: prior.id };
+  }
+  if (prior && (prior.deliveryStatus === "pending" || prior.deliveryStatus === "uncertain")) {
+    // Delivery UNKNOWN — never replay (duplicate risk). Converge the row
+    // on `uncertain` and audit the uncertainty ONCE (on the transition).
+    if (prior.deliveryStatus !== "uncertain") {
+      await db.botHistory.update({ where: { id: prior.id }, data: { deliveryStatus: "uncertain" } });
+      await audit({
+        userId,
+        actor: "system",
+        action: "bot_workflow_send_uncertain",
+        targetType: "bot",
+        targetId: botId,
+        meta: { workflowId: args.workflowId, stepId: args.stepId, historyId: prior.id, reason: "unknown_delivery_state" },
+      });
+    }
+    return { ok: true, skipped: true, uncertain: true, historyId: prior.id };
+  }
+
+  // --- 3. Durable pre-write: the pending row exists BEFORE the send, so
+  // a crash after a successful provider call leaves an auditable record.
+  const text = (args.text ?? "").slice(0, 4000);
+  let historyId: string;
+  if (prior && prior.deliveryStatus === "failed") {
+    // Definitive failure on an earlier attempt — re-send is safe. Re-arm
+    // the SAME row to pending and drive it through the machine again.
+    await db.botHistory.update({ where: { id: prior.id }, data: { deliveryStatus: "pending" } });
+    historyId = prior.id;
+  } else {
+    const row = await db.botHistory.create({
+      data: {
+        botId,
+        userId: userId ?? null,
+        direction: "outbound",
+        providerUserId: ctx.providerUserId,
+        text,
+        workflowId: args.workflowId,
+        stepId: args.stepId,
+        deliveryStatus: "pending",
+      },
+    });
+    historyId = row.id;
+  }
+
+  // --- 4. Send + converge the row to its terminal state.
+  const send = await sendViaProvider(ctx.bot, ctx.providerUserId, args.text, args.buttons);
+  if (send.ok) {
+    await db.botHistory.update({
+      where: { id: historyId },
+      data: { deliveryStatus: "sent", providerMessageId: send.providerMessageId ?? null },
+    });
+    return { ok: true, historyId, providerMessageId: send.providerMessageId };
+  }
+  if (send.ambiguous) {
+    // UNKNOWN outcome — record `uncertain`; the RUN must not fail for it
+    // (a retry could duplicate a delivered message).
+    await db.botHistory.update({ where: { id: historyId }, data: { deliveryStatus: "uncertain" } });
+    await audit({
+      userId,
+      actor: "system",
+      action: "bot_workflow_send_uncertain",
+      targetType: "bot",
+      targetId: botId,
+      meta: { workflowId: args.workflowId, stepId: args.stepId, historyId, reason: "ambiguous_provider_result", errorFa: send.errorFa },
+    });
+    return { ok: true, uncertain: true, historyId };
+  }
+  // Definitive refusal — record `failed`; the engine treats this as a
+  // step failure so the run stays retryable (V5 C-01).
+  await db.botHistory.update({ where: { id: historyId }, data: { deliveryStatus: "failed" } });
+  await audit({
+    userId,
+    actor: "system",
+    action: "bot_workflow_send_failed",
+    targetType: "bot",
+    targetId: botId,
+    meta: { workflowId: args.workflowId, stepId: args.stepId, historyId, errorFa: send.errorFa },
   });
-  if (!r.ok) return { ok: false, errorFa: r.errorFa };
-  return { ok: true };
+  return { ok: false, errorFa: send.errorFa, historyId };
+}
+
+/**
+ * Tracked one-shot reply used by the webhook/poller layers for
+ * non-workflow replies (link-code consumption). Same pre-write pending →
+ * send → converge pattern; the history write is NEVER silently swallowed.
+ */
+export async function sendTrackedBotReply(
+  bot: Bot,
+  chatId: string,
+  text: string,
+  userId: string | null,
+): Promise<void> {
+  const trimmed = (text ?? "").slice(0, 4000);
+  // 1. Durable pre-write.
+  let historyId: string | null = null;
+  try {
+    const row = await db.botHistory.create({
+      data: {
+        botId: bot.id,
+        userId: userId ?? null,
+        direction: "outbound",
+        providerUserId: chatId,
+        text: trimmed,
+        deliveryStatus: "pending",
+      },
+    });
+    historyId = row.id;
+  } catch (err) {
+    // Observability persistence must not break the reply itself — but it
+    // must never be silent.
+    console.error("bot reply pending history write failed:", err instanceof Error ? err.message : err);
+  }
+  // 2. Send with outcome classification.
+  let delivery: "sent" | "failed" | "uncertain" = "uncertain";
+  let providerMessageId: string | null = null;
+  if (!isValidProviderName(bot.provider)) {
+    delivery = "failed";
+  } else {
+    let botToken: string;
+    try {
+      botToken = decryptString(bot.botTokenEnc);
+    } catch {
+      botToken = "";
+      delivery = "failed"; // definitive: an undecryptable token can never send
+    }
+    if (botToken) {
+      try {
+        const provider = getDestinationProvider(bot.provider);
+        const r = await provider.publishMessage({ botToken, chatId, text: trimmed });
+        if (r.ok) {
+          delivery = "sent";
+          providerMessageId = r.providerMessageId ?? null;
+        } else {
+          delivery = r.ambiguous ? "uncertain" : "failed";
+        }
+      } catch (err) {
+        // publishMessage resolves failures; a throw here is delivery-UNKNOWN.
+        delivery = "uncertain";
+        console.error("bot reply send failed:", err instanceof Error ? err.message : err);
+      }
+    } else {
+      console.error("bot reply send skipped: token undecryptable (botId redacted)");
+    }
+  }
+  // 3. Converge the row (never silently swallowed).
+  if (historyId) {
+    try {
+      await db.botHistory.update({
+        where: { id: historyId },
+        data: { deliveryStatus: delivery, providerMessageId },
+      });
+    } catch (err) {
+      console.error("bot reply delivery state write failed:", err instanceof Error ? err.message : err);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------
 // Walk the workflow
 // ---------------------------------------------------------------------
-export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowResult> {
+export async function executeWorkflow(ctx: WorkflowContext, resume?: WorkflowResumeContext): Promise<WorkflowResult> {
   if (!ctx.bot || !ctx.workflow) {
     return { ok: false, matched: false, outboundCount: 0, errorFa: "گردالشکار یا ربات نامعتبر است." };
   }
@@ -404,12 +688,46 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
   let hops = 0;
   const MAX_HOPS = def.steps.length * 2 + 4;
 
-  while (current && hops < MAX_HOPS) {
+  // V5 H-04 — durable per-step progress. `resume` (from the run's stored
+  // cursor) lets a retry skip every step that already completed on a
+  // previous attempt — including the exact condition branch taken — so
+  // recovery never re-sends already-delivered messages or re-performs
+  // side-effecting actions. New progress is recorded into `cursor`.
+  const cursor: WorkflowResumeCursor = {
+    completedNext: { ...(resume?.completedNext ?? {}) },
+    outboundHistory: { ...(resume?.outboundHistory ?? {}) },
+  };
+
+  // V5 H-04/C-01 — a message step whose send was DEFINITIVELY refused
+  // keeps the run retryable: the engine finishes the walk (preserving the
+  // previous continue-behavior) but reports ok:false so the durable run
+  // layer retries ONLY the failed step (its cursor entry is omitted while
+  // every completed sibling keeps theirs).
+  let hadDefiniteSendFailure = false;
+
+  // Memoized run-start resolution for the crash-recovery fallback channel
+  // (resolved at most once per execution, only when a tracked send needs it).
+  let runStartCache: Date | null | undefined;
+  const getRunStart = async (): Promise<Date | null> => {
+    if (runStartCache === undefined) runStartCache = await resolveRunStart(ctx);
+    return runStartCache;
+  };
+
+  try {
+    while (current && hops < MAX_HOPS) {
     hops++;
     if (visited.has(current.id)) break; // cycle guard
     visited.add(current.id);
 
     if (current.type === "end") break;
+
+    // V5 H-04 — resume fast-path: this step completed on a previous
+    // attempt; jump straight to its recorded successor.
+    const recordedNext = cursor.completedNext[current.id];
+    if (recordedNext !== undefined) {
+      current = stepMap.get(recordedNext);
+      continue;
+    }
 
     // START steps carry no behavior — advance to their next step. (The
     // previous engine fell through to the "unknown step type" break here,
@@ -417,29 +735,40 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
     // any action — a second total-disabling defect alongside the steps
     // shape mismatch fixed above.)
     if (current.type === "start") {
-      current = current.nextStepId ? stepMap.get(current.nextStepId) : undefined;
+      const next = current.nextStepId ? stepMap.get(current.nextStepId) : undefined;
+      if (next) cursor.completedNext[current.id] = next.id;
+      current = next;
       continue;
     }
 
     if (current.type === "message") {
       const text = current.text ?? "";
+      let stepSendFailedDefinitively = false;
       if (text) {
-        const r = await sendOutbound(ctx.bot, ctx.providerUserId, text);
+        // V5 H-04 — tracked send: durable pending row → provider call →
+        // terminal delivery state. A prior row (cursor or run-scoped
+        // fallback) decides between skip / converge / safe re-send.
+        const r = await sendOutboundTracked(ctx, linkedUser?.id ?? null, {
+          workflowId: ctx.workflow.id,
+          stepId: current.id,
+          text,
+          priorHistoryId: cursor.outboundHistory[current.id],
+        }, getRunStart);
         if (r.ok) {
           outboundCount++;
-          await persistOutbound(ctx, linkedUser?.id ?? null, text);
+          if (r.historyId) cursor.outboundHistory[current.id] = r.historyId;
         } else {
-          await audit({
-            userId: linkedUser?.id ?? null,
-            actor: "system",
-            action: "bot_workflow_send_failed",
-            targetType: "bot",
-            targetId: ctx.bot.id,
-            meta: { workflowId: ctx.workflow.id, stepId: current.id, errorFa: r.errorFa },
-          });
+          // DEFINITIVE refusal — the run becomes retryable (C-01). No
+          // cursor entry is written for THIS step, so a retry re-drives
+          // exactly it; steps that completed after it keep their entries
+          // and are cursor-skipped on the retry. Walk continues.
+          stepSendFailedDefinitively = true;
+          hadDefiniteSendFailure = true;
         }
       }
-      current = current.nextStepId ? stepMap.get(current.nextStepId) : undefined;
+      const next = current.nextStepId ? stepMap.get(current.nextStepId) : undefined;
+      if (!stepSendFailedDefinitively && next) cursor.completedNext[current.id] = next.id;
+      current = next;
       continue;
     }
 
@@ -452,7 +781,9 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
         linkedUserId: linkedUser?.id ?? null,
       });
       const nextId = matched ? c.thenStepId : c.elseStepId;
-      current = nextId ? stepMap.get(nextId) : undefined;
+      const next = nextId ? stepMap.get(nextId) : undefined;
+      if (next) cursor.completedNext[current.id] = next.id;
+      current = next;
       continue;
     }
 
@@ -468,10 +799,18 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
       );
       if (!entitlement.allowed) {
         if (entitlement.errorFa) {
-          const r = await sendOutbound(ctx.bot, ctx.providerUserId, entitlement.errorFa);
+          // V5 H-04 — the refusal reply is a tracked send attributed to the
+          // gated step. Its outcome never flips the run result: the gate
+          // refusal itself is the correct, terminal outcome here.
+          const r = await sendOutboundTracked(ctx, linkedUser?.id ?? null, {
+            workflowId: ctx.workflow.id,
+            stepId: current.id,
+            text: entitlement.errorFa,
+            priorHistoryId: cursor.outboundHistory[current.id],
+          }, getRunStart);
           if (r.ok) {
             outboundCount++;
-            await persistOutbound(ctx, linkedUser?.id ?? null, entitlement.errorFa);
+            if (r.historyId) cursor.outboundHistory[current.id] = r.historyId;
           }
         }
         break; // gated action refused — stop the walk (fail closed)
@@ -497,21 +836,57 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
         linkedUserId: linkedUser?.id ?? null,
       });
       if (actionResult.outboundText) {
-        const r = await sendOutbound(ctx.bot, ctx.providerUserId, actionResult.outboundText, actionResult.outboundButtons);
+        // V5 H-04 — action outbounds are tracked sends attributed to the
+        // action step. The ACTION itself already succeeded (ticket/payment/
+        // AI/notification are idempotency-guarded); a definitive refusal of
+        // its confirm-message is audited and recorded but does NOT flip the
+        // run result — re-running the whole action would be the riskier
+        // outcome (e.g. a duplicate ticket).
+        const r = await sendOutboundTracked(ctx, linkedUser?.id ?? null, {
+          workflowId: ctx.workflow.id,
+          stepId: current.id,
+          text: actionResult.outboundText,
+          buttons: actionResult.outboundButtons,
+          priorHistoryId: cursor.outboundHistory[current.id],
+        }, getRunStart);
         if (r.ok) {
           outboundCount++;
-          await persistOutbound(ctx, linkedUser?.id ?? null, actionResult.outboundText);
+          if (r.historyId) cursor.outboundHistory[current.id] = r.historyId;
         }
       }
-      current = a.nextStepId ? stepMap.get(a.nextStepId) : (current.nextStepId ? stepMap.get(current.nextStepId) : undefined);
+      const next = a.nextStepId ? stepMap.get(a.nextStepId) : (current.nextStepId ? stepMap.get(current.nextStepId) : undefined);
+      if (next) cursor.completedNext[current.id] = next.id;
+      current = next;
       continue;
     }
 
     // Unknown step type — break gracefully
     break;
   }
+  } catch (err) {
+    // V5 H-04 — a crash mid-walk must not discard durable progress: the
+    // cursor rides on the error so the run layer persists it and the
+    // retry resumes instead of re-sending delivered steps.
+    if (err instanceof Error) {
+      (err as Error & { workflowCursor?: WorkflowResumeCursor }).workflowCursor = cursor;
+    }
+    throw err;
+  }
 
-  return { ok: true, matched: true, outboundCount };
+  // V5 H-04/C-01 — a DEFINITIVE send failure makes the run retryable: the
+  // durable run layer persists the cursor and re-drives ONLY the failed
+  // step on the next attempt (already-delivered steps are cursor-skipped).
+  if (hadDefiniteSendFailure) {
+    return {
+      ok: false,
+      matched: true,
+      outboundCount,
+      errorFa: "ارسال یک یا چند پیام در گردش کار ناموفق بود.",
+      cursor,
+    };
+  }
+
+  return { ok: true, matched: true, outboundCount, cursor };
 }
 
 // ---------------------------------------------------------------------
@@ -769,7 +1144,19 @@ async function performAction(
       if (!prompt) {
         return { outboundText: "پرامپت خالی است." };
       }
-      const idemKey = `bot:ai:${args.ctx.bot.ownerId}:${args.ctx.bot.id}:${args.ctx.workflow.id}:${hashToken(prompt).slice(0, 32)}`;
+      // V5 H-08 — the idempotency key must cover EVERY model-shaping input:
+      // the previous key hashed only the prompt, so the same prompt with a
+      // different systemPrompt/provider/model collided on the UNIQUE
+      // AiJob.idempotencyKey and silently returned the FIRST variant's
+      // answer instead of invoking the reconfigured step.
+      const idemInput = JSON.stringify({
+        task: "custom",
+        prompt,
+        systemPrompt: systemPrompt ?? null,
+        provider: provider ?? null,
+        model: model ?? null,
+      });
+      const idemKey = `bot:ai:${args.ctx.bot.ownerId}:${args.ctx.bot.id}:${args.ctx.workflow.id}:${hashToken(idemInput).slice(0, 32)}`;
       try {
         // C-13/C-14: the AI invocation is charged to and gated by the BOT
         // OWNER's plan (the bot is the owner's automated asset consuming
@@ -934,7 +1321,7 @@ function parseButtons(raw: unknown): GlassButton[] | undefined {
 //   * per-kind action configuration validation;
 //   * button URLs/callbacks validated with the same policy as parseButtons.
 // ---------------------------------------------------------------------
-export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: string; def?: WorkflowDef } {
+export async function validateWorkflowDef(steps: unknown): Promise<{ ok: boolean; errorFa?: string; def?: WorkflowDef }> {
   if (!Array.isArray(steps)) return { ok: false, errorFa: "گام‌های گردش کار باید آرایه باشند." };
   if (steps.length === 0 || steps.length > 100) return { ok: false, errorFa: "تعداد گام‌ها باید بین ۱ و ۱۰۰ باشد." };
   const ids = new Set<string>();
@@ -1026,8 +1413,11 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
           if (btns !== undefined && !Array.isArray(btns)) {
             return { ok: false, errorFa: `دکمه‌های گام «${step.id}» باید آرایه باشند.` };
           }
-          if (Array.isArray(btns) && !buttonsAreSafe(btns)) {
-            return { ok: false, errorFa: `دکمه‌های گام «${step.id}» نشانی یا داده نامعتبر دارند.` };
+          if (Array.isArray(btns)) {
+            // V5 H-13 — save-time bounds (count + label length) that the
+            // runtime previously clamped silently.
+            const btnErr = buttonsAreSafe(btns, step.id);
+            if (btnErr) return { ok: false, errorFa: btnErr };
           }
           break;
         }
@@ -1051,8 +1441,9 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
           if (menuBtns !== undefined && !Array.isArray(menuBtns)) {
             return { ok: false, errorFa: `دکمه‌های گام «${step.id}» باید آرایه باشند.` };
           }
-          if (Array.isArray(menuBtns) && !buttonsAreSafe(menuBtns)) {
-            return { ok: false, errorFa: `دکمه‌های گام «${step.id}» نشانی یا داده نامعتبر دارند.` };
+          if (Array.isArray(menuBtns)) {
+            const menuBtnErr = buttonsAreSafe(menuBtns, step.id);
+            if (menuBtnErr) return { ok: false, errorFa: menuBtnErr };
           }
           break;
         }
@@ -1089,6 +1480,21 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
           if (!planCode) return { ok: false, errorFa: `کد طرح پرداخت در گام «${step.id}» الزامی است.` };
           if (planCode.length > 64) {
             return { ok: false, errorFa: `کد طرح پرداخت در گام «${step.id}» بیش از حد طولانی است.` };
+          }
+          if (/[\u0000-\u001f\u007f]/.test(planCode)) {
+            return { ok: false, errorFa: `کد طرح پرداخت در گام «${step.id}» شامل نویسه کنترلی است.` };
+          }
+          // V5 H-13 — save-time existence/visibility check: the workflow
+          // editor must not be able to persist a payment step pointing at
+          // an unknown, inactive or hidden (non-public) plan. The runtime
+          // execution re-checks against the CURRENT plan state — this
+          // validation only keeps obviously-broken definitions out of the DB.
+          const plan = await db.plan.findUnique({
+            where: { code: planCode },
+            select: { active: true, isPublic: true },
+          });
+          if (!plan || !plan.active || !plan.isPublic) {
+            return { ok: false, errorFa: `کد طرح پرداخت در گام «${step.id}» به طرحی فعال و عمومی اشاره ندارد.` };
           }
           break;
         }
@@ -1141,7 +1547,17 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
         }
         case "show_order":
         case "send_content": {
-          // Config validated at runtime against ownership; nothing structural.
+          // V5 H-13 — structural bounds for the referenced id: bounded to
+          // 64 chars with no control characters (the runtime checks
+          // existence and OWNERSHIP; this keeps malformed ids out of the DB).
+          const idField = step.action.kind === "show_order" ? cfg.orderId : cfg.contentId;
+          if (idField !== undefined) {
+            const v = String(idField);
+            if (!v || v.length > 64 || /[\u0000-\u001f\u007f]/.test(v)) {
+              const label = step.action.kind === "show_order" ? "شناسه سفارش" : "شناسه محتوا";
+              return { ok: false, errorFa: `${label} در گام «${step.id}» نامعتبر است (حداکثر ۶۴ نویسه، بدون نویسه کنترلی).` };
+            }
+          }
           break;
         }
         default:
@@ -1183,17 +1599,42 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
   return { ok: true, def: { steps: steps as WorkflowStep[] } };
 }
 
-/** Validate button config arrays against the P1.2 URL/callback policy. */
-function buttonsAreSafe(raw: unknown[]): boolean {
-  for (const r of raw) {
-    if (!r || typeof r !== "object") return false;
-    const o = r as Record<string, unknown>;
-    if (o.url !== undefined && o.url !== null && safeButtonUrl(o.url) === undefined) return false;
-    const cb = o.callbackData ?? o.callback_data;
-    if (cb !== undefined && cb !== null && safeCallbackData(cb) === undefined) return false;
-    if ((o.url === undefined || o.url === null) && (cb === undefined || cb === null)) return false;
+/**
+ * V5 H-13 — validate button config arrays against the P1.2 URL/callback
+ * policy PLUS save-time bounds that the runtime previously clamped
+ * silently: at most BUTTON_MAX_COUNT buttons and labels that stay within
+ * BUTTON_LABEL_MAX after the same cleaning the runtime applies.
+ * Returns null when safe, otherwise a bounded Persian error message.
+ */
+function buttonsAreSafe(raw: unknown[], stepId: string): string | null {
+  if (raw.length > BUTTON_MAX_COUNT) {
+    return `دکمه‌های گام «${stepId}» بیش از ${toPersianDigits(BUTTON_MAX_COUNT)} دکمه دارد.`;
   }
-  return true;
+  for (const r of raw) {
+    if (!r || typeof r !== "object") return `دکمه‌های گام «${stepId}» نشانی یا داده نامعتبر دارند.`;
+    const o = r as Record<string, unknown>;
+    if (o.url !== undefined && o.url !== null && safeButtonUrl(o.url) === undefined) {
+      return `دکمه‌های گام «${stepId}» نشانی یا داده نامعتبر دارند.`;
+    }
+    const cb = o.callbackData ?? o.callback_data;
+    if (cb !== undefined && cb !== null && safeCallbackData(cb) === undefined) {
+      return `دکمه‌های گام «${stepId}» نشانی یا داده نامعتبر دارند.`;
+    }
+    if ((o.url === undefined || o.url === null) && (cb === undefined || cb === null)) {
+      return `دکمه‌های گام «${stepId}» نشانی یا داده نامعتبر دارند.`;
+    }
+    // Label bound — measured AFTER the same control-character cleaning the
+    // runtime applies (safeButtonLabel), so the check mirrors what would
+    // actually reach the provider instead of clamping silently.
+    const rawLabel = o.label ?? o.text;
+    if (rawLabel !== undefined && rawLabel !== null) {
+      const cleaned = String(rawLabel).replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+      if (cleaned.length > BUTTON_LABEL_MAX) {
+        return `برچسب دکمه در گام «${stepId}» بیش از ${toPersianDigits(BUTTON_LABEL_MAX)} نویسه است.`;
+      }
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------

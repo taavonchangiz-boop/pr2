@@ -24,15 +24,17 @@ import {
   verifyWebhookSig,
   computeWebhookBodySignature,
 } from "@/lib/bots/register-webhook";
-import { executeWorkflow, processBaleUpdate, persistInboundOnce } from "@/lib/bots/workflow";
+import { executeWorkflow, processBaleUpdate, persistInboundOnce, sendTrackedBotReply } from "@/lib/bots/workflow";
+import { isBalePaymentUpdate } from "@/lib/bots/inbound-classify";
 import {
   ensureBotEvent,
-  claimBotEvent,
-  completeBotEvent,
+  claimBotEventForOwner,
+  finalizeBotEvent,
   failBotEvent,
   recoverBotEvents,
   runMatchedWorkflowsForEvent,
 } from "@/lib/bots/event-dedup";
+import type { WorkflowResumeContext } from "@/lib/bots/event-dedup";
 import { audit } from "@/lib/server/auth";
 import type { Bot, BotWorkflow } from "@prisma/client";
 import { webhookRequestGuard, readBoundedWebhookBody } from "@/lib/bots/webhook-guard";
@@ -121,27 +123,41 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, errorFa: "بدنه وب‌هوک نامعتبر است." }, { status: 400 });
   }
 
-  // P0.11 ROOT-CAUSE FIX — payment-bearing updates are durably idempotent
-  // in processBaleUpdate itself (BalePaymentRef.chargeId CAS + healing
-  // upserts + hard amount/secret checks) and MUST run on every delivery;
-  // their event row is recorded for observability, but financial
-  // correctness stays owned by BalePaymentRef (no claim, no skip).
+  // P0.11 + V5 C-02 — payment-bearing updates are durably idempotent in
+  // processBaleUpdate itself (BalePaymentRef.chargeId CAS + healing
+  // upserts + hard amount/secret checks) AND take the SAME durable
+  // claim → finalize path as every other update. The previous live path
+  // called completeBotEvent on a `received` row (a no-op — completion
+  // only matched `processing`), so the event stayed `received` forever
+  // and the recovery scan later re-processed the PAYMENT payload through
+  // the NON-payment handler (message-kind workflows fired on payments
+  // and payment-handler failures were masked at the event layer).
   // Non-payment updates take the durable BotInboundEvent claim path:
-  // UNIQUE collapses duplicates, the lease + recovery pass make a crash
-  // after claim RETRYABLE instead of lost (the old volatile claim was
-  // at-most-once and permanently suppressed the provider's retry).
+  // UNIQUE collapses duplicates, the fenced lease + recovery pass make
+  // a crash after claim RETRYABLE instead of lost.
   const updateId = update.update_id;
-  const isPaymentUpdate = !!(update.pre_checkout_query || update.message?.successful_payment);
+  const isPaymentUpdate = isBalePaymentUpdate(update);
   const event = await ensureBotEvent(bot, "bale", String(updateId), update);
 
   if (isPaymentUpdate) {
+    const holder = await claimBotEventForOwner(event.id);
+    if (!holder) {
+      // Another worker owns this event (live lease) — the provider's
+      // redelivery/recovery owns the outcome; never double-process.
+      return NextResponse.json({ ok: true, payment: true, duplicate: true });
+    }
     try {
       await processBaleUpdate(bot, update);
-      await completeBotEvent(event.id);
+      // V5 C-02 — the durable event layer decides completion.
+      const done = await finalizeBotEvent(event.id, holder);
+      if (!done) {
+        await failBotEvent(event.id, "تکمیل رویداد پرداخت ممکن نشد؛ برای بازیابی مجدد علامت خورد.", holder);
+      }
     } catch (err) {
       await failBotEvent(
         event.id,
         err instanceof Error ? `${err.name}: ${err.message}` : "خطای پردازش پرداخت.",
+        holder,
       );
       await audit({
         userId: bot.ownerId,
@@ -156,27 +172,57 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: true, payment: true });
   }
 
-  const claimed = await claimBotEvent(event.id);
-  if (!claimed) {
+  const holder = await claimBotEventForOwner(event.id);
+  if (!holder) {
     return NextResponse.json({ ok: true, duplicate: true });
   }
   try {
     await processBaleNonPaymentUpdate(bot, update, {
       isRetry: event.attempts > 1,
       eventId: event.id,
+      holder,
     });
-    await completeBotEvent(event.id);
+    const done = await finalizeBotEvent(event.id, holder);
+    if (!done) {
+      await failBotEvent(event.id, "تکمیل رویداد ممکن نبود: یک یا چند گردش کار هنوز کامل نشده است.", holder);
+    }
   } catch (err) {
     await failBotEvent(
       event.id,
       err instanceof Error ? `${err.name}: ${err.message}` : "خطای پردازش رویداد.",
+      holder,
     );
   }
 
-  // Bounded crash-recovery pass for this bot (C-04/H-03).
-  await recoverBotEvents(bot, (b, payload, o) => processBaleNonPaymentUpdate(b, payload as BaleUpdate, o));
+  // Bounded crash-recovery pass for this bot (C-04/H-03). The recovery
+  // processor is PAYMENT-AWARE: a stored payment payload (e.g. a legacy
+  // `received` row) is routed to the dedicated payment handler, never
+  // through the non-payment workflow dispatcher (V5 C-02 Hole 2).
+  await recoverBotEvents(bot, (b, payload, o) =>
+    processBaleRecoveryUpdate(b, payload as BaleUpdate, o),
+  );
 
   return NextResponse.json({ ok: true });
+}
+
+/**
+ * V5 C-02 (Hole 2) — recovery router: payment payloads go to the
+ * durable payment handler (BalePaymentRef-owned, idempotent), everything
+ * else to the non-payment workflow dispatcher.
+ */
+function processBaleRecoveryUpdate(
+  bot: Bot,
+  update: BaleUpdate,
+  opts: { isRetry: boolean; eventId: string; holder: string },
+): Promise<void> {
+  if (isBalePaymentUpdate(update)) {
+    // processBaleUpdate reports {handled, reason} — the recovery router
+    // only forwards; the durable event layer decides the outcome.
+    return (async () => {
+      await processBaleUpdate(bot, update);
+    })();
+  }
+  return processBaleNonPaymentUpdate(bot, update, opts);
 }
 
 /**
@@ -188,7 +234,7 @@ export async function POST(req: Request) {
 async function processBaleNonPaymentUpdate(
   bot: Bot,
   update: BaleUpdate,
-  opts: { isRetry: boolean; eventId: string },
+  opts: { isRetry: boolean; eventId: string; holder?: string },
 ): Promise<void> {
   // Extract chat id + text
   let chatId = "";
@@ -226,22 +272,9 @@ async function processBaleNonPaymentUpdate(
     } else {
       reply = result.errorFa ?? "اتصال ناموفق بود.";
     }
-    const { getDestinationProvider } = await import("@/lib/providers");
-    const { decryptString } = await import("@/lib/security/crypto");
-    try {
-      const token = decryptString(bot.botTokenEnc);
-      const provider = getDestinationProvider("bale");
-      await provider.publishMessage({ botToken: token, chatId, text: reply });
-      await db.botHistory.create({
-        data: {
-          botId: bot.id,
-          direction: "outbound",
-          providerUserId: chatId,
-          userId: result.userId ?? null,
-          text: reply.slice(0, 4000),
-        },
-      });
-    } catch { /* best-effort */ }
+    // V5 H-04 — tracked reply: durable pending row BEFORE the send,
+    // converged to sent/failed/uncertain afterwards; no swallowed writes.
+    await sendTrackedBotReply(bot, chatId, reply, result.userId ?? null);
     return;
   }
 
@@ -260,7 +293,7 @@ async function processBaleNonPaymentUpdate(
     .filter((wf) => matchesTrigger(wf, incomingText))
     .map((wf) => ({
       workflowId: wf.id,
-      execute: async () => {
+      execute: async (resume: WorkflowResumeContext) => {
         const r = await executeWorkflow({
           bot,
           providerUserId: chatId,
@@ -269,11 +302,11 @@ async function processBaleNonPaymentUpdate(
           callbackQueryId,
           updateId: update.update_id,
           workflow: wf,
-        });
-        return { ok: r.ok, errorFa: r.errorFa };
+        }, resume);
+        return { ok: r.ok, errorFa: r.errorFa, cursor: r.cursor };
       },
     }));
-  await runMatchedWorkflowsForEvent(opts.eventId, jobs);
+  await runMatchedWorkflowsForEvent(opts.eventId, jobs, { eventHolder: opts.holder });
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {

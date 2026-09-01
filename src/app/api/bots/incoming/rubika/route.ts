@@ -24,13 +24,14 @@ import { requireCronSecret } from "@/lib/server/cron-secret";
 import { audit } from "@/lib/server/auth";
 import {
   ensureBotEvent,
-  claimBotEvent,
-  completeBotEvent,
+  claimBotEventForOwner,
+  finalizeBotEvent,
   failBotEvent,
   recoverBotEvents,
   runMatchedWorkflowsForEvent,
 } from "@/lib/bots/event-dedup";
-import { executeWorkflow, persistInboundOnce } from "@/lib/bots/workflow";
+import type { WorkflowResumeContext } from "@/lib/bots/event-dedup";
+import { executeWorkflow, persistInboundOnce, sendTrackedBotReply } from "@/lib/bots/workflow";
 import type { Bot, BotWorkflow } from "@prisma/client";
 
 const PollSchema = z.object({
@@ -144,18 +145,24 @@ export async function POST(req: Request) {
       // a crash after the claim is retryable via lease takeover and the
       // bounded recovery pass instead of lost forever.
       const event = await ensureBotEvent(bot, "rubika", String(uid), update);
-      const claimed = await claimBotEvent(event.id);
-      if (!claimed) continue;
+      const holder = await claimBotEventForOwner(event.id);
+      if (!holder) continue;
       try {
         await processRubikaUpdate(bot, update, {
           isRetry: event.attempts > 1,
           eventId: event.id,
+          holder,
         });
-        await completeBotEvent(event.id);
+        // V5 C-02 — the durable event layer decides completion.
+        const done = await finalizeBotEvent(event.id, holder);
+        if (!done) {
+          await failBotEvent(event.id, "تکمیل رویداد ممکن نبود: یک یا چند گردش کار هنوز کامل نشده است.", holder);
+        }
       } catch (err) {
         await failBotEvent(
           event.id,
           err instanceof Error ? `${err.name}: ${err.message}` : "خطای پردازش رویداد.",
+          holder,
         );
       }
     } else {
@@ -194,7 +201,7 @@ export async function POST(req: Request) {
 async function processRubikaUpdate(
   bot: Bot,
   update: RubikaUpdate,
-  opts: { isRetry: boolean; eventId: string | null },
+  opts: { isRetry: boolean; eventId: string | null; holder?: string },
 ): Promise<void> {
   const uid = typeof update.update_id === "number" ? update.update_id :
     typeof update.update_id === "string" ? Number(update.update_id) : 0;
@@ -232,20 +239,9 @@ async function processRubikaUpdate(
     const reply = result.ok
       ? "حساب پُست‌یار شما با موفقیت به این ربات متصل شد."
       : (result.errorFa ?? "اتصال ناموفق بود.");
-    try {
-      const { getDestinationProvider } = await import("@/lib/providers");
-      const provider = getDestinationProvider("rubika");
-      await provider.publishMessage({ botToken: decryptString(bot.botTokenEnc), chatId, text: reply });
-      await db.botHistory.create({
-        data: {
-          botId: bot.id,
-          direction: "outbound",
-          providerUserId: chatId,
-          userId: result.userId ?? null,
-          text: reply.slice(0, 4000),
-        },
-      });
-    } catch { /* best-effort */ }
+    // V5 H-04 — tracked reply: durable pending row BEFORE the send,
+    // converged to sent/failed/uncertain afterwards; no swallowed writes.
+    await sendTrackedBotReply(bot, chatId, reply, result.userId ?? null);
     return;
   }
 
@@ -263,7 +259,7 @@ async function processRubikaUpdate(
     // No dedup key: run directly (previous semantics, never collapsed).
     for (const wf of matched) {
       try {
-        await executeWorkflow({
+        const r = await executeWorkflow({
           bot,
           providerUserId: chatId,
           rawUpdate: update,
@@ -273,6 +269,18 @@ async function processRubikaUpdate(
           providerMessageId,
           workflow: wf,
         });
+        // V5 C-01 — the typed outcome must never be dropped: an
+        // ok:false here is a genuine engine failure, not a silent no-op.
+        if (!r.ok) {
+          await audit({
+            userId: bot.ownerId,
+            actor: "system",
+            action: "bot_workflow_execute_failed",
+            targetType: "bot",
+            targetId: bot.id,
+            meta: { workflowId: wf.id, errorFa: r.errorFa ?? "نامشخص", unkeyed: true },
+          });
+        }
       } catch (err) {
         await audit({
           userId: bot.ownerId,
@@ -288,7 +296,7 @@ async function processRubikaUpdate(
   }
   const jobs = matched.map((wf) => ({
     workflowId: wf.id,
-    execute: async () => {
+    execute: async (resume: WorkflowResumeContext) => {
       const r = await executeWorkflow({
         bot,
         providerUserId: chatId,
@@ -298,11 +306,11 @@ async function processRubikaUpdate(
         updateId: uid,
         providerMessageId,
         workflow: wf,
-      });
-      return { ok: r.ok, errorFa: r.errorFa };
+      }, resume);
+      return { ok: r.ok, errorFa: r.errorFa, cursor: r.cursor };
     },
   }));
-  await runMatchedWorkflowsForEvent(opts.eventId, jobs);
+  await runMatchedWorkflowsForEvent(opts.eventId, jobs, { eventHolder: opts.holder });
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {

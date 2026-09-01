@@ -68,7 +68,29 @@ export async function POST(req: Request, { params }: Params) {
     // Idempotent: already rejected → update reason if provided, return ok.
     const alreadyRejected = order.status === "rejected";
 
-    // Persist rejection details in the order metadata JSON.
+    // ROOT-CAUSE FIX (audit TOCTOU): the paid-check above is a plain read;
+    // an approve completing between that read and this write used to flip a
+    // fully-fulfilled order to rejected. The conditional update re-checks
+    // atomically and refuses to touch paid orders.
+    //
+    // V5 ordering fix — the CAS status write happens FIRST. The previous
+    // order wrote the rejection metadata BEFORE the CAS, so a lost race
+    // (the CAS returning count === 0 because the order had just been paid)
+    // left a rejection note appended to a now-PAID order's metadata. Now
+    // metadata/audit are written ONLY after a won CAS.
+    const rejected = await db.order.updateMany({
+      where: { id: order.id, status: { not: "paid" } },
+      data: { status: "rejected" },
+    });
+    if (rejected.count === 0) {
+      return NextResponse.json(
+        { errorFa: "سفارش قبلاً پرداخت شده و قابل رد نیست." },
+        { status: 400 },
+      );
+    }
+
+    // Persist rejection details in the order metadata JSON (CAS won — the
+    // order is now `rejected`, never `paid`).
     const existingMeta = safeJsonParse<Record<string, unknown>>(order.metadata, {});
     const rejection = {
       at: new Date().toISOString(),
@@ -90,21 +112,6 @@ export async function POST(req: Request, { params }: Params) {
         metadata: JSON.stringify(nextMeta),
       },
     });
-
-    // ROOT-CAUSE FIX (audit TOCTOU): the paid-check above is a plain read;
-    // an approve completing between that read and this write used to flip a
-    // fully-fulfilled order to rejected. The conditional update re-checks
-    // atomically and refuses to touch paid orders.
-    const rejected = await db.order.updateMany({
-      where: { id: order.id, status: { not: "paid" } },
-      data: { status: "rejected" },
-    });
-    if (rejected.count === 0) {
-      return NextResponse.json(
-        { errorFa: "سفارش قبلاً پرداخت شده و قابل رد نیست." },
-        { status: 400 },
-      );
-    }
 
     // Mark the card receipt rejected, if present.
     if (order.cardReceipt) {

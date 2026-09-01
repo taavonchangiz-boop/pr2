@@ -47,6 +47,49 @@ describe("publishing state machine: valid transitions", () => {
   });
 });
 
+// =====================================================================
+// V5 H-16 — `partial` outcome (mixed delivery truth). Strengthened in
+// Task 9-c: partial is a real content status with its own edges.
+// =====================================================================
+describe("publishing state machine: partial outcome (V5 H-16)", () => {
+  test("processing → partial", () => {
+    expect(() => assertTransition("processing", "partial")).not.toThrow();
+  });
+  test("partial → queued (retry path)", () => {
+    expect(() => assertTransition("partial", "queued")).not.toThrow();
+  });
+  test("partial → cancelled", () => {
+    expect(() => assertTransition("partial", "cancelled")).not.toThrow();
+  });
+  test("delivered → partial is rejected", () => {
+    expect(() => assertTransition("delivered", "partial")).toThrow(InvalidTransition);
+  });
+  test("cancelled → partial is rejected", () => {
+    expect(() => assertTransition("cancelled", "partial")).toThrow(InvalidTransition);
+  });
+  test("partial → delivered is rejected (must go through queued → processing)", () => {
+    expect(() => assertTransition("partial", "delivered")).toThrow(InvalidTransition);
+  });
+  test("partial → failed is rejected (partial already encodes the mixed truth)", () => {
+    expect(() => assertTransition("partial", "failed")).toThrow(InvalidTransition);
+  });
+  test("partial → scheduled is rejected (same as failed)", () => {
+    expect(() => assertTransition("partial", "scheduled")).toThrow(InvalidTransition);
+  });
+  test("partial → processing is rejected (must go through queued)", () => {
+    expect(() => assertTransition("partial", "processing")).toThrow(InvalidTransition);
+  });
+  test("nextStates(partial) = [queued, cancelled]", () => {
+    expect(nextStates("partial")).toEqual(["queued", "cancelled"]);
+  });
+  test("partial is NOT terminal (re-schedulable like failed)", () => {
+    expect(isTerminal("partial")).toBe(false);
+  });
+  test("isContentStatus accepts partial", () => {
+    expect(isContentStatus("partial")).toBe(true);
+  });
+});
+
 describe("publishing state machine: INVALID transitions (rejected)", () => {
   const invalidCases: Array<[string, string]> = [
     ["delivered", "processing"],   // cannot re-publish delivered

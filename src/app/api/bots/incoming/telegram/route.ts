@@ -30,13 +30,14 @@ import {
 import { webhookRequestGuard, readBoundedWebhookBody } from "@/lib/bots/webhook-guard";
 import {
   ensureBotEvent,
-  claimBotEvent,
-  completeBotEvent,
+  claimBotEventForOwner,
+  finalizeBotEvent,
   failBotEvent,
   recoverBotEvents,
   runMatchedWorkflowsForEvent,
 } from "@/lib/bots/event-dedup";
-import { executeWorkflow, persistInboundOnce } from "@/lib/bots/workflow";
+import type { WorkflowResumeContext } from "@/lib/bots/event-dedup";
+import { executeWorkflow, persistInboundOnce, sendTrackedBotReply } from "@/lib/bots/workflow";
 import { audit } from "@/lib/server/auth";
 import type { Bot, BotWorkflow } from "@prisma/client";
 
@@ -139,19 +140,25 @@ export async function POST(req: Request) {
   // completed events never execute again.
   const updateId = update.update_id;
   const event = await ensureBotEvent(bot, "telegram", String(updateId), update);
-  const claimed = await claimBotEvent(event.id);
-  if (!claimed) {
+  const holder = await claimBotEventForOwner(event.id);
+  if (!holder) {
     // Completed/owned elsewhere/stale-unclaimed — ack 200 so Telegram
     // doesn't retry; the durable inbox owns any retry.
     return NextResponse.json({ ok: true, duplicate: true });
   }
   try {
-    await processTelegramUpdate(bot, update, { isRetry: event.attempts > 1, eventId: event.id });
-    await completeBotEvent(event.id);
+    await processTelegramUpdate(bot, update, { isRetry: event.attempts > 1, eventId: event.id, holder });
+    // V5 C-02 — the durable event layer decides completion (all children
+    // terminal-success), never this handler's return.
+    const done = await finalizeBotEvent(event.id, holder);
+    if (!done) {
+      await failBotEvent(event.id, "تکمیل رویداد ممکن نبود: یک یا چند گردش کار هنوز کامل نشده است.", holder);
+    }
   } catch (err) {
     await failBotEvent(
       event.id,
       err instanceof Error ? `${err.name}: ${err.message}` : "خطای پردازش رویداد.",
+      holder,
     );
     // Still ack 200 — the durable inbox retries (provider redelivery or
     // the bounded recovery pass); a 500 would only add unbounded retries.
@@ -174,7 +181,7 @@ export async function POST(req: Request) {
 async function processTelegramUpdate(
   bot: Bot,
   update: TgUpdate,
-  opts: { isRetry: boolean; eventId: string },
+  opts: { isRetry: boolean; eventId: string; holder?: string },
 ): Promise<void> {
   // Extract chat id + incoming text
   let chatId = "";
@@ -216,24 +223,11 @@ async function processTelegramUpdate(
     } else {
       reply = result.errorFa ?? "اتصال ناموفق بود.";
     }
-    // Send the reply via the destination provider's publishMessage.
-    const { getDestinationProvider } = await import("@/lib/providers");
-    const { decryptString } = await import("@/lib/security/crypto");
-    try {
-      const token = decryptString(bot.botTokenEnc);
-      const provider = getDestinationProvider("telegram");
-      await provider.publishMessage({ botToken: token, chatId, text: reply });
-      // Persist outbound
-      await db.botHistory.create({
-        data: {
-          botId: bot.id,
-          direction: "outbound",
-          providerUserId: chatId,
-          userId: result.userId ?? null,
-          text: reply.slice(0, 4000),
-        },
-      });
-    } catch { /* best-effort */ }
+    // V5 H-04 — the reply send is tracked: a durable pending BotHistory row
+    // is written BEFORE the provider call and converged to
+    // sent/failed/uncertain (+ providerMessageId) afterwards. The history
+    // write is never swallowed by a bare `catch {}`.
+    await sendTrackedBotReply(bot, chatId, reply, result.userId ?? null);
     return;
   }
 
@@ -254,7 +248,7 @@ async function processTelegramUpdate(
     .filter((wf) => matchesTrigger(wf, incomingText))
     .map((wf) => ({
       workflowId: wf.id,
-      execute: async () => {
+      execute: async (resume: WorkflowResumeContext) => {
         const r = await executeWorkflow({
           bot,
           providerUserId: chatId,
@@ -263,11 +257,11 @@ async function processTelegramUpdate(
           callbackQueryId,
           updateId: update.update_id,
           workflow: wf,
-        });
-        return { ok: r.ok, errorFa: r.errorFa };
+        }, resume);
+        return { ok: r.ok, errorFa: r.errorFa, cursor: r.cursor };
       },
     }));
-  await runMatchedWorkflowsForEvent(opts.eventId, jobs);
+  await runMatchedWorkflowsForEvent(opts.eventId, jobs, { eventHolder: opts.holder });
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {

@@ -157,7 +157,12 @@ export async function POST(req: Request) {
         const { runWorkerOnce } = await import("@/lib/queue/worker");
         // Fire-and-forget — we don't block the response (the cron worker is
         // the durable fallback; this only accelerates first delivery).
-        void runWorkerOnce(5);
+        // V5 H-16: the rejection MUST be caught — the try/catch above only
+        // guards the dynamic import, so a DB error inside runWorkerOnce
+        // would otherwise surface as an unhandled rejection.
+        runWorkerOnce(5).catch((err: unknown) =>
+          console.error("publish worker kick failed:", err instanceof Error ? err.message : err),
+        );
       } catch { /* ignore — cron will pick it up */ }
     }
 

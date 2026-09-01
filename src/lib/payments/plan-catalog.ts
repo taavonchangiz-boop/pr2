@@ -328,6 +328,46 @@ export function findImpossibleFeatureCombinations(
   return out;
 }
 
+/**
+ * V5 M-02 — MERGED combination check: the impossible-pair rule must also
+ * consider the LEGACY `Plan.quota` JSON, which the admin plan routes
+ * accept as a SEPARATE write surface from `features`. A plan patch like
+ * `{ features: { publish: true }, quota: { publishPerMonth: 0 } }` (or the
+ * reverse: features-only patch against an existing quota of 0) used to
+ * slip past the features-only check and produce a capability toggled ON
+ * whose effective quota is 0 — the gating engine could never use it.
+ *
+ * `quota` may be anything the caller has already validated through
+ * {@link parsePlanQuota} (a plain object of numbers) or a raw
+ * legacy/stored JSON object. Only finite numeric values for the PAIRED
+ * keys override the features map for the check (strings are defensively
+ * accepted via Number()); non-finite/unknown values never override.
+ * Returns the same human-readable offending-pair list as
+ * {@link findImpossibleFeatureCombinations} (empty = consistent).
+ */
+export function validatePlanQuotaFeatureConsistency(
+  features: Record<string, unknown>,
+  quota: PlanQuota | Record<string, unknown> | null | undefined,
+): string[] {
+  const merged: Record<string, unknown> = { ...features };
+  const q = (quota ?? {}) as Record<string, unknown>;
+  if (q && typeof q === "object") {
+    for (const pair of BOOLEAN_FEATURE_QUOTA_PAIRS) {
+      if (!(pair.quotaKey in q)) continue;
+      const v = q[pair.quotaKey];
+      let n: number | null = null;
+      if (typeof v === "number" && Number.isFinite(v)) n = v;
+      else if (typeof v === "string" && v.trim() !== "") {
+        const parsed = Number(v);
+        if (Number.isFinite(parsed)) n = parsed;
+      }
+      if (n === null) continue;
+      merged[pair.quotaKey] = n < 0 ? UNLIMITED_QUOTA : Math.max(0, Math.floor(n));
+    }
+  }
+  return findImpossibleFeatureCombinations(merged);
+}
+
 /** Parse + validate a raw features JSON string into a PlanFeatures object.
  *  Numeric values accept the UNLIMITED_QUOTA (-1) sentinel; anything else
  *  is floored at 0 (disabled). */

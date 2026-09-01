@@ -3,6 +3,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireUser, clientIp, AuthError } from "@/lib/server/auth";
+import { requirePlanFeature } from "@/lib/payments/plans";
 import { createTicket, listMyTickets, type TicketCategory, type TicketPriority } from "@/lib/tickets";
 
 const CreateSchema = z.object({
@@ -34,6 +35,15 @@ export async function POST(req: Request) {
   let user;
   try { user = await requireUser(); } catch (e) {
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
+  }
+  // V5 H-12 — uniformity gate: the create_ticket workflow action requires
+  // the `tickets` plan feature, but this UI/API boundary did not. Every
+  // privileged action boundary must call the capability check (P0.15).
+  try {
+    await requirePlanFeature(user.id, "tickets");
+  } catch (e) {
+    const err = e as AuthError;
+    return NextResponse.json({ errorFa: err.message }, { status: err.status });
   }
   const ip = clientIp(req);
   let body: unknown;

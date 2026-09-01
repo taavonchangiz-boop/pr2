@@ -24,22 +24,22 @@ function baseSteps(): WorkflowStep[] {
 }
 
 describe("workflow graph validation (P1.1)", () => {
-  test("a valid linear workflow passes", () => {
+  test("a valid linear workflow passes", async () => {
     const steps = baseSteps();
     steps[0]!.nextStepId = "m1";
     steps[1]!.nextStepId = "end1";
-    const r = validateWorkflowDef(steps);
+    const r = await validateWorkflowDef(steps);
     expect(r.ok).toBe(true);
     expect(r.def?.steps.length).toBe(3);
   });
 
-  test("dangling nextStepId is rejected", () => {
+  test("dangling nextStepId is rejected", async () => {
     const steps = baseSteps();
     steps[0]!.nextStepId = "does-not-exist";
-    expect(validateWorkflowDef(steps).ok).toBe(false);
+    expect((await validateWorkflowDef(steps)).ok).toBe(false);
   });
 
-  test("dangling condition branch targets are rejected", () => {
+  test("dangling condition branch targets are rejected", async () => {
     const steps: WorkflowStep[] = [
       { id: "s1", type: "start" },
       {
@@ -49,7 +49,7 @@ describe("workflow graph validation (P1.1)", () => {
       },
       { id: "end1", type: "end" },
     ];
-    expect(validateWorkflowDef(steps).ok).toBe(false);
+    expect((await validateWorkflowDef(steps)).ok).toBe(false);
 
     const steps2: WorkflowStep[] = [
       { id: "s1", type: "start" },
@@ -60,10 +60,10 @@ describe("workflow graph validation (P1.1)", () => {
       },
       { id: "end1", type: "end" },
     ];
-    expect(validateWorkflowDef(steps2).ok).toBe(false);
+    expect((await validateWorkflowDef(steps2)).ok).toBe(false);
   });
 
-  test("valid condition branches pass", () => {
+  test("valid condition branches pass", async () => {
     const steps: WorkflowStep[] = [
       { id: "s1", type: "start" },
       {
@@ -74,58 +74,58 @@ describe("workflow graph validation (P1.1)", () => {
       { id: "m1", type: "message", text: "معرفی کنید!" },
       { id: "end1", type: "end" },
     ];
-    expect(validateWorkflowDef(steps).ok).toBe(true);
+    expect((await validateWorkflowDef(steps)).ok).toBe(true);
   });
 
-  test("missing start is rejected; multiple starts are rejected", () => {
+  test("missing start is rejected; multiple starts are rejected", async () => {
     const noStart: WorkflowStep[] = [
       { id: "m1", type: "message", text: "سلام" },
     ];
-    expect(validateWorkflowDef(noStart).ok).toBe(false);
+    expect((await validateWorkflowDef(noStart)).ok).toBe(false);
 
     const twoStarts: WorkflowStep[] = [
       { id: "s1", type: "start" },
       { id: "s2", type: "start" },
     ];
-    expect(validateWorkflowDef(twoStarts).ok).toBe(false);
+    expect((await validateWorkflowDef(twoStarts)).ok).toBe(false);
   });
 
-  test("cycles are rejected at validation time", () => {
+  test("cycles are rejected at validation time", async () => {
     const steps: WorkflowStep[] = [
       { id: "s1", type: "start", nextStepId: "m1" },
       { id: "m1", type: "message", text: "سلام", nextStepId: "a1" },
       { id: "a1", type: "action", action: { kind: "send_message", config: { text: "x" }, nextStepId: "m1" } },
     ];
-    const r = validateWorkflowDef(steps);
+    const r = await validateWorkflowDef(steps);
     expect(r.ok).toBe(false);
     expect(r.errorFa).toContain("حلقه");
   });
 
-  test("dangling action nextStepId is rejected", () => {
+  test("dangling action nextStepId is rejected", async () => {
     const steps: WorkflowStep[] = [
       { id: "s1", type: "start", nextStepId: "a1" },
       { id: "a1", type: "action", action: { kind: "send_message", config: { text: "سلام" }, nextStepId: "ghost" } },
     ];
-    expect(validateWorkflowDef(steps).ok).toBe(false);
+    expect((await validateWorkflowDef(steps)).ok).toBe(false);
   });
 
-  test("per-kind action config: send_message without text rejected", () => {
+  test("per-kind action config: send_message without text rejected", async () => {
     const steps: WorkflowStep[] = [
       { id: "s1", type: "start", nextStepId: "a1" },
       { id: "a1", type: "action", action: { kind: "send_message", config: { text: "  " } } },
     ];
-    expect(validateWorkflowDef(steps).ok).toBe(false);
+    expect((await validateWorkflowDef(steps)).ok).toBe(false);
   });
 
-  test("per-kind action config: initiate_payment without planCode rejected", () => {
+  test("per-kind action config: initiate_payment without planCode rejected", async () => {
     const steps: WorkflowStep[] = [
       { id: "s1", type: "start", nextStepId: "a1" },
       { id: "a1", type: "action", action: { kind: "initiate_payment", config: {} } },
     ];
-    expect(validateWorkflowDef(steps).ok).toBe(false);
+    expect((await validateWorkflowDef(steps)).ok).toBe(false);
   });
 
-  test("unsafe button URLs are rejected inside send_message config (P1.2)", () => {
+  test("unsafe button URLs are rejected inside send_message config (P1.2)", async () => {
     const cases = [
       { label: "x", url: "javascript:alert(1)" },
       { label: "x", url: "data:text/html;base64,PHNjcmlwdD4=" },
@@ -142,11 +142,11 @@ describe("workflow graph validation (P1.1)", () => {
           action: { kind: "send_message", config: { text: "سلام", buttons: [btn] } },
         },
       ];
-      expect(validateWorkflowDef(steps).ok).toBe(false);
+      expect((await validateWorkflowDef(steps)).ok).toBe(false);
     }
   });
 
-  test("safe https buttons pass", () => {
+  test("safe https buttons pass", async () => {
     const steps: WorkflowStep[] = [
       { id: "s1", type: "start", nextStepId: "a1" },
       {
@@ -164,10 +164,10 @@ describe("workflow graph validation (P1.1)", () => {
         },
       },
     ];
-    expect(validateWorkflowDef(steps).ok).toBe(true);
+    expect((await validateWorkflowDef(steps)).ok).toBe(true);
   });
 
-  test("button without url or callbackData is rejected", () => {
+  test("button without url or callbackData is rejected", async () => {
     const steps: WorkflowStep[] = [
       { id: "s1", type: "start", nextStepId: "a1" },
       {
@@ -176,6 +176,109 @@ describe("workflow graph validation (P1.1)", () => {
         action: { kind: "send_message", config: { text: "سلام", buttons: [{ label: "بدون مقصد" }] } },
       },
     ];
-    expect(validateWorkflowDef(steps).ok).toBe(false);
+    expect((await validateWorkflowDef(steps)).ok).toBe(false);
+  });
+
+  // ------------------------------------------------------------------
+  // V5 H-13 — save-time bounds that the runtime previously clamped
+  // silently: button count, button label length, referenced ids.
+  // ------------------------------------------------------------------
+  test("more than 20 buttons is rejected at save (was silently clamped at runtime)", async () => {
+    const buttons = Array.from({ length: 21 }, (_, i) => ({
+      label: `دکمه ${i + 1}`,
+      callbackData: `cb_${i}`,
+    }));
+    const steps: WorkflowStep[] = [
+      { id: "s1", type: "start", nextStepId: "a1" },
+      {
+        id: "a1",
+        type: "action",
+        action: { kind: "send_message", config: { text: "سلام", buttons } },
+      },
+    ];
+    const r = await validateWorkflowDef(steps);
+    expect(r.ok).toBe(false);
+    expect(r.errorFa).toContain("دکمه");
+
+    // 20 buttons exactly pass.
+    const okSteps: WorkflowStep[] = [
+      { id: "s1", type: "start", nextStepId: "a1" },
+      {
+        id: "a1",
+        type: "action",
+        action: {
+          kind: "send_message",
+          config: { text: "سلام", buttons: buttons.slice(0, 20) },
+        },
+      },
+    ];
+    expect((await validateWorkflowDef(okSteps)).ok).toBe(true);
+  });
+
+  test("button label longer than 64 chars is rejected at save (was clamped at runtime)", async () => {
+    const steps: WorkflowStep[] = [
+      { id: "s1", type: "start", nextStepId: "a1" },
+      {
+        id: "a1",
+        type: "action",
+        action: {
+          kind: "send_message",
+          config: {
+            text: "سلام",
+            buttons: [{ label: "ل".repeat(65), callbackData: "cb_1" }],
+          },
+        },
+      },
+    ];
+    const r = await validateWorkflowDef(steps);
+    expect(r.ok).toBe(false);
+    expect(r.errorFa).toContain("برچسب");
+
+    // A 64-char label passes; a longer label made shorter ONLY by control
+    // characters (which the runtime cleans) also passes.
+    const okSteps: WorkflowStep[] = [
+      { id: "s1", type: "start", nextStepId: "a1" },
+      {
+        id: "a1",
+        type: "action",
+        action: {
+          kind: "send_message",
+          config: {
+            text: "سلام",
+            buttons: [{ label: "ل".repeat(64), callbackData: "cb_1" }],
+          },
+        },
+      },
+    ];
+    expect((await validateWorkflowDef(okSteps)).ok).toBe(true);
+  });
+
+  test("show_order.orderId / send_content.contentId are bounded to 64 chars, no control chars", async () => {
+    const longId = "x".repeat(65);
+    const controlCharId = "abc\n123";
+    const cases: Array<{ kind: "show_order" | "send_content"; field: "orderId" | "contentId"; value: string }> = [
+      { kind: "show_order", field: "orderId", value: longId },
+      { kind: "show_order", field: "orderId", value: controlCharId },
+      { kind: "send_content", field: "contentId", value: longId },
+      { kind: "send_content", field: "contentId", value: controlCharId },
+    ];
+    for (const c of cases) {
+      const steps: WorkflowStep[] = [
+        { id: "s1", type: "start", nextStepId: "a1" },
+        {
+          id: "a1",
+          type: "action",
+          action: { kind: c.kind, config: { [c.field]: c.value } },
+        },
+      ];
+      expect((await validateWorkflowDef(steps)).ok).toBe(false);
+    }
+    // A bounded id passes the structural check (existence/ownership is a
+    // runtime concern).
+    const okSteps: WorkflowStep[] = [
+      { id: "s1", type: "start", nextStepId: "a1" },
+      { id: "a1", type: "action", action: { kind: "show_order", config: { orderId: "x".repeat(64) } } },
+    ];
+    expect((await validateWorkflowDef(okSteps)).ok).toBe(true);
   });
 });

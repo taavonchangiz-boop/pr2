@@ -9,6 +9,11 @@
 import { db } from "@/lib/db";
 import { formatRials, toPersianDigits } from "@/lib/persian";
 import { latestBalanceFor } from "@/lib/payments/wallet";
+// V5 — the referral reward computed inside activateSubscription must use
+// the SAME clamped env parsers as the referral engine (a malformed
+// POSTYAR_REFERRAL_PERCENT/_CAP_RIALS previously became NaN here and the
+// reward was silently dropped).
+import { rewardPercent as clampedReferralPercent, rewardCapRials as clampedReferralCapRials } from "./referral";
 import type { Prisma } from "@prisma/client";
 
 // ---------------------------------------------------------------------
@@ -58,6 +63,7 @@ export {
   parsePlanQuota,
   findUnknownFeatureKeys,
   findImpossibleFeatureCombinations,
+  validatePlanQuotaFeatureConsistency,
   parsePlanFeatures,
   PAYABLE_STATUSES,
 } from "./plan-catalog";
@@ -771,8 +777,10 @@ export async function activateSubscription(input: {
           where: { referredId: user.id },
         });
         if (!existingReward) {
-          const rewardPercent = Number(process.env.POSTYAR_REFERRAL_PERCENT ?? 20);
-          const capRials = Number(process.env.POSTYAR_REFERRAL_CAP_RIALS ?? 100_000);
+          // V5 — clamped parsers (referral.ts): NaN/garbage env values
+          // degrade to the documented defaults instead of NaN rewards.
+          const rewardPercent = clampedReferralPercent();
+          const capRials = clampedReferralCapRials();
           const computed = Math.round((order.amountRials * rewardPercent) / 100);
           referralRewardRials = Math.min(computed, capRials);
           if (referralRewardRials > 0) {

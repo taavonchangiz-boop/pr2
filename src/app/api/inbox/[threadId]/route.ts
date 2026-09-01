@@ -9,6 +9,7 @@ import { decryptString } from "@/lib/security/crypto";
 import { getDestinationProvider, isValidProviderName } from "@/lib/providers";
 import { rateLimit } from "@/lib/security/cache";
 import { formatJalaliDateTime } from "@/lib/persian";
+import { requirePlanFeature } from "@/lib/payments/plans";
 
 function parseThreadId(threadId: string): { botId: string; providerUserId: string } | null {
   const idx = threadId.indexOf(":");
@@ -92,6 +93,16 @@ export async function POST(
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status: (e as AuthError).status });
   }
   const ip = clientIp(req);
+  // P0.15 — server-side plan feature gate (UI hiding is not authorization).
+  // V5 — the inbox feature gate was previously MISSING on this route; the
+  // free plan grants inbox:true, so legitimate users see no UX regression,
+  // while a downgraded owner can no longer reply through the inbox API.
+  try {
+    await requirePlanFeature(user.id, "inbox");
+  } catch (e) {
+    const status = e instanceof AuthError ? e.status : 403;
+    return NextResponse.json({ errorFa: (e as AuthError).message }, { status });
+  }
   const { threadId } = await params;
   const parsed = parseThreadId(threadId);
   if (!parsed) return NextResponse.json({ errorFa: "شناسه گفتگو نامعتبر است." }, { status: 400 });
@@ -133,29 +144,53 @@ export async function POST(
     return NextResponse.json({ errorFa: "محدودیت ارسال — کمی بعد تلاش کنید." }, { status: 429 });
   }
 
-  const result = await provider.publishMessage({
-    botToken,
-    chatId: parsed.providerUserId,
-    text: parsedBody.data.message,
-  });
-  if (!result.ok) {
-    return NextResponse.json(
-      { ok: false, sent: 0, failed: 1, errorFa: result.errorFa ?? "ارسال ناموفق بود." },
-      { status: 400 },
-    );
-  }
-
+  // V5 H-04 — durable pre-write: the pending outbound row exists BEFORE
+  // the provider call (a crash after a successful send leaves an auditable
+  // `pending` record instead of a silently lost history row), then the row
+  // converges to sent/failed/uncertain (+ providerMessageId).
+  let historyId: string | null = null;
   try {
-    await db.botHistory.create({
+    const row = await db.botHistory.create({
       data: {
         botId: bot.id,
         direction: "outbound",
         providerUserId: parsed.providerUserId,
         text: parsedBody.data.message.slice(0, 4000),
         userId: user.id,
+        deliveryStatus: "pending",
       },
     });
-  } catch { /* ignore */ }
+    historyId = row.id;
+  } catch (err) {
+    // Never silent: the reply proceeds, but the lost tracking row is logged.
+    console.error("inbox reply pending history write failed:", err instanceof Error ? err.message : err);
+  }
+
+  const result = await provider.publishMessage({
+    botToken,
+    chatId: parsed.providerUserId,
+    text: parsedBody.data.message,
+  });
+  const deliveryStatus = result.ok ? "sent" : (result.ambiguous ? "uncertain" : "failed");
+  if (historyId) {
+    try {
+      await db.botHistory.update({
+        where: { id: historyId },
+        data: {
+          deliveryStatus,
+          providerMessageId: result.ok ? result.providerMessageId ?? null : null,
+        },
+      });
+    } catch (err) {
+      console.error("inbox reply delivery state write failed:", err instanceof Error ? err.message : err);
+    }
+  }
+  if (!result.ok) {
+    return NextResponse.json(
+      { ok: false, sent: 0, failed: 1, errorFa: result.errorFa ?? "ارسال ناموفق بود." },
+      { status: 400 },
+    );
+  }
 
   await audit({
     userId: user.id,

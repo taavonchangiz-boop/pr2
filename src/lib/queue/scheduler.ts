@@ -32,6 +32,17 @@
 //   Consequences: zero jobs → zero quota; retry after partial completion
 //   is impossible; no duplicate quota reservation on retry; no refund
 //   path exists to get wrong; no impossible content states.
+//
+// V5 H-16 — RETRY SOURCES: the content CAS below validates the previous
+// status via the publishing state machine, so re-scheduling (the retry
+// path) is accepted from every status with a machine edge to
+// queued/scheduled — currently draft, scheduled, `failed` and `partial`
+// (queued→queued is the idempotent-duplicate path). `partial` is the V5
+// mixed outcome (some destinations delivered, some not); re-scheduling
+// from it creates fresh job rows for the requested destinations and the
+// worker's reconcileContentOutcome treats a destination as delivered iff
+// ANY of its jobs delivered, so an older failed row never negates a
+// retry that succeeded.
 // =====================================================================
 import { db } from "@/lib/db";
 import { assertTransition, isContentStatus } from "@/lib/publishing/state";
@@ -155,6 +166,9 @@ export async function schedulePublishJobsAtomic(
       // a concurrent writer must not be clobbered). Invalid transitions are
       // normalized to ContentTransitionError so callers map them to a 409
       // (a raw InvalidTransition would surface as an opaque 500).
+      // V5 H-16: because the guard is the machine itself, `partial` and
+      // `failed` are accepted sources for the queued retry path exactly
+      // as far as the state machine allows (partial/failed → queued).
       try {
         assertTransition(content.status, next);
       } catch {

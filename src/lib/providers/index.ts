@@ -49,6 +49,16 @@ export interface DeliveryResult {
   providerMessageId?: string;
   errorFa?: string;
   raw?: unknown; // sanitized
+  /**
+   * V5 H-04 — ambiguity flag for FAILED sends. true = the outcome is
+   * UNKNOWN (timeout/abort/network error, or an HTTP 5xx): the message
+   * may or may not have been delivered, so the caller must NEVER blindly
+   * re-send it (duplicate risk) and must record it as `uncertain`.
+   * false (or absent) = the provider definitively refused (e.g. HTTP 4xx):
+   * the message was NOT sent and a retry is safe.
+   * A successful send (ok: true) is never ambiguous.
+   */
+  ambiguous?: boolean;
 }
 
 export interface VerifyResult {

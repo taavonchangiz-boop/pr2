@@ -102,7 +102,9 @@ export async function PATCH(
   if (parsed.data.triggerKind !== undefined) data.triggerKind = parsed.data.triggerKind;
   if (parsed.data.triggerValue !== undefined) data.triggerValue = parsed.data.triggerValue;
   if (parsed.data.steps !== undefined) {
-    const wfValidation = validateWorkflowDef(parsed.data.steps);
+    // V5 H-13 — validation is now async (save-time plan lookup for
+    // initiate_payment steps).
+    const wfValidation = await validateWorkflowDef(parsed.data.steps);
     if (!wfValidation.ok || !wfValidation.def) {
       return NextResponse.json(
         { errorFa: wfValidation.errorFa ?? "تعریف گردالشکار نامعتبر است." },

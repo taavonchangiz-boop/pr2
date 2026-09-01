@@ -188,19 +188,26 @@ export const telegramProvider: DestinationProvider = {
       const j = (await res.json()) as { ok?: boolean; description?: string; result?: TgMessage; error_code?: number };
       if (!j.ok || !j.result) {
         const err = j.description ?? "";
+        // V5 H-04 — ambiguity classification: a DEFINITIVE provider refusal
+        // (HTTP 4xx: bad request / unauthorized / forbidden / chat missing /
+        // rate-limited) means the message was NOT sent — a retry is safe.
+        // HTTP 5xx (or an unmapped status ≥500) means the server failed
+        // while possibly accepting the message — the outcome is UNKNOWN.
+        const is5xx = res.status >= 500 || (typeof j.error_code === "number" && j.error_code >= 500);
+        const ambiguous = is5xx;
         if (j.error_code === 401) {
-          return { ok: false, errorFa: "توکن نامعتبر است.", raw: sanitizeRaw({ description: err }) };
+          return { ok: false, ambiguous: false, errorFa: "توکن نامعتبر است.", raw: sanitizeRaw({ description: err }) };
         }
         if (j.error_code === 403 || /forbidden/i.test(err)) {
-          return { ok: false, errorFa: "ربات دسترسی به این چت را ندارد.", raw: sanitizeRaw({ description: err }) };
+          return { ok: false, ambiguous: false, errorFa: "ربات دسترسی به این چت را ندارد.", raw: sanitizeRaw({ description: err }) };
         }
         if (j.error_code === 400 || /chat not found/i.test(err)) {
-          return { ok: false, errorFa: "چت یافت نشد.", raw: sanitizeRaw({ description: err }) };
+          return { ok: false, ambiguous: false, errorFa: "چت یافت نشد.", raw: sanitizeRaw({ description: err }) };
         }
         if (j.error_code === 429) {
-          return { ok: false, errorFa: "محدودیت ارسال پیام. کمی بعد تلاش کنید.", raw: sanitizeRaw({ description: err }) };
+          return { ok: false, ambiguous: false, errorFa: "محدودیت ارسال پیام. کمی بعد تلاش کنید.", raw: sanitizeRaw({ description: err }) };
         }
-        return { ok: false, errorFa: "ارسال پیام ناموفق بود.", raw: sanitizeRaw({ description: err }) };
+        return { ok: false, ambiguous, errorFa: "ارسال پیام ناموفق بود.", raw: sanitizeRaw({ description: err }) };
       }
       // No token in URL — but if we ever log the URL, scrub it.
       void scrubTokenFromUrl;
@@ -210,8 +217,12 @@ export const telegramProvider: DestinationProvider = {
         raw: sanitizeRaw({ message_id: j.result.message_id }),
       };
     } catch (err) {
+      // V5 H-04 — a thrown fetch (AbortError/timeout, TypeError/network) or
+      // an unparseable response leaves the delivery outcome UNKNOWN: the
+      // request may have reached the provider. Never report false certainty.
       return {
         ok: false,
+        ambiguous: true,
         errorFa: "اتصال به سرویس ناموفق بود.",
         raw: sanitizeRaw({ name: err instanceof Error ? err.name : "Error" }),
       };

@@ -233,7 +233,9 @@ export async function processImageUpload(buf: Buffer, declaredMime: string): Pro
   }
 
   // Use sharp to decode — invalid images will throw
-  let pipeline: sharp.Sharp;
+  // sharp 0.35 switched to `export = sharp`; under esModuleInterop the
+  // instance type is derived from the callable default export.
+  let pipeline: ReturnType<typeof sharp>;
   try {
     pipeline = sharp(buf, { failOn: "truncated" });
     // Force metadata read so we know dimensions before re-encoding

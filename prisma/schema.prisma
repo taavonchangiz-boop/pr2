@@ -755,8 +755,25 @@ model BotHistory {
   // identity; the UNIQUE index makes persistInboundOnce truly idempotent
   // at the DATABASE level (crash/retry-safe, no preflight reads).
   inboundEventId String? @unique
+  // V5 H-04 — durable OUTBOUND delivery state machine. Every outbound
+  // row is written BEFORE the provider send as `pending`, then updated
+  // to exactly one of: `sent` (provider confirmed + providerMessageId
+  // kept), `failed` (provider definitively refused), or `uncertain`
+  // (timeout/network ambiguity — delivery may or may not have happened;
+  // NEVER replayed as-if-original and NEVER reported as success).
+  // A crash between a successful send and the post-send update leaves
+  // the row `pending` — auditable evidence of a possibly-delivered
+  // message instead of a silently lost history row.
+  deliveryStatus String?  // outbound only: pending|sent|failed|uncertain
+  providerMessageId String? // provider's message id when it confirmed delivery
+  // V5 H-04 — workflow-step attribution: lets a workflow retry resolve
+  // the durable fate of a step's outbound message (skip already-sent,
+  // re-send only definitively-failed) instead of re-sending every step.
+  workflowId String?
+  stepId     String?
   createdAt     DateTime @default(now())
   @@index([botId])
+  @@index([botId, workflowId, stepId])
 }
 
 // C-04/H-03 — DURABLE inbound-event inbox (single authoritative dedup
@@ -781,6 +798,11 @@ model BotInboundEvent {
   status          String    @default("received") // received|processing|completed|failed|dead
   attempts        Int       @default(0)
   leaseUntil      DateTime?
+  // V5 C-03 — lease OWNER (fencing token). Set on every claim; renewal,
+  // completion and failure writes are gated on it so a zombie worker
+  // whose event was taken over can no longer renew/complete/fail the
+  // row it lost.
+  lockedBy        String?
   // V4 H-02 — durable retry schedule: exponential backoff + jitter is
   // persisted so recovery NEVER hot-loops a just-failed event and
   // multi-instance deployments honor the same schedule.
@@ -817,6 +839,15 @@ model BotWorkflowRun {
   // stolen while its worker is alive; a crashed run's lease expires and
   // the run becomes claimable again. Completed runs are immutable.
   leaseUntil  DateTime?
+  // V5 C-03 — run lease owner (fencing token), same semantics as the
+  // parent event's lockedBy: only the worker that WON the CAS claim may
+  // renew, complete or fail the run.
+  lockedBy    String?
+  // V5 H-04 — per-step resume cursor (JSON): maps stepId → { next,
+  // outbound history id } so a retry after a crash/failure resumes the
+  // workflow from the interrupted step instead of re-sending every
+  // already-delivered step (duplicate-message vector).
+  cursorJson  String?
   lastError   String?
   createdAt   DateTime        @default(now())
   updatedAt   DateTime        @updatedAt

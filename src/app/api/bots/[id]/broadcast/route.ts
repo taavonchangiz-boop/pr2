@@ -108,25 +108,50 @@ export async function POST(
         { status: 429 },
       );
     }
+    // V5 H-04 — durable pre-write: the pending outbound row exists BEFORE
+    // the provider call, so a crash after a successful send leaves an
+    // auditable record instead of a silently lost history row.
+    let historyId: string | null = null;
+    try {
+      const row = await db.botHistory.create({
+        data: {
+          botId: id,
+          direction: "outbound",
+          providerUserId: recipient,
+          text: parsed.data.message.slice(0, 4000),
+          userId: user.id,
+          deliveryStatus: "pending",
+        },
+      });
+      historyId = row.id;
+    } catch (err) {
+      // Never silent: the broadcast proceeds, but the lost tracking row is logged.
+      console.error("broadcast pending history write failed:", err instanceof Error ? err.message : err);
+    }
     const result = await provider.publishMessage({
       botToken,
       chatId: recipient,
       text: parsed.data.message,
     });
-    if (result.ok) {
-      sent++;
-      // Persist outbound history (best-effort)
+    // V5 H-04 — converge the row to its terminal delivery state
+    // (sent + providerMessageId / failed = definitive refusal /
+    // uncertain = unknown outcome — never reported as plain success).
+    const deliveryStatus = result.ok ? "sent" : (result.ambiguous ? "uncertain" : "failed");
+    if (historyId) {
       try {
-        await db.botHistory.create({
+        await db.botHistory.update({
+          where: { id: historyId },
           data: {
-            botId: id,
-            direction: "outbound",
-            providerUserId: recipient,
-            text: parsed.data.message.slice(0, 4000),
-            userId: user.id,
+            deliveryStatus,
+            providerMessageId: result.ok ? result.providerMessageId ?? null : null,
           },
         });
-      } catch { /* ignore */ }
+      } catch (err) {
+        console.error("broadcast delivery state write failed:", err instanceof Error ? err.message : err);
+      }
+    }
+    if (result.ok) {
+      sent++;
     } else {
       failed++;
       failures.push({ providerUserId: recipient, errorFa: result.errorFa ?? "ارسال ناموفق بود." });

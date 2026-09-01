@@ -92,7 +92,9 @@ export async function POST(
     const status = e instanceof AuthError ? e.status : 403;
     return NextResponse.json({ errorFa: (e as AuthError).message }, { status });
   }
-  const wfValidation = validateWorkflowDef(parsed.data.steps);
+  // V5 H-13 — validation is now async (save-time plan lookup for
+  // initiate_payment steps).
+  const wfValidation = await validateWorkflowDef(parsed.data.steps);
   if (!wfValidation.ok || !wfValidation.def) {
     return NextResponse.json(
       { errorFa: wfValidation.errorFa ?? "تعریف گردالشکار نامعتبر است." },

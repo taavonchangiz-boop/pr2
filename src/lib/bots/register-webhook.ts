@@ -35,6 +35,7 @@ import {
   hmacSign,
   constantTimeEqual,
 } from "@/lib/security/crypto";
+import { isPlaceholderSecret } from "@/lib/security/placeholder";
 import { audit } from "@/lib/server/auth";
 import { sanitizeRaw, getSetting } from "@/lib/providers/util";
 import type { Bot } from "@prisma/client";
@@ -46,7 +47,12 @@ import type { Bot } from "@prisma/client";
 // ---------------------------------------------------------------------
 async function getPublicBaseUrl(): Promise<string> {
   const url = (await getSetting("POSTYAR_PUBLIC_BASE_URL", "")).trim();
-  if (url && /^https?:\/\//.test(url)) return url.replace(/\/$/, "");
+  // V5 H-17 — a placeholder copied from .env.example (e.g.
+  // https://postyar.example.com) is NOT configuration: registering a real
+  // bot's webhook against a dead template host silently breaks inbound
+  // updates. A placeholder value is treated exactly like an empty one —
+  // fall through to the production error / dev fallback below.
+  if (url && /^https?:\/\//.test(url) && !isPlaceholderSecret(url)) return url.replace(/\/$/, "");
   if (process.env.NODE_ENV === "production") {
     // V4 M-13 — bounded Persian message; the env-var detail stays in logs.
     console.error("POSTYAR_PUBLIC_BASE_URL is not configured for production webhook registration.");

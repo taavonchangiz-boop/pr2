@@ -159,8 +159,14 @@ async function evalOneBot(bot: {
           text: `${titleFa}\n\n${bodyFa}`,
         });
       }
-    } catch {
-      // best-effort — notification row is already written
+    } catch (err) {
+      // Best-effort — the notification row is already written, but the
+      // failure must never be SILENT: an uncertain/failed destination
+      // publish is observable for debugging delivery issues.
+      console.error(
+        "gold bot destination publish failed:",
+        err instanceof Error ? err.message : err,
+      );
     }
   }
 

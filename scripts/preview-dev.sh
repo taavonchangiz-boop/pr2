@@ -31,13 +31,16 @@
 #   5. Starts the dev server on 0.0.0.0:3000 (reverse-proxy friendly:
 #      the preview gateway forwards Host/X-Forwarded-* headers).
 #
-# Side-effect safety (V4 M-10): with the sandbox env above, the SMS and
-# bank channels are hard-disabled in non-production runtime
-# (NODE_ENV=development), so the preview can NEVER send a real SMS,
-# e-mail, or contact a real payment gateway. Telegram/Bale/Rubika bots
-# only talk to their sandbox APIs when a bot token is configured by the
-# user INSIDE the preview UI — the preview env ships with all bot/sms/
-# bank credentials empty.
+# Side-effect safety (V4 M-10 + V5 H-17/H-18): with the sandbox env below,
+# the SMS and bank channels are hard-disabled in non-production runtime
+# (NODE_ENV=development), so the preview can NEVER send a real SMS or
+# e-mail, and the bank gateway channels refuse to run outside production.
+# ONE DOCUMENTED EXCEPTION: the Bale wallet-invoice path (sendInvoice →
+# pre_checkout_query → successful_payment) is DB-token gated — it fires
+# ONLY if the operator deliberately configures a REAL bot token inside the
+# preview UI (the preview env itself ships every bot/sms/bank credential
+# empty). Telegram/Bale/Rubika bots never talk to any API until such a
+# token is entered by the user INSIDE the preview UI.
 #
 # `.env.preview` is gitignored and must never be committed; only this
 # script and the committed `.env.example` template are in the repository.
@@ -117,8 +120,36 @@ export POSTYAR_GOLD_PROVIDER_URL=""
 export POSTYAR_AI_PROVIDER=""
 export POSTYAR_AI_API_KEY=""
 export REDIS_URL=""
-# POSTYAR_PUBLIC_BASE_URL stays unset unless the operator exports it —
-# webhook registration then degrades to the dev fallback + poll route.
+# V5 H-17 — POSTYAR_PUBLIC_BASE_URL is forced EMPTY: a value inherited from
+# the shell or a placeholder copied from .env.example
+# (https://postyar.example.com) would make webhook registration point a
+# REAL bot at a dead public URL instead of the documented localhost
+# fallback + poll route. Empty here ⇒ getPublicBaseUrl() degrades to the
+# dev fallback (http://localhost:3000) and the cron poll route.
+export POSTYAR_PUBLIC_BASE_URL=""
+# V5 H-18 — the dev-suppression overrides must be forced EMPTY: a shell-
+# inherited POSTYAR_ALLOW_REAL_SMS_IN_DEV=1 / POSTYAR_ALLOW_REAL_BANK_IN_DEV=1
+# would otherwise DEFEAT the dev guards in src/lib/providers/sms and
+# src/lib/payments/bank and let the preview reach real providers.
+export POSTYAR_ALLOW_REAL_SMS_IN_DEV=""
+export POSTYAR_ALLOW_REAL_BANK_IN_DEV=""
+# V5 H-18 — a shipped/inherited Ollama URL makes local Ollama look
+# "available" in the preview provider list; force it empty so only
+# postyar-zai (in-house, no external side effect) is offered.
+export POSTYAR_AI_OLLAMA_URL=""
+# V5 H-18 — per-provider AI keys (POSTYAR_AI_OPENAI_KEY, POSTYAR_AI_GEMINI_KEY,
+# …): an inherited REAL key would flow into real billable provider calls.
+# Unset EVERY POSTYAR_AI_*_KEY from the environment (pure-bash loop — no
+# grep -P dependency). The generic POSTYAR_AI_API_KEY is re-emptied right
+# after the loop, since it matches the *_KEY glob.
+while IFS='=' read -r _k _v; do
+  case "${_k}" in
+    POSTYAR_AI_*_KEY) unset "${_k}" ;;
+  esac
+done < <(env)
+export POSTYAR_AI_API_KEY=""
+# NOTE: operators who deliberately want a real AI provider in the preview
+# must edit .env.preview AND this block — the default is fail-closed.
 
 echo "[preview] applying migrations to ${DB_FILE}"
 bunx prisma migrate deploy

@@ -300,6 +300,21 @@ export async function bankVerifyAndFinalize(input: {
   status?: string;
   ip?: string;
 }): Promise<{ ok: boolean; paidRials?: number; providerRef?: string; errorFa?: string }> {
+  // V5 H-18 — defense in depth: the verify/finalize path makes a REAL
+  // outbound gateway call and commits the full financial fulfillment, so it
+  // carries the SAME dev gate as bankCreatePaymentRequest above (which
+  // refuses outside production unless POSTYAR_ALLOW_REAL_BANK_IN_DEV=1).
+  // Without this gate, a dev/preview caller could drive a verify against a
+  // configured gateway and flip an order to paid with real side effects.
+  // Mirrors the create path's refusal shape (bounded Persian errorFa result
+  // — the only caller, the callback route, handles ok:false with a redirect;
+  // nothing before this line touches any DB row or the network).
+  if (process.env.NODE_ENV !== "production" && process.env.POSTYAR_ALLOW_REAL_BANK_IN_DEV !== "1") {
+    return {
+      ok: false,
+      errorFa: "درگاه بانکی در محیط توسعه/پیش‌نمایش غیرفعال است؛ از پرداخت کارت به کارت استفاده کنید.",
+    };
+  }
   const ref = await db.bankGatewayRef.findUnique({
     where: { authority: input.authority },
   });

@@ -22,15 +22,47 @@ and the runtime enforces it independently:
 - `dispatchOtp` short-circuits **before any network call** outside
   production (override with `POSTYAR_ALLOW_REAL_SMS_IN_DEV=1`) — no real
   SMS is ever sent from a preview;
-- `bankCreatePaymentRequest` refuses to contact any gateway outside
-  production (override with `POSTYAR_ALLOW_REAL_BANK_IN_DEV=1`) — no real
-  charge can happen; card-to-card remains available;
+- `bankCreatePaymentRequest` and `bankVerifyAndFinalize` both refuse to
+  contact any gateway outside production (override with
+  `POSTYAR_ALLOW_REAL_BANK_IN_DEV=1`) — no real charge or verify call can
+  happen; card-to-card remains available;
 - placeholder credentials copied from `.env.example` (`REPLACE_*`,
-  `example.com` hosts) are treated as *not configured* by both resolvers,
+  `example.com` hosts) are treated as *not configured* by every resolver,
   so a template env can never trigger a real outbound request;
 - e-mail is dev-gated in `src/lib/providers/email`; Telegram/Bale/Rubika
   only talk to their APIs when the user configures a bot token inside the
   preview UI, and the sandbox env ships all provider keys empty.
+
+### One documented exception: the Bale wallet-invoice path
+
+Bale has no separate payment API — the wallet top-up invoice flow
+(`sendInvoice` → `pre_checkout_query` → `successful_payment`) runs over
+the **Bot API**. It is therefore **DB-token gated, not env-gated**: if the
+operator deliberately configures a REAL bot token in the preview UI, that
+bot WILL talk to the real Bale API and a real invoice flow can complete.
+The preview env itself ships every bot token empty, so nothing happens
+unless the operator takes that deliberate action. This is why "the preview
+can never contact a real payment gateway" holds for the **bank gateway
+channels** (hard dev-gated) but is a **deliberate-operator exception** for
+the Bale bot wallet-invoice path.
+
+### V5 neutralization guarantees (preview-dev.sh sandbox overrides)
+
+On top of the V4 channel neutralization, the preview script now forces:
+
+- `POSTYAR_PUBLIC_BASE_URL=""` — an inherited value or the old
+  `.env.example` placeholder (`https://postyar.example.com`) could make
+  webhook registration point a real bot at a dead public URL. Forced empty,
+  webhook registration degrades to the localhost dev fallback plus the cron
+  poll route (`POST /api/bots/[id]/poll`), and placeholder values are
+  treated as unset by `getPublicBaseUrl()` in every environment;
+- `POSTYAR_ALLOW_REAL_SMS_IN_DEV=""` and `POSTYAR_ALLOW_REAL_BANK_IN_DEV=""`
+  — a shell-inherited `=1` can no longer defeat the dev-suppression guards;
+- `POSTYAR_AI_OLLAMA_URL=""` — a local Ollama no longer looks "available"
+  in the preview provider list (only the in-house `postyar-zai` is offered);
+- every per-provider AI key (`POSTYAR_AI_*_KEY`) is **unset** from the
+  environment, so an inherited real key can never flow into a real billable
+  provider call (the generic `POSTYAR_AI_API_KEY` is force-emptied too).
 
 Then open the preview URL. `GET /api/health` reports component status truthfully (`app/db/storage/queue/worker`).
 
@@ -56,5 +88,8 @@ client bundle.
 ## Environment
 
 `.env` is gitignored and must never be committed. `POSTYAR_PUBLIC_BASE_URL`
-may stay unset for local preview (payment callback URLs degrade to
-relative paths); production MUST set it to the HTTPS origin.
+ships EMPTY (placeholders must never ship as values — the code treats
+placeholder values as unset). For local preview it stays empty: payment
+callback URLs degrade to relative paths and webhook registration degrades
+to the localhost fallback + poll route. Production MUST set it to the real
+HTTPS origin.

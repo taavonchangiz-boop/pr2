@@ -8,6 +8,7 @@ import {
   parsePlanFeatures,
   parsePlanQuota,
   findUnknownFeatureKeys,
+  validatePlanQuotaFeatureConsistency,
   countEnabledFeatures,
   type PlanFeatures,
 } from "@/lib/payments/plans";
@@ -103,6 +104,17 @@ export async function POST(req: Request) {
   const features: PlanFeatures = parsePlanFeatures(
     parsed.data.features ? JSON.stringify(parsed.data.features) : "{}",
   );
+  // V5 M-02 — MERGED combination check across BOTH write surfaces (the
+  // POST path previously had NO combination check at all): a capability
+  // toggled ON whose effective quota is 0 (via features OR the legacy
+  // quota JSON) is rejected before any row is created.
+  const impossible = validatePlanQuotaFeatureConsistency(features, quota.quota);
+  if (impossible.length > 0) {
+    return NextResponse.json(
+      { errorFa: `ترکیب ناممکن ویژگی/سهمیه: ${impossible.join("، ")} — امکان فعال با سهمیهٔ صفر قابل ذخیره نیست.` },
+      { status: 400 },
+    );
+  }
   const created = await db.plan.create({
     data: {
       code: parsed.data.code,

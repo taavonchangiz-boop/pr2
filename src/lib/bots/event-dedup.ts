@@ -37,6 +37,7 @@
 import { db } from "@/lib/db";
 import { sanitizeRaw } from "@/lib/providers/util";
 import type { Bot, BotInboundEvent } from "@prisma/client";
+import { randomUUID } from "node:crypto";
 
 export const BOT_EVENT_LEASE_MS = 5 * 60 * 1000;
 export const BOT_EVENT_MAX_ATTEMPTS = 5;
@@ -69,6 +70,40 @@ export interface WorkflowExecutionOutcome {
   ok: boolean;
   /** Bounded Persian failure description when ok is false. */
   errorFa?: string;
+  /** V5 H-04 — per-step resume cursor; persisted by the run layer so a
+   *  retry resumes from the interrupted step (never re-sends delivered
+   *  steps). Opaque to this layer. */
+  cursor?: unknown;
+}
+
+/** V5 H-04 — resume input handed to the execute callback on a retry. */
+export interface WorkflowResumeContext {
+  /** stepId → next step id chosen on the previous attempt (completed steps). */
+  completedNext: Record<string, string>;
+  /** stepId → durable outbound history id recorded on a previous attempt. */
+  outboundHistory: Record<string, string>;
+}
+
+/** Parse a run's stored cursor; corrupt input never executes as progress. */
+export function parseRunCursor(raw: string | null | undefined): WorkflowResumeContext {
+  const empty: WorkflowResumeContext = { completedNext: {}, outboundHistory: {} };
+  if (!raw) return empty;
+  try {
+    const parsed = JSON.parse(raw) as Partial<WorkflowResumeContext> | null;
+    if (!parsed || typeof parsed !== "object") return empty;
+    return {
+      completedNext:
+        parsed.completedNext && typeof parsed.completedNext === "object"
+          ? (parsed.completedNext as Record<string, string>)
+          : {},
+      outboundHistory:
+        parsed.outboundHistory && typeof parsed.outboundHistory === "object"
+          ? (parsed.outboundHistory as Record<string, string>)
+          : {},
+    };
+  } catch {
+    return empty;
+  }
 }
 
 /** Sanitized, size-capped payload + explicit truncation flag (H-03). */
@@ -123,7 +158,20 @@ export async function ensureBotEvent(
  * A live lease or a completed/dead event is never claimable.
  */
 export async function claimBotEvent(eventId: string): Promise<boolean> {
+  return (await claimBotEventForOwner(eventId)) !== null;
+}
+
+/**
+ * V5 C-03 — the SAME claim, returning the lease OWNER (a fencing token).
+ * The owner is stored on the row and every subsequent renewal/completion/
+ * failure write by this caller is gated on it: after a stale takeover the
+ * dispossessed (zombie) worker can no longer touch the row. Production
+ * callers (webhook routes, recovery) MUST use this variant and thread the
+ * holder through to finalize/fail/renew.
+ */
+export async function claimBotEventForOwner(eventId: string): Promise<string | null> {
   const now = new Date();
+  const holder = randomUUID();
   const res = await db.botInboundEvent.updateMany({
     where: {
       id: eventId,
@@ -141,30 +189,73 @@ export async function claimBotEvent(eventId: string): Promise<boolean> {
       status: "processing",
       attempts: { increment: 1 },
       leaseUntil: new Date(now.getTime() + BOT_EVENT_LEASE_MS),
+      lockedBy: holder,
       lastError: null,
     },
   });
-  return res.count === 1;
+  return res.count === 1 ? holder : null;
 }
 
 /**
  * Renew the event lease while its worker is alive (H-01 heartbeat).
  * A live worker can therefore never be stolen; only a crashed worker
  * (whose heartbeat stopped) becomes take-overable.
+ * V5 C-03 — when a holder is supplied the renewal is FENCED: a worker
+ * whose event was taken over can no longer renew the lease it lost.
  */
-export async function renewBotEventLease(eventId: string): Promise<void> {
+export async function renewBotEventLease(eventId: string, holder?: string): Promise<void> {
   await db.botInboundEvent.updateMany({
-    where: { id: eventId, status: "processing" },
+    where: {
+      id: eventId,
+      status: "processing",
+      ...(holder ? { lockedBy: holder } : {}),
+    },
     data: { leaseUntil: new Date(Date.now() + BOT_EVENT_LEASE_MS) },
   });
 }
 
-/** Mark a claimed event completed (idempotent; only from processing). */
-export async function completeBotEvent(eventId: string): Promise<void> {
-  await db.botInboundEvent.updateMany({
-    where: { id: eventId, status: "processing" },
-    data: { status: "completed", completedAt: new Date(), leaseUntil: null, lastError: null },
+/**
+ * V5 C-02 — THE single authoritative event-completion transition.
+ * The durable event layer itself — never a provider processor's return
+ * value — decides whether an event is completed:
+ *   * completed ONLY when no child BotWorkflowRun remains pending/
+ *     failed/processing (every intended child is terminal-success);
+ *   * returns false (and writes nothing) when any child is not
+ *     terminal-success, or when the caller lost ownership (stale holder)
+ *     — the caller must then fail the event so it stays retryable;
+ *   * never infers success merely because a caller returned.
+ */
+export async function finalizeBotEvent(eventId: string, holder?: string): Promise<boolean> {
+  return db.$transaction(async (tx) => {
+    const outstanding = await tx.botWorkflowRun.count({
+      where: { eventId, status: { not: "completed" } },
+    });
+    if (outstanding > 0) return false;
+    const res = await tx.botInboundEvent.updateMany({
+      where: {
+        id: eventId,
+        status: { in: ["received", "processing"] },
+        ...(holder ? { lockedBy: holder } : {}),
+      },
+      data: {
+        status: "completed",
+        completedAt: new Date(),
+        leaseUntil: null,
+        nextRetryAt: null,
+        lastError: null,
+      },
+    });
+    return res.count === 1;
   });
+}
+
+/**
+ * Legacy-name completion entry point — now the C-02 authoritative
+ * {@link finalizeBotEvent} (a caller returning is NOT success; a
+ * non-terminal child keeps the event un-completed).
+ */
+export async function completeBotEvent(eventId: string, holder?: string): Promise<void> {
+  await finalizeBotEvent(eventId, holder);
 }
 
 function computeNextRetryAt(attempts: number): Date {
@@ -181,7 +272,11 @@ function computeNextRetryAt(attempts: number): Date {
  * attempts reach BOT_EVENT_MAX_ATTEMPTS (bounded retry, observable
  * terminal state).
  */
-export async function failBotEvent(eventId: string, errorFa: string): Promise<"failed" | "dead"> {
+export async function failBotEvent(
+  eventId: string,
+  errorFa: string,
+  holder?: string,
+): Promise<"failed" | "dead"> {
   const ev = await db.botInboundEvent.findUnique({
     where: { id: eventId },
     select: { attempts: true, status: true },
@@ -189,7 +284,11 @@ export async function failBotEvent(eventId: string, errorFa: string): Promise<"f
   if (!ev || ev.status !== "processing") return "failed";
   const dead = ev.attempts >= BOT_EVENT_MAX_ATTEMPTS;
   await db.botInboundEvent.updateMany({
-    where: { id: eventId, status: "processing" },
+    where: {
+      id: eventId,
+      status: "processing",
+      ...(holder ? { lockedBy: holder } : {}),
+    },
     data: {
       status: dead ? "dead" : "failed",
       lastError: errorFa.slice(0, 500),
@@ -218,8 +317,9 @@ export async function failBotEvent(eventId: string, errorFa: string): Promise<"f
 export async function runWorkflowOnceForEvent(
   eventId: string,
   workflowId: string,
-  execute: () => Promise<WorkflowExecutionOutcome>,
-): Promise<{ executed: boolean; ok: boolean }> {
+  execute: (resume: WorkflowResumeContext) => Promise<WorkflowExecutionOutcome>,
+  opts?: { eventHolder?: string },
+): Promise<{ executed: boolean; ok: boolean; contended?: boolean }> {
   const run = await db.botWorkflowRun.upsert({
     where: { eventId_workflowId: { eventId, workflowId } },
     create: { eventId, workflowId },
@@ -228,6 +328,7 @@ export async function runWorkflowOnceForEvent(
   if (run.status === "completed") return { executed: false, ok: true };
 
   const now = new Date();
+  const runHolder = randomUUID();
   const claimed = await db.botWorkflowRun.updateMany({
     where: {
       id: run.id,
@@ -237,21 +338,47 @@ export async function runWorkflowOnceForEvent(
     data: {
       attempts: { increment: 1 },
       leaseUntil: new Date(now.getTime() + BOT_EVENT_LEASE_MS),
+      lockedBy: runHolder,
       lastError: null,
     },
   });
-  if (claimed.count === 0) return { executed: false, ok: true };
+  if (claimed.count === 0) {
+    // V5 C-02 (Hole 1) — a contended claim is NOT a legitimate no-op.
+    // The run's lease outliving the parent event's lease (mid-sequence
+    // crash window, or a partially-failed heartbeat tick) means another
+    // worker still owns this child: reporting ok:true here let the
+    // aggregate complete the event while the child was still pending and
+    // the workflow was lost forever. Distinguish honestly:
+    const current = await db.botWorkflowRun.findUnique({
+      where: { id: run.id },
+      select: { status: true },
+    });
+    if (current?.status === "completed") return { executed: false, ok: true };
+    return {
+      executed: false,
+      ok: false,
+      contended: true,
+    };
+  }
+
+  // V5 H-04 — load the durable per-step resume cursor from the previous
+  // attempt (if any) so the engine resumes instead of re-sending.
+  const resume = parseRunCursor(run.cursorJson);
 
   // H-01 heartbeat: keep BOTH this run's lease and the parent event's
   // lease alive while the worker is alive. The timer is always cleared
   // (finally) and failures inside a tick are logged, never unhandled.
+  // V5 C-03 — both renewals are FENCED on their owners so a zombie
+  // worker whose run/event was taken over can no longer renew them.
   const heartbeat = setInterval(() => {
     Promise.all([
       db.botWorkflowRun.updateMany({
-        where: { id: run.id, status: "pending" },
+        where: { id: run.id, status: "pending", lockedBy: runHolder },
         data: { leaseUntil: new Date(Date.now() + BOT_EVENT_LEASE_MS) },
       }),
-      renewBotEventLease(eventId),
+      opts?.eventHolder
+        ? renewBotEventLease(eventId, opts.eventHolder)
+        : Promise.resolve(),
     ]).catch((err: unknown) => {
       console.error(
         "bot workflow run lease renewal failed:",
@@ -262,10 +389,10 @@ export async function runWorkflowOnceForEvent(
   heartbeat.unref?.();
 
   try {
-    const outcome = await execute();
+    const outcome = await execute(resume);
     if (outcome && outcome.ok === true) {
       await db.botWorkflowRun.updateMany({
-        where: { id: run.id, status: { not: "completed" } },
+        where: { id: run.id, status: { not: "completed" }, lockedBy: runHolder },
         data: { status: "completed", lastError: null, leaseUntil: null },
       });
       return { executed: true, ok: true };
@@ -274,15 +401,31 @@ export async function runWorkflowOnceForEvent(
     // retryable and is never recorded as completed.
     const errorFa = (outcome && outcome.errorFa ? outcome.errorFa : "اجرای گردش کار ناموفق بود.").slice(0, 500);
     await db.botWorkflowRun.updateMany({
-      where: { id: run.id, status: { not: "completed" } },
-      data: { status: "failed", lastError: errorFa, leaseUntil: null },
+      where: { id: run.id, status: { not: "completed" }, lockedBy: runHolder },
+      data: {
+        status: "failed",
+        lastError: errorFa,
+        leaseUntil: null,
+        ...(outcome?.cursor
+          ? { cursorJson: JSON.stringify(outcome.cursor) }
+          : {}),
+      },
     });
     return { executed: true, ok: false };
   } catch (err) {
     const msg = err instanceof Error ? `${err.name}: ${err.message}` : "unknown error";
+    // V5 H-04 — a crash mid-walk carries the engine's cursor on the
+    // error; persist it so the retry resumes from the interrupted step
+    // instead of re-sending every already-delivered step.
+    const carried = (err as { workflowCursor?: unknown } | null)?.workflowCursor;
     await db.botWorkflowRun.updateMany({
-      where: { id: run.id, status: { not: "completed" } },
-      data: { status: "failed", lastError: msg.slice(0, 500), leaseUntil: null },
+      where: { id: run.id, status: { not: "completed" }, lockedBy: runHolder },
+      data: {
+        status: "failed",
+        lastError: msg.slice(0, 500),
+        leaseUntil: null,
+        ...(carried ? { cursorJson: JSON.stringify(carried) } : {}),
+      },
     });
     return { executed: true, ok: false };
   } finally {
@@ -300,11 +443,17 @@ export async function runWorkflowOnceForEvent(
  */
 export async function runMatchedWorkflowsForEvent(
   eventId: string,
-  jobs: Array<{ workflowId: string; execute: () => Promise<WorkflowExecutionOutcome> }>,
+  jobs: Array<{
+    workflowId: string;
+    execute: (resume: WorkflowResumeContext) => Promise<WorkflowExecutionOutcome>;
+  }>,
+  opts?: { eventHolder?: string },
 ): Promise<void> {
   const failedWorkflowIds: string[] = [];
   for (const job of jobs) {
-    const r = await runWorkflowOnceForEvent(eventId, job.workflowId, job.execute);
+    const r = await runWorkflowOnceForEvent(eventId, job.workflowId, job.execute, {
+      eventHolder: opts?.eventHolder,
+    });
     if (!r.ok) failedWorkflowIds.push(job.workflowId);
   }
   if (failedWorkflowIds.length > 0) {
@@ -353,13 +502,14 @@ export async function recoverBotEvents(
   process: (
     bot: Bot,
     payload: unknown,
-    opts: { isRetry: boolean; eventId: string },
+    opts: { isRetry: boolean; eventId: string; holder: string },
   ) => Promise<void>,
 ): Promise<void> {
   // `process` closes over the full Bot — callers pass it through.
   const events = await listRecoverableBotEvents(bot.id);
   for (const ev of events) {
-    if (!(await claimBotEvent(ev.id))) continue;
+    const holder = await claimBotEventForOwner(ev.id);
+    if (!holder) continue;
     // V4 H-03 — a deliberately truncated payload is NEVER replayed as
     // though it were the original update. Both the explicit flag and
     // the legacy byte-slice marker gate here; the event fails with a
@@ -383,10 +533,19 @@ export async function recoverBotEvents(
       continue;
     }
     try {
-      await process(bot as Bot, parsed, { isRetry: true, eventId: ev.id });
-      await completeBotEvent(ev.id);
+      await process(bot as Bot, parsed, { isRetry: true, eventId: ev.id, holder });
+      // V5 C-02 — completion is decided by the durable event layer
+      // (all children terminal-success), never by the processor's return.
+      const done = await finalizeBotEvent(ev.id, holder);
+      if (!done) {
+        await failBotEvent(
+          ev.id,
+          "تکمیل رویداد ممکن نبود: یک یا چند گردش کار این رویداد هنوز کامل نشده است.",
+          holder,
+        );
+      }
     } catch (err) {
-      await failBotEvent(ev.id, err instanceof Error ? err.message : "خطای بازیابی رویداد.");
+      await failBotEvent(ev.id, err instanceof Error ? err.message : "خطای بازیابی رویداد.", holder);
     }
   }
 }

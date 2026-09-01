@@ -7,7 +7,8 @@ import {
   parsePlanFeatures,
   parsePlanQuota,
   findUnknownFeatureKeys,
-  findImpossibleFeatureCombinations,
+  validatePlanQuotaFeatureConsistency,
+  safeJsonParse,
   isBooleanFeature,
   ALL_FEATURE_DEFS,
   type PlanFeatures,
@@ -97,17 +98,29 @@ export async function PATCH(
         }
       }
     }
-    // V4 M-2 — impossible feature/quota combinations (e.g. a capability
-    // toggled ON with its linked quota explicitly disabled) are rejected.
-    const impossible = findImpossibleFeatureCombinations(featureInput);
+    const features: PlanFeatures = parsePlanFeatures(JSON.stringify(parsed.data.features));
+    data.features = JSON.stringify(features);
+  }
+  // V5 M-02 — MERGED combination check across BOTH write surfaces: the
+  // features-only check missed an impossible pair supplied through the
+  // separate legacy `quota` JSON (and vice-versa against stored rows).
+  // Untouched surfaces fall back to the stored values so unrelated edits
+  // (e.g. nameFa) are never blocked by a legacy inconsistent row.
+  if (data.quota !== undefined || data.features !== undefined) {
+    const effFeatures = parsePlanFeatures(
+      data.features !== undefined ? (data.features as string) : existing.features,
+    );
+    const effQuota = safeJsonParse<Record<string, unknown>>(
+      data.quota !== undefined ? (data.quota as string) : (existing.quota || "{}"),
+      {},
+    );
+    const impossible = validatePlanQuotaFeatureConsistency(effFeatures, effQuota);
     if (impossible.length > 0) {
       return NextResponse.json(
         { errorFa: `ترکیب ناممکن ویژگی/سهمیه: ${impossible.join("، ")} — امکان فعال با سهمیهٔ صفر قابل ذخیره نیست.` },
         { status: 400 },
       );
     }
-    const features: PlanFeatures = parsePlanFeatures(JSON.stringify(parsed.data.features));
-    data.features = JSON.stringify(features);
   }
   if (parsed.data.imageUrl !== undefined) data.imageUrl = parsed.data.imageUrl ?? null;
   if (parsed.data.discountPct !== undefined) data.discountPct = parsed.data.discountPct;

@@ -280,8 +280,8 @@ describe("C-11/12 — one event, every intended workflow executes exactly once",
     expect(inbound.length).toBe(1); // pre-fix: one row PER matched workflow
   });
 
-  test("workflow graph validation still rejects malformed defs (regression guard)", () => {
-    expect(validateWorkflowDef([{ id: "s1", type: "start", nextStepId: "nope" }]).ok).toBe(false);
-    expect(validateWorkflowDef([]).ok).toBe(false);
+  test("workflow graph validation still rejects malformed defs (regression guard)", async () => {
+    expect((await validateWorkflowDef([{ id: "s1", type: "start", nextStepId: "nope" }])).ok).toBe(false);
+    expect((await validateWorkflowDef([])).ok).toBe(false);
   });
 });

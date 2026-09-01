@@ -12,13 +12,26 @@
 //       4. Resolve provider.
 //       5. Convert content + buttons → provider payload.
 //       6. Call publishMessage.
-//       7. On success: mark job `delivered`, set deliveredAt; if all jobs
-//          of this content are delivered → mark Content.status=`delivered`.
-//          Fire a Notification row.
+//       7. On success: mark job `delivered`, set deliveredAt; the content
+//          outcome is then RECONCILED (reconcileContentOutcome): all
+//          destinations delivered → Content `delivered`; some delivered,
+//          some definitively not → `partial` (V5 H-16); none → `failed`.
+//          A Notification row is fired per delivery.
 //       8. On failure: increment attempts; if attempts >= maxAttempts →
 //          `failed`; else revert to `queued` with exponential backoff
 //          (next runAt = now + 2^attempts * 30s, capped at 30 minutes).
 //   - Release lock in finally. Returns a summary.
+//
+// V5 H-16 — uncertain outcomes: the reaper NEVER re-queues a stale
+// `processing` job whose durable pre-send marker (deliveryAttemptedAt)
+// is set — the provider call already went out, so its result is
+// unknowable from the DB alone. Such a job transitions to `failed` with
+// a bounded Persian uncertainty note + resultPayload {uncertain:true}.
+// Re-queueing it would double-send (provider APIs have no idempotent
+// send); marking it delivered would claim an unconfirmed success.
+//
+// All content status writes are CAS (updateMany where status ∈
+// sourcesFor(target), count verified) — see publishing/state.ts.
 //
 // We do NOT log tokens, chat IDs, or sanitized raw payloads to stdout.
 // Audit rows store only the Persian error message + a small JSON blob.
@@ -29,7 +42,7 @@ import { getDestinationProvider, isValidProviderName } from "@/lib/providers/ind
 import { getDestinationToken } from "@/lib/destinations/helpers";
 import { safeJsonParse } from "@/lib/server/auth";
 import { signMediaUrlToken } from "@/lib/security/crypto";
-import { assertTransition, isContentStatus } from "@/lib/publishing/state";
+import { sourcesFor } from "@/lib/publishing/state";
 import type { GlassButton } from "@/lib/types/glass-button";
 import { getSetting } from "@/lib/providers/util";
 
@@ -44,6 +57,14 @@ export interface WorkerSummary {
 const DEFAULT_BATCH = 5;
 const BASE_BACKOFF_SEC = 30;
 const MAX_BACKOFF_SEC = 30 * 60;
+// V5 H-16 — bounded Persian note persisted on uncertain-outcome jobs
+// (reaped AFTER the pre-send marker was written) and on the content
+// when the uncertain job is the reason the content cannot be delivered.
+export const UNCERTAIN_DELIVERY_FA =
+  "ارسال انجام شد اما نتیجه آن نامشخص ماند؛ برای جلوگیری از ارسال تکراری، تلاش مجدد خودکار انجام نشد.";
+// V5 H-16 — content-level note for the `partial` outcome.
+const PARTIAL_OUTCOME_FA = "ارسال به برخی از مقصدها ناموفق بود؛ برای موارد باقی‌مانده می‌توانید تلاش مجدد کنید.";
+const NON_TERMINAL_JOB_STATUSES: readonly string[] = ["queued", "processing"];
 // A job left in `processing` longer than this is considered orphaned
 // (its worker crashed or the process died mid-publish). The lease is
 // deliberately much longer than the publish timeout so a LIVE publish
@@ -60,22 +81,60 @@ function computeBackoffSec(attempts: number): number {
  * `processing` were never retried — a worker crash (or OOM kill) between
  * the provider call and the status update left the job (and its Content)
  * permanently frozen, because the candidate query only selects `queued`.
- * This reaper re-queues orphaned jobs whose lease expired, honoring
- * maxAttempts with the standard exponential backoff. At-least-once
- * semantics: if the orphaned worker actually delivered before dying,
- * the retry may double-send — that is inherent to provider APIs without
- * idempotent send; the lease is kept long (10 min) to make the window
- * rare, and attempts/maxAttempts still bound total sends.
+ * This reaper re-claims orphaned jobs whose lease expired.
+ *
+ * V5 H-16 — UNCERTAIN OUTCOMES: the decision is now gated on the durable
+ * pre-send marker (PublishJob.deliveryAttemptedAt):
+ *
+ *   deliveryAttemptedAt IS SET  → the provider call already went out (or
+ *     was in flight) when the worker died. The outcome is unknowable:
+ *     re-queueing would double-send and marking delivered would claim an
+ *     unconfirmed success. The job transitions to `failed` carrying the
+ *     bounded Persian uncertainty note + resultPayload {"uncertain":true}.
+ *     NO requeue, NO re-send — ever.
+ *
+ *   deliveryAttemptedAt IS NULL → the send never went out; the orphan is
+ *     safe to retry. Requeued with the standard exponential backoff,
+ *     honoring maxAttempts (exhausted orphans → failed).
+ *
+ * After every terminal reaper decision the content outcome is reconciled
+ * (the old code left orphan-failed contents frozen in `processing`).
  */
-async function reclaimStaleProcessingJobs(): Promise<number> {
+export async function reclaimStaleProcessingJobs(): Promise<number> {
   const staleBefore = new Date(Date.now() - STALE_LEASE_MS);
   const stale = await db.publishJob.findMany({
     where: { status: "processing", lockedAt: { lt: staleBefore } },
-    select: { id: true, attempts: true, maxAttempts: true },
+    select: {
+      id: true,
+      contentId: true,
+      attempts: true,
+      maxAttempts: true,
+      deliveryAttemptedAt: true,
+    },
     take: 20,
   });
   let reclaimed = 0;
   for (const job of stale) {
+    if (job.deliveryAttemptedAt) {
+      // Uncertain outcome — see the H-16 note above. Conditional on the
+      // job still being processing with an expired lease (CAS).
+      const res = await db.publishJob.updateMany({
+        where: { id: job.id, status: "processing", lockedAt: { lt: staleBefore } },
+        data: {
+          status: "failed",
+          attempts: job.attempts + 1,
+          failureReason: UNCERTAIN_DELIVERY_FA,
+          resultPayload: sanitizeResultPayload({ uncertain: true }),
+          lockedBy: null,
+          lockedAt: null,
+        },
+      });
+      if (res.count > 0) {
+        reclaimed += res.count;
+        await reconcileContentOutcome(job.contentId, UNCERTAIN_DELIVERY_FA);
+      }
+      continue;
+    }
     const attempts = job.attempts + 1;
     if (attempts >= job.maxAttempts) {
       const res = await db.publishJob.updateMany({
@@ -88,7 +147,10 @@ async function reclaimStaleProcessingJobs(): Promise<number> {
           lockedAt: null,
         },
       });
-      reclaimed += res.count;
+      if (res.count > 0) {
+        reclaimed += res.count;
+        await reconcileContentOutcome(job.contentId, "مهلت پردازش منقضی شد (worker از دست رفت).");
+      }
     } else {
       const backoffSec = computeBackoffSec(attempts);
       const res = await db.publishJob.updateMany({
@@ -206,10 +268,11 @@ async function processJob(
     db.destination.findUnique({ where: { id: job.destinationId } }),
   ]);
   if (!content || !destination) {
-    await db.publishJob.updateMany({
+    const res = await db.publishJob.updateMany({
       where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
       data: { status: "failed", failureReason: "محتوا یا مقصد یافت نشد." },
     });
+    if (res.count > 0) await reconcileContentOutcome(job.contentId, "محتوا یا مقصد یافت نشد.");
     return { outcome: "failed", errorFa: "محتوا یا مقصد یافت نشد." };
   }
   if (destination.status === "deleted") {
@@ -218,9 +281,11 @@ async function processJob(
       data: { status: "cancelled", failureReason: "مقصد حذف شده است." },
     });
     if (cancelled.count > 0) {
-      // Release the content from `processing` — a cancelled terminal job
-      // means this content will never deliver to a live destination set.
-      await maybeMarkContentFailed(content.id, "مقصد حذف شده است.");
+      // Reconcile the content outcome — a cancelled terminal job counts as
+      // "not delivered" for its destination: if every other destination
+      // already received the message the content becomes `partial` (not
+      // `delivered`), and if nothing was delivered it becomes `failed`.
+      await reconcileContentOutcome(content.id, "مقصد حذف شده است.");
     }
     return { outcome: "failed", errorFa: "مقصد حذف شده است." };
   }
@@ -230,17 +295,24 @@ async function processJob(
   // closes that window (previously processJob never re-checked the
   // content state after claiming and delivered to a cancelled content).
   if (content.status === "cancelled") {
-    await db.publishJob.updateMany({
+    const res = await db.publishJob.updateMany({
       where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
       data: { status: "cancelled", failureReason: "محتوا لغو شده است." },
     });
+    if (res.count > 0) {
+      // Terminal job transition — reconcile keeps the invariant uniform.
+      // The content is already `cancelled` (terminal), so the CAS below
+      // is a no-op by construction; it exists for state consistency.
+      await reconcileContentOutcome(content.id);
+    }
     return { outcome: "failed", errorFa: "محتوا لغو شده است." };
   }
   if (!isValidProviderName(destination.provider)) {
-    await db.publishJob.updateMany({
+    const res = await db.publishJob.updateMany({
       where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
       data: { status: "failed", failureReason: "پروایدر نامعتبر است." },
     });
+    if (res.count > 0) await reconcileContentOutcome(content.id, "پروایدر نامعتبر است.");
     return { outcome: "failed", errorFa: "پروایدر نامعتبر است." };
   }
 
@@ -336,7 +408,7 @@ async function processJob(
         // Lease lost mid-flight — do not touch terminal/reclaimed state.
         return { outcome: "retried", errorFa: "اجاره پردازش در میانه راه از دست رفت." };
       }
-      await maybeMarkContentDelivered(content.id);
+      await reconcileContentOutcome(content.id);
       await db.notification.create({
         data: {
           userId: content.ownerId,
@@ -428,40 +500,90 @@ async function failJob(
     },
   });
   if (res.count === 0) return; // lease lost or state moved — leave alone
-  // Mark Content.status = failed too, but ONLY if it was previously in
-  // a processing/queued state and no other job is still queued/delivered.
-  await maybeMarkContentFailed(job.contentId, reason);
+  // Reconcile the content outcome for this terminal job transition.
+  await reconcileContentOutcome(job.contentId, reason);
 }
 
-/** Mark Content.status = delivered iff every non-cancelled job for the content is delivered. */
-async function maybeMarkContentDelivered(contentId: string): Promise<void> {
-  const outstanding = await db.publishJob.count({
-    where: { contentId, status: { in: ["queued", "processing", "failed"] } },
+/**
+ * V5 H-16 — content outcome reconciliation (single authoritative
+ * replacement for the old maybeMarkContentDelivered/maybeMarkContentFailed
+ * pair). Called after EVERY job terminal transition (delivered, failed,
+ * cancelled) and after every terminal reaper decision.
+ *
+ * Decision procedure (truthful, per-destination):
+ *   1. No jobs → nothing to reconcile.
+ *   2. ANY job still queued/processing → outcome not yet decidable; the
+ *      content keeps its current status (the old code mislabelled a
+ *      content `failed` the moment its FIRST job exhausted attempts while
+ *      siblings were still in flight, and then could never recover).
+ *   3. All jobs terminal — a destination counts as DELIVERED iff any of
+ *      its jobs delivered (retries append rows per destination; an older
+ *      failed row never negates a real delivery):
+ *        every destination delivered            → content `delivered`
+ *        at least one delivered, some not       → content `partial`
+ *        nothing delivered anywhere             → content `failed`
+ *
+ * ALL writes are CAS: updateMany where status ∈ sourcesFor(target) (the
+ * machine-derived reverse adjacency) with the moved count verified — a
+ * write can never land on a status the machine forbids, terminal rows are
+ * never overwritten, and concurrent reconciles converge idempotently.
+ *
+ * Returns the applied target status, or null when no write happened
+ * (undecidable, nothing to do, or CAS lost to a concurrent writer).
+ */
+export async function reconcileContentOutcome(
+  contentId: string,
+  failureReasonFa?: string,
+): Promise<"delivered" | "partial" | "failed" | null> {
+  const jobs = await db.publishJob.findMany({
+    where: { contentId },
+    select: { status: true, destinationId: true },
   });
-  if (outstanding > 0) return;
-  const content = await db.content.findUnique({ where: { id: contentId }, select: { status: true } });
-  if (!content) return;
-  if (isContentStatus(content.status)) {
-    try {
-      assertTransition(content.status, "delivered");
-      await db.content.update({ where: { id: contentId }, data: { status: "delivered", publishedAt: new Date() } });
-    } catch { /* not a valid transition — leave alone */ }
-  }
-}
+  if (jobs.length === 0) return null; // nothing to reconcile
+  if (jobs.some((j) => NON_TERMINAL_JOB_STATUSES.includes(j.status))) return null;
 
-/** Mark Content.status = failed (with reason) when the worker has exhausted retries. */
-async function maybeMarkContentFailed(contentId: string, reason: string): Promise<void> {
-  const content = await db.content.findUnique({ where: { id: contentId }, select: { status: true } });
-  if (!content) return;
-  if (isContentStatus(content.status)) {
-    try {
-      assertTransition(content.status, "failed");
-      await db.content.update({
-        where: { id: contentId },
-        data: { status: "failed", failureReason: reason.slice(0, 400) },
-      });
-    } catch { /* not a valid transition — leave alone */ }
+  // Per-destination effective outcome.
+  const destinationDelivered = new Map<string, boolean>();
+  for (const j of jobs) {
+    if (j.status === "delivered") {
+      destinationDelivered.set(j.destinationId, true);
+    } else if (!destinationDelivered.get(j.destinationId)) {
+      destinationDelivered.set(j.destinationId, false);
+    }
   }
+  const totalDestinations = destinationDelivered.size;
+  const deliveredDestinations = [...destinationDelivered.values()].filter(Boolean).length;
+
+  let target: "delivered" | "partial" | "failed";
+  if (deliveredDestinations === totalDestinations) {
+    target = "delivered";
+  } else if (deliveredDestinations > 0) {
+    target = "partial";
+  } else {
+    target = "failed";
+  }
+
+  const sources = sourcesFor(target);
+  if (sources.length === 0) return null;
+
+  // Build the mutation per target. `delivered` stamps publishedAt and
+  // clears any stale failure note; `partial` carries a bounded Persian
+  // note; `failed` carries the caller's reason when provided.
+  const data =
+    target === "delivered"
+      ? { status: target, publishedAt: new Date(), failureReason: null }
+      : target === "partial"
+        ? { status: target, failureReason: PARTIAL_OUTCOME_FA }
+        : {
+            status: target,
+            ...(failureReasonFa ? { failureReason: failureReasonFa.slice(0, 400) } : {}),
+          };
+
+  const moved = await db.content.updateMany({
+    where: { id: contentId, status: { in: sources } },
+    data,
+  });
+  return moved.count > 0 ? target : null;
 }
 
 /**

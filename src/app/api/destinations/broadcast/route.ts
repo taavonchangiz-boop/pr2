@@ -123,12 +123,30 @@ export async function POST(req: Request) {
         errorFa: result.errorFa ?? "ارسال ناموفق بود.",
       });
       // Persist lastError on the destination so the list UI can surface it.
+      // V5 H-04 — ambiguity must NOT be collapsed into a plain failure:
+      // an uncertain send (timeout/network/5xx) may still have been
+      // delivered, so it is labelled distinctly for the user and logged
+      // server-side. NOTE: a durable per-message BotHistory row is not
+      // possible here — BotHistory.botId is a REQUIRED relation and this
+      // bot-less broadcast targets Destinations directly.
+      const uncertain = result.ambiguous === true;
+      if (uncertain) {
+        console.error(
+          "destination broadcast delivery uncertain:",
+          JSON.stringify({ destinationId: d.id, errorFa: result.errorFa ?? "" }),
+        );
+      }
+      const lastErrorFa = uncertain
+        ? `تحویل نامشخص — نتیجه ارسال معلوم نیست (${result.errorFa ?? "خطای شبکه"}).`
+        : (result.errorFa ?? "ارسال ناموفق بود.");
       try {
         await db.destination.update({
           where: { id: d.id },
-          data: { lastError: (result.errorFa ?? "ارسال ناموفق بود.").slice(0, 500), lastCheckedAt: new Date() },
+          data: { lastError: lastErrorFa.slice(0, 500), lastCheckedAt: new Date() },
         });
-      } catch { /* ignore */ }
+      } catch (err) {
+        console.error("destination lastError write failed:", err instanceof Error ? err.message : err);
+      }
     }
   }
 

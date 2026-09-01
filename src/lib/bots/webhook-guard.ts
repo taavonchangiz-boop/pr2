@@ -23,7 +23,11 @@ export const WEBHOOK_MAX_BODY_BYTES = 1 * 1024 * 1024; // 1 MiB — Bot API upda
 
 export async function webhookRequestGuard(req: Request): Promise<Response | null> {
   const ip = clientIp(req);
-  const rl = await rateLimit({ key: `webhook:${ip}`, limit: 300, windowMs: 60 * 1000 });
+  // V5 H-06 — the PUBLIC (unauthenticated) webhook flood cap is
+  // security-adjacent: in production without Redis it must FAIL CLOSED
+  // instead of degrading to a per-process Map (per-instance budgets
+  // multiply the flood an attacker can land before DB/HMAC work).
+  const rl = await rateLimit({ key: `webhook:${ip}`, limit: 300, windowMs: 60 * 1000, critical: true });
   if (!rl.ok) {
     return NextResponse.json({ ok: false, errorFa: "تعداد درخواست‌ها بیش از حد مجاز است." }, { status: 429 });
   }

@@ -237,32 +237,34 @@ export async function adminAdjustWallet(input: {
           link: "/dashboard/wallet",
         },
       });
+
+      // M-04 + V5 M-05 — the wallet-adjust audit JOINS the transaction
+      // (critical) AND lives inside the mutation-only branch: an idempotent
+      // replay (same key, no money movement) must not write a SECOND audit
+      // row. A failed audit rolls the operation back and the idempotent
+      // retry heals.
+      await audit({
+        userId: input.userId,
+        actor: "admin",
+        action: "wallet_adjust",
+        targetType: "wallet",
+        targetId: input.userId,
+        ip: input.ip,
+        tx,
+        critical: true,
+        meta: {
+          adminId: input.adminId,
+          direction,
+          amountRials: amountAbs,
+          reason: input.reason,
+          balanceAfter,
+        },
+      });
     }
 
     // Always report the TRUE derived balance — the checkpoint of the
     // latest row inside the same transaction (V4 H-6).
     const actualBalance = await latestBalanceFor(tx, input.userId);
-
-    // M-04: the wallet-adjust audit JOINS the transaction (critical) —
-    // the money move and its audit trail commit atomically; a failed
-    // audit rolls the operation back and the idempotent retry heals.
-    await audit({
-      userId: input.userId,
-      actor: "admin",
-      action: "wallet_adjust",
-      targetType: "wallet",
-      targetId: input.userId,
-      ip: input.ip,
-      tx,
-      critical: true,
-      meta: {
-        adminId: input.adminId,
-        direction,
-        amountRials: amountAbs,
-        reason: input.reason,
-        balanceAfter: actualBalance,
-      },
-    });
 
     return { balanceAfter: actualBalance };
   });

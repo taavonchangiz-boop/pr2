@@ -120,20 +120,76 @@ async function readSettingsEpoch(): Promise<string> {
 }
 
 /**
+ * V5 H-07 — compute the NEXT epoch value: STRICTLY greater than the
+ * stored one and at least Date.now(). The old implementation used
+ * String(Date.now()) — two instances bumping in the same millisecond
+ * wrote the SAME value, leaving old-epoch shared-cache entries reachable
+ * for up to the 60s TTL. Integer-shaped epochs (the normal case) are
+ * advanced with BigInt so "+1" can never stall above
+ * Number.MAX_SAFE_INTEGER; legacy/exotic values fall back to Number()
+ * arithmetic; a non-numeric legacy string ("abc", NaN) falls back to
+ * Date.now() — never throws.
+ */
+function computeNextEpochValue(prev: string): string {
+  const trimmed = (prev ?? "").trim();
+  if (/^-?\d+$/.test(trimmed)) {
+    const candidate = BigInt(trimmed) + BigInt(1);
+    const nowBig = BigInt(Date.now());
+    return (candidate > nowBig ? candidate : nowBig).toString();
+  }
+  const n = Number(trimmed);
+  if (trimmed !== "" && Number.isFinite(n)) {
+    return String(Math.max(n + 1 || 0, Date.now()));
+  }
+  return String(Date.now());
+}
+
+/**
  * Bump the settings-cache epoch so EVERY application instance re-reads
  * SystemSetting values from the database on the next getSetting call
  * (within the explicit 3s epoch-read window). Must be awaited by the
  * admin write path AFTER the setting rows are committed.
+ *
+ * V5 H-07 — CAS-monotonic bump: the current row value is read, a
+ * strictly-greater next value is computed, and the write is guarded by a
+ * compare-and-set (updateMany WHERE value = prev). A lost CAS (a
+ * concurrent bump won the race) re-reads and retries up to 3 times; the
+ * final upsert fallback guarantees a bump is NEVER silently lost. The
+ * signature and callers are unchanged.
  */
 export async function bumpSettingsEpoch(): Promise<void> {
-  const next = String(Date.now());
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const row = await db.systemSetting.findUnique({
+      where: { key: SETTINGS_EPOCH_KEY },
+      select: { value: true },
+    });
+    if (!row) break; // first-ever bump → the upsert below creates the row
+    const next = computeNextEpochValue(row.value);
+    const cas = await db.systemSetting.updateMany({
+      where: { key: SETTINGS_EPOCH_KEY, value: row.value },
+      data: { value: next },
+    });
+    if (cas.count === 1) {
+      // This instance switches immediately; peers follow within
+      // EPOCH_LOCAL_TTL_MS.
+      epochLocal = { value: next, exp: Date.now() + EPOCH_LOCAL_TTL_MS };
+      return;
+    }
+  }
+  // Fallback (3 lost CAS races or missing row): upsert a value strictly
+  // greater than the freshly-read stored one, so a bump is never lost —
+  // and never moves the epoch BACKWARD.
+  const current = await db.systemSetting.findUnique({
+    where: { key: SETTINGS_EPOCH_KEY },
+    select: { value: true },
+  });
+  const fallback = current ? computeNextEpochValue(current.value) : String(Date.now());
   await db.systemSetting.upsert({
     where: { key: SETTINGS_EPOCH_KEY },
-    create: { key: SETTINGS_EPOCH_KEY, value: next },
-    update: { value: next },
+    create: { key: SETTINGS_EPOCH_KEY, value: fallback },
+    update: { value: fallback },
   });
-  // This instance switches immediately; peers follow within EPOCH_LOCAL_TTL_MS.
-  epochLocal = { value: next, exp: Date.now() + EPOCH_LOCAL_TTL_MS };
+  epochLocal = { value: fallback, exp: Date.now() + EPOCH_LOCAL_TTL_MS };
 }
 
 /**

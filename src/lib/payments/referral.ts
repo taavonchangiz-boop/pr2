@@ -14,11 +14,18 @@ import { maskMobile, formatRials, toPersianDigits } from "@/lib/persian";
 const DEFAULT_REWARD_PERCENT = 20; // % of paid amount
 const DEFAULT_REWARD_CAP_RIALS = 100_000; // 10,000 toman
 
-function rewardPercent(): number {
+/**
+ * V5 — exported clamped parsers. The activation path in plans.ts used to
+ * re-read these env vars with a bare Number() (malformed value → NaN →
+ * the referral reward was silently dropped); every reader must go through
+ * THIS clamp so a malformed operator override degrades to the documented
+ * default instead of corrupting the reward computation.
+ */
+export function rewardPercent(): number {
   const v = Number(process.env.POSTYAR_REFERRAL_PERCENT ?? DEFAULT_REWARD_PERCENT);
   return Number.isFinite(v) && v >= 0 && v <= 100 ? v : DEFAULT_REWARD_PERCENT;
 }
-function rewardCapRials(): number {
+export function rewardCapRials(): number {
   const v = Number(process.env.POSTYAR_REFERRAL_CAP_RIALS ?? DEFAULT_REWARD_CAP_RIALS);
   return Number.isFinite(v) && v >= 0 ? v : DEFAULT_REWARD_CAP_RIALS;
 }

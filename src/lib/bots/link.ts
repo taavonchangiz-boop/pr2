@@ -213,22 +213,28 @@ export async function consumeLinkCode(input: {
   if (!input.code) return { ok: false, errorFa: "کد اتصال الزامی است." };
   if (!input.providerUserId) return { ok: false, errorFa: "شناسه کاربر در ربات الزامی است." };
 
-  // Rate limit per providerUserId (C-07)
+  // Rate limit per providerUserId (C-07). V5 H-06 — the unauthenticated
+  // link-code brute-force throttle is DISTRIBUTION-CRITICAL: in production
+  // without Redis it must FAIL CLOSED instead of silently degrading to a
+  // per-process Map (N instances would multiply the guessing budget ×N).
   const rlKey = `bot:link:consume:${input.providerUserId}`;
   const rl = await rateLimit({
     key: rlKey,
     limit: CONSUME_RATE_LIMIT,
     windowMs: CONSUME_RATE_WINDOW_MS,
+    critical: true,
   });
   if (!rl.ok) {
     return { ok: false, errorFa: "تعداد تلاش بیش از حد مجاز است. ده دقیقه بعد تلاش کنید." };
   }
   // Rate limit per bot (C-07): bounds AGGREGATE online guessing per bot
-  // across all provider identities.
+  // across all provider identities. V5 H-06 — critical (same reasoning as
+  // the per-identity throttle above).
   const rlBot = await rateLimit({
     key: `bot:link:consume:bot:${input.botId}`,
     limit: CONSUME_BOT_LIMIT,
     windowMs: CONSUME_BOT_WINDOW_MS,
+    critical: true,
   });
   if (!rlBot.ok) {
     return { ok: false, errorFa: "تعداد تلاش بیش از حد مجاز است. ده دقیقه بعد تلاش کنید." };

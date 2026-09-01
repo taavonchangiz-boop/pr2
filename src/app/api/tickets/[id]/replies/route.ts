@@ -23,6 +23,11 @@ import {
 } from "@/lib/tickets";
 
 const MAX_TOTAL_REPLY_BYTES = 60 * 1024 * 1024; // 60 MiB hard ceiling across all files
+// V5 — per-user reply throttle that was imported-but-never-wired: bounds
+// reply/notification amplification (each reply fans out to a DB row, an
+// audit row and an email/notification for the other party).
+const REPLY_RATE_LIMIT = 10;
+const REPLY_RATE_WINDOW_MS = 5 * 60 * 1000;
 
 export async function POST(
   req: Request,
@@ -35,6 +40,19 @@ export async function POST(
     return NextResponse.json(
       { errorFa: (e as AuthError).message },
       { status: (e as AuthError).status },
+    );
+  }
+  // V5 — WIRE the intended per-user reply throttle (the rateLimit import
+  // existed without a call site, so the cap was silently lost).
+  const rl = await rateLimit({
+    key: `tickets:reply:${user.id}`,
+    limit: REPLY_RATE_LIMIT,
+    windowMs: REPLY_RATE_WINDOW_MS,
+  });
+  if (!rl.ok) {
+    return NextResponse.json(
+      { errorFa: "تعداد پاسخ‌های شما بیش از حد مجاز است. کمی بعد تلاش کنید." },
+      { status: 429 },
     );
   }
   const ip = clientIp(req);
