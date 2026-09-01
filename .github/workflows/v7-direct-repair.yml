@@ -1,0 +1,141 @@
+name: Postyar V7 direct static repair
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  repair:
+    if: ${{ !contains(github.event.head_commit.message, '[postyar-direct-repair]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Apply and validate repairs
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text(encoding="utf-8")
+              count = s.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected one match, got {count}: {old[:120]!r}")
+              p.write_text(s.replace(old, new), encoding="utf-8")
+
+          # Race-safe idempotency for ticket creation.
+          p = Path("src/lib/tickets/index.ts")
+          s = p.read_text(encoding="utf-8")
+          if "let ticket: Awaited<ReturnType<typeof db.ticket.create>>;" not in s:
+              replace_once(
+                  "src/lib/tickets/index.ts",
+                  "  const ticket = await db.ticket.create({",
+                  "  let ticket: Awaited<ReturnType<typeof db.ticket.create>>;\n  try {\n    ticket = await db.ticket.create({",
+              )
+              replace_once(
+                  "src/lib/tickets/index.ts",
+                  "  });\n\n  await audit({\n    userId: input.userId,\n    actor: \"user\",\n    action: \"ticket_created\",",
+                  """  });
+  } catch (err) {
+    if (input.operationKey && err && typeof err === \"object\" && \"code\" in err && err.code === \"P2002\") {
+      const existing = await db.ticket.findUnique({
+        where: { operationKey: input.operationKey },
+        include: {
+          user: { select: { id: true, firstName: true, lastName: true, businessName: true } },
+          assignedTo: { select: { id: true, firstName: true, lastName: true } },
+          department: { select: { id: true, nameFa: true } },
+          replies: true,
+        },
+      });
+      if (existing) return { ok: true, ticket: toView(existing) };
+    }
+    throw err;
+  }
+
+  await audit({
+    userId: input.userId,
+    actor: \"user\",
+    action: \"ticket_created\",
+    """,
+              )
+
+          # Race-safe idempotency for notification creation.
+          p = Path("src/lib/notifications/index.ts")
+          s = p.read_text(encoding="utf-8")
+          if "let notif: Awaited<ReturnType<typeof db.notification.create>>;" not in s:
+              replace_once(
+                  "src/lib/notifications/index.ts",
+                  "  const notif = await db.notification.create({",
+                  "  let notif: Awaited<ReturnType<typeof db.notification.create>>;\n  try {\n    notif = await db.notification.create({",
+              )
+              replace_once(
+                  "src/lib/notifications/index.ts",
+                  "  });\n\n  // Look up the user's preferences",
+                  """  });
+  } catch (err) {
+    if (input.operationKey && err && typeof err === \"object\" && \"code\" in err && err.code === \"P2002\") {
+      const existing = await db.notification.findUnique({ where: { operationKey: input.operationKey } });
+      if (existing) return { ok: true, notificationId: existing.id, emailSent: false, smsSent: false };
+    }
+    throw err;
+  }
+
+  // Look up the user's preferences""",
+              )
+
+          # Never allow a stale cursor row to overwrite an exact operation-key match.
+          p = Path("src/lib/bots/workflow.ts")
+          s = p.read_text(encoding="utf-8")
+          if "if (args.priorHistoryId)" in s and "if (!prior && args.priorHistoryId)" not in s:
+              replace_once("src/lib/bots/workflow.ts", "  if (args.priorHistoryId) {", "  if (!prior && args.priorHistoryId) {")
+
+          # Inbound history persistence is part of the durable event contract.
+          p = Path("src/lib/bots/event-dedup.ts")
+          s = p.read_text(encoding="utf-8")
+          old = """    // Never fail the event on observability persistence — but never hide
+    // the failure either.
+    console.error(\"bot history persist failed:\", err instanceof Error ? err.message : err);"""
+          new = """    // Persistence is part of the durable event contract. Do not continue without it.
+    console.error(\"bot history persist failed:\", err instanceof Error ? err.message : err);
+    throw err;"""
+          if old in s:
+              replace_once("src/lib/bots/event-dedup.ts", old, new)
+
+          # Remove all temporary remediation workflows/artifacts; keep only canonical CI.
+          wfdir = Path(".github/workflows")
+          for item in list(wfdir.iterdir()):
+              if item.name != "ci.yml":
+                  item.unlink()
+          for item in [Path("V7-final2-trigger.txt"), Path("PACKAGE-TRIGGER.txt"), Path("V7-final-trigger.txt")]:
+              if item.exists():
+                  item.unlink()
+
+          # Static assertions — build is deliberately not run here.
+          assertions = {
+              "src/lib/tickets/index.ts": ["operationKey?: string", "let ticket: Awaited<ReturnType<typeof db.ticket.create>>;", "err.code === \"P2002\""],
+              "src/lib/notifications/index.ts": ["operationKey?: string", "let notif: Awaited<ReturnType<typeof db.notification.create>>;", "err.code === \"P2002\""],
+              "src/lib/bots/workflow.ts": ["function workflowOperationKey", "if (!prior && args.priorHistoryId)", "شرط گردش کار قابل بررسی نیست"],
+              "src/lib/bots/event-dedup.ts": ["attempts: { lt: BOT_EVENT_MAX_ATTEMPTS }"],
+              "prisma/schema.prisma": ["workflowVersion String?", "operationKey  String?  @unique"],
+              "prisma/migrations/20260902010000_v7_workflow_action_idempotency/migration.sql": ["ALTER TABLE \"BotWorkflowRun\" ADD COLUMN \"workflowVersion\" TEXT;", "CREATE UNIQUE INDEX \"BotHistory_operationKey_key\""],
+          }
+          for path, needles in assertions.items():
+              text = Path(path).read_text(encoding="utf-8")
+              for needle in needles:
+                  if needle not in text:
+                      raise SystemExit(f"static assertion failed: {path}: {needle!r}")
+          if sorted(p.name for p in wfdir.iterdir()) != ["ci.yml"]:
+              raise SystemExit("temporary workflow cleanup failed")
+          print("POSTYAR STATIC REPAIR: PASS")
+      - name: Commit repairs and cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'postyar-direct-repair'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --check
+          git commit -m '[postyar-direct-repair] static hardening and cleanup'
+          git push origin HEAD:main
