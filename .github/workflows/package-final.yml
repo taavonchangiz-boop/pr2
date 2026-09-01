@@ -1,0 +1,21 @@
+name: Package clean final repository
+on:
+  push:
+    branches: [_postyar-final-package]
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Archive
+        run: git archive --format=zip --output=/tmp/postyar-final-clean.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: postyar-final-clean
+          path: /tmp/postyar-final-clean.zip
+          retention-days: 1
