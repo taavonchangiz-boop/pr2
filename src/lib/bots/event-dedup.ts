@@ -692,7 +692,7 @@ export async function listRecoverableBotEvents(botId: string): Promise<BotInboun
           attempts: { lt: BOT_EVENT_MAX_ATTEMPTS },
           OR: [{ nextRetryAt: null }, { nextRetryAt: { lte: new Date(now) } }],
         },
-        { status: "processing", leaseUntil: { lt: new Date(now) } },
+        { status: "processing", attempts: { lt: BOT_EVENT_MAX_ATTEMPTS }, leaseUntil: { lt: new Date(now) } },
         { status: "received", updatedAt: { lt: new Date(now - BOT_EVENT_RECOVER_MIN_AGE_MS) } },
       ],
     },

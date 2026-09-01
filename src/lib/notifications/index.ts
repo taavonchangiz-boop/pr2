@@ -34,6 +34,7 @@ export interface NotifyInput {
   link?: string | null;
   email?: { to: string; subjectFa?: string; htmlFa?: string } | null;
   sms?: { mobile: string } | null;
+  operationKey?: string;
 }
 
 export interface NotifyResult {
@@ -62,6 +63,11 @@ export async function notify(input: NotifyInput): Promise<NotifyResult> {
   if (!input.userId) return { ok: false, notificationId: "", errorFa: "شناسه کاربر الزامی است." };
   if (!input.titleFa || !input.bodyFa) return { ok: false, notificationId: "", errorFa: "عنوان و متن اعلان الزامی است." };
 
+  if (input.operationKey) {
+    const existing = await db.notification.findUnique({ where: { operationKey: input.operationKey } });
+    if (existing) return { ok: true, notificationId: existing.id, emailSent: false, smsSent: false };
+  }
+
   // Persist the notification row — always, regardless of prefs (so the
   // user can see security alerts even if push was disabled).
   const notif = await db.notification.create({
@@ -71,6 +77,7 @@ export async function notify(input: NotifyInput): Promise<NotifyResult> {
       titleFa: input.titleFa.slice(0, 200),
       bodyFa: input.bodyFa.slice(0, 2000),
       link: input.link ?? null,
+      operationKey: input.operationKey ?? null,
     },
   });
 

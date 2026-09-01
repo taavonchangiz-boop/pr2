@@ -345,6 +345,16 @@ export async function persistInboundOnce(
  *  execution (via the durable event identity). Returns null for direct
  *  callers without a durable event/run — the fallback channel is then
  *  simply inactive. */
+function workflowOperationKey(ctx: WorkflowContext, stepId: string, kind: string): string | undefined {
+  const externalId =
+    ctx.updateId !== undefined ? String(ctx.updateId)
+    : ctx.providerMessageId !== undefined ? String(ctx.providerMessageId)
+    : undefined;
+  if (!externalId) return undefined;
+  const raw = `${kind}:${ctx.bot.id}:${ctx.bot.provider}:${externalId}:${ctx.workflow.id}:${stepId}`;
+  return `wfop:${hashToken(raw).slice(0, 64)}`;
+}
+
 async function resolveRunStart(ctx: WorkflowContext): Promise<Date | null> {
   const externalId =
     ctx.updateId !== undefined ? String(ctx.updateId)
@@ -426,9 +436,16 @@ async function sendOutboundTracked(
   getRunStart: () => Promise<Date | null>,
 ): Promise<TrackedSendResult> {
   const botId = ctx.bot.id;
+  const operationKey = workflowOperationKey(ctx, args.stepId, "outbound");
 
-  // --- 1. Resolve the step's prior durable row (cross-attempt channel).
+  // --- 1. Resolve the step's prior durable row (exact operation identity first).
   let prior: { id: string; deliveryStatus: string | null } | null = null;
+  if (operationKey) {
+    const row = await db.botHistory.findUnique({ where: { operationKey } });
+    if (row && row.botId === botId && row.direction === "outbound" && row.workflowId === args.workflowId && row.stepId === args.stepId) {
+      prior = { id: row.id, deliveryStatus: row.deliveryStatus };
+    }
+  }
   if (args.priorHistoryId) {
     const row = await db.botHistory.findUnique({ where: { id: args.priorHistoryId } });
     // Never adopt a foreign row (different bot/workflow/direction).
@@ -436,8 +453,8 @@ async function sendOutboundTracked(
       prior = { id: row.id, deliveryStatus: row.deliveryStatus };
     }
   }
-  if (!prior) {
-    // Crash-recovery fallback: a step WITHOUT a cursor entry may still
+  if (!prior && !operationKey) {
+    // Legacy fallback is retained only for direct callers that have no stable event identity.
     // have a durable row from an earlier attempt of THIS run (crash
     // before the cursor was persisted, or a definitely-failed send).
     const runStart = await getRunStart();
@@ -503,6 +520,7 @@ async function sendOutboundTracked(
         workflowId: args.workflowId,
         stepId: args.stepId,
         deliveryStatus: "pending",
+        operationKey: operationKey ?? null,
       },
     });
     historyId = row.id;
@@ -841,6 +859,7 @@ export async function executeWorkflow(ctx: WorkflowContext, resume?: WorkflowRes
       const actionResult = await performAction(a, {
         ctx,
         linkedUserId: linkedUser?.id ?? null,
+        stepId: current.id,
       });
       if (actionResult.outboundText) {
         // V5 H-04 — action outbounds are tracked sends attributed to the
@@ -963,8 +982,9 @@ async function evaluateCondition(
       default:
         return false;
     }
-  } catch {
-    return false;
+  } catch (err) {
+    console.error("bot workflow condition evaluation failed:", err instanceof Error ? err.message : err);
+    throw new Error("شرط گردش کار قابل بررسی نیست؛ برای جلوگیری از اجرای ناخواسته، اجرا متوقف شد.");
   }
 }
 
@@ -981,6 +1001,7 @@ async function performAction(
   args: {
     ctx: WorkflowContext;
     linkedUserId: string | null;
+    stepId: string;
   },
 ): Promise<ActionResult> {
   const cfg = a.config ?? {};
@@ -1005,6 +1026,12 @@ async function performAction(
       if (!args.linkedUserId) {
         return { outboundText: "برای ثبت تیکت ابتدا حساب پُست‌یار خود را به این ربات متصل کنید." };
       }
+      const operationKey = workflowOperationKey(args.ctx, args.stepId, "ticket");
+      if (operationKey) {
+        const existing = await db.ticket.findUnique({ where: { operationKey }, select: { id: true } });
+        if (existing) return { outboundText: `تیکت شما با شناسه ${toPersianDigits(existing.id.slice(-8).toUpperCase())} قبلاً ثبت شده است.` };
+      }
+
       // L-6 — abuse cap: a trigger-happy workflow must not let a chat
       // identity farm unlimited support tickets.
       const ticketRl = await rateLimit({
@@ -1029,6 +1056,7 @@ async function performAction(
         priority: ticketPriority,
         body,
         ip: undefined,
+        operationKey,
       });
       if (!r.ok || !r.ticket) {
         return { outboundText: r.errorFa ?? "ایجاد تیکت ناموفق بود." };
@@ -1227,13 +1255,16 @@ async function performAction(
       const title = String(cfg.titleFa ?? "اعلان پُست‌یار");
       const body = String(cfg.bodyFa ?? "");
       const link = cfg.link ? String(cfg.link) : undefined;
-      const category = String(cfg.category ?? "system") as NotificationCategory;
+      const categoryRaw = String(cfg.category ?? "system");
+      const category = (NOTIFICATION_CATEGORIES.includes(categoryRaw) ? categoryRaw : "system") as NotificationCategory;
+      const operationKey = workflowOperationKey(args.ctx, args.stepId, "notification");
       await notify({
         userId: args.linkedUserId,
         category,
         titleFa: title,
         bodyFa: body,
         link,
+        operationKey,
       });
       return { outboundText: cfg.confirmText ? String(cfg.confirmText) : "اعلان شما ثبت شد." };
     }

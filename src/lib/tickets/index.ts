@@ -111,9 +111,22 @@ export async function createTicket(input: {
   departmentId?: string | null;
   body: string;
   ip?: string;
+  operationKey?: string;
 }): Promise<{ ok: boolean; ticket?: TicketView; errorFa?: string }> {
   const subject = (input.subject ?? "").trim();
   const body = (input.body ?? "").trim();
+  if (input.operationKey) {
+    const existing = await db.ticket.findUnique({
+      where: { operationKey: input.operationKey },
+      include: {
+        user: { select: { id: true, firstName: true, lastName: true, businessName: true } },
+        assignedTo: { select: { id: true, firstName: true, lastName: true } },
+        department: { select: { id: true, nameFa: true } },
+        replies: true,
+      },
+    });
+    if (existing) return { ok: true, ticket: toView(existing) };
+  }
   if (subject.length < 3) return { ok: false, errorFa: "موضوع تیکت حداقل باید ۳ نویسه باشد." };
   if (body.length < 3) return { ok: false, errorFa: "متن تیکت حداقل باید ۳ نویسه باشد." };
 
@@ -134,6 +147,7 @@ export async function createTicket(input: {
       priority: input.priority ?? "normal",
       status: "open",
       departmentId,
+      operationKey: input.operationKey ?? null,
       replies: {
         create: {
           userId: input.userId,
