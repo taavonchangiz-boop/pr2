@@ -70,7 +70,9 @@ export async function notify(input: NotifyInput): Promise<NotifyResult> {
 
   // Persist the notification row — always, regardless of prefs (so the
   // user can see security alerts even if push was disabled).
-  const notif = await db.notification.create({
+  let notif: Awaited<ReturnType<typeof db.notification.create>>;
+  try {
+    notif = await db.notification.create({
     data: {
       userId: input.userId,
       category: input.category,
@@ -80,6 +82,13 @@ export async function notify(input: NotifyInput): Promise<NotifyResult> {
       operationKey: input.operationKey ?? null,
     },
   });
+  } catch (err) {
+    if (input.operationKey && err && typeof err === "object" && "code" in err && err.code === "P2002") {
+      const existing = await db.notification.findUnique({ where: { operationKey: input.operationKey } });
+      if (existing) return { ok: true, notificationId: existing.id, emailSent: false, smsSent: false };
+    }
+    throw err;
+  }
 
   // Look up the user's preferences from Profile.notifyPrefs (JSON).
   const profile = await db.profile.findUnique({ where: { userId: input.userId } });

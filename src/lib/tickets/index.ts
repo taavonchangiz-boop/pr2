@@ -139,7 +139,9 @@ export async function createTicket(input: {
     departmentId = dep.id;
   }
 
-  const ticket = await db.ticket.create({
+  let ticket: Awaited<ReturnType<typeof db.ticket.create>>;
+  try {
+    ticket = await db.ticket.create({
     data: {
       userId: input.userId,
       subject: subject.slice(0, 200),
@@ -163,6 +165,21 @@ export async function createTicket(input: {
       replies: true,
     },
   });
+  } catch (err) {
+    if (input.operationKey && err && typeof err === "object" && "code" in err && err.code === "P2002") {
+      const existing = await db.ticket.findUnique({
+        where: { operationKey: input.operationKey },
+        include: {
+          user: { select: { id: true, firstName: true, lastName: true, businessName: true } },
+          assignedTo: { select: { id: true, firstName: true, lastName: true } },
+          department: { select: { id: true, nameFa: true } },
+          replies: true,
+        },
+      });
+      if (existing) return { ok: true, ticket: toView(existing) };
+    }
+    throw err;
+  }
 
   await audit({
     userId: input.userId,

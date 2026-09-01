@@ -446,7 +446,7 @@ async function sendOutboundTracked(
       prior = { id: row.id, deliveryStatus: row.deliveryStatus };
     }
   }
-  if (args.priorHistoryId) {
+  if (!prior && args.priorHistoryId) {
     const row = await db.botHistory.findUnique({ where: { id: args.priorHistoryId } });
     // Never adopt a foreign row (different bot/workflow/direction).
     if (row && row.botId === botId && row.direction === "outbound" && row.workflowId === args.workflowId) {
