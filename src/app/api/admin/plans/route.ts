@@ -6,6 +6,8 @@ import { db } from "@/lib/db";
 import { formatRials, formatJalaliDate } from "@/lib/persian";
 import {
   parsePlanFeatures,
+  parsePlanQuota,
+  findUnknownFeatureKeys,
   countEnabledFeatures,
   type PlanFeatures,
 } from "@/lib/payments/plans";
@@ -87,6 +89,17 @@ export async function POST(req: Request) {
   if (dup) {
     return NextResponse.json({ errorFa: "این کد طرح قبلاً ثبت شده است." }, { status: 409 });
   }
+  // M-02: reject unknown feature keys with an explicit 400.
+  const unknown = findUnknownFeatureKeys((parsed.data.features ?? {}) as Record<string, unknown>);
+  if (unknown.length > 0) {
+    return NextResponse.json(
+      { errorFa: `ویژگی(های) ناشناخته: ${unknown.join("، ")}` },
+      { status: 400 },
+    );
+  }
+  // M-02: strict quota validation/normalization.
+  const quota = parsePlanQuota((parsed.data.quota ?? {}) as Record<string, unknown>);
+  if (!quota.ok) return NextResponse.json({ errorFa: quota.errorFa }, { status: 400 });
   const features: PlanFeatures = parsePlanFeatures(
     parsed.data.features ? JSON.stringify(parsed.data.features) : "{}",
   );
@@ -97,7 +110,7 @@ export async function POST(req: Request) {
       descriptionFa: parsed.data.descriptionFa ?? "",
       priceRials: parsed.data.priceRials,
       intervalMonths: parsed.data.intervalMonths,
-      quota: JSON.stringify(parsed.data.quota ?? {}),
+      quota: JSON.stringify(quota.quota),
       features: JSON.stringify(features),
       imageUrl: parsed.data.imageUrl ?? null,
       discountPct: parsed.data.discountPct ?? 0,

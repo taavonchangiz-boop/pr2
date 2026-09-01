@@ -3,7 +3,12 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { requireRole, clientIp, audit, AuthError } from "@/lib/server/auth";
 import { db } from "@/lib/db";
-import { parsePlanFeatures, type PlanFeatures } from "@/lib/payments/plans";
+import {
+  parsePlanFeatures,
+  parsePlanQuota,
+  findUnknownFeatureKeys,
+  type PlanFeatures,
+} from "@/lib/payments/plans";
 
 const PatchSchema = z.object({
   nameFa: z.string().min(2).max(80).optional(),
@@ -49,8 +54,23 @@ export async function PATCH(
   if (parsed.data.descriptionFa !== undefined) data.descriptionFa = parsed.data.descriptionFa;
   if (parsed.data.priceRials !== undefined) data.priceRials = parsed.data.priceRials;
   if (parsed.data.intervalMonths !== undefined) data.intervalMonths = parsed.data.intervalMonths;
-  if (parsed.data.quota !== undefined) data.quota = JSON.stringify(parsed.data.quota);
+  if (parsed.data.quota !== undefined) {
+    // M-02: strict quota validation — unknown dimensions / non-finite
+    // values are rejected instead of silently persisted.
+    const q = parsePlanQuota(parsed.data.quota as Record<string, unknown>);
+    if (!q.ok) return NextResponse.json({ errorFa: q.errorFa }, { status: 400 });
+    data.quota = JSON.stringify(q.quota);
+  }
   if (parsed.data.features !== undefined) {
+    // M-02: reject unknown feature keys with an explicit 400 — the
+    // previous normalization silently DROPPED typo'd keys.
+    const unknown = findUnknownFeatureKeys(parsed.data.features as Record<string, unknown>);
+    if (unknown.length > 0) {
+      return NextResponse.json(
+        { errorFa: `ویژگی(های) ناشناخته: ${unknown.join("، ")}` },
+        { status: 400 },
+      );
+    }
     const features: PlanFeatures = parsePlanFeatures(JSON.stringify(parsed.data.features));
     data.features = JSON.stringify(features);
   }

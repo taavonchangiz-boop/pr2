@@ -245,10 +245,17 @@ export async function schedulePublishJobsAtomic(
   return result;
 }
 
-/** Cancel a queued/scheduled job. No-op if already terminal. */
-export async function cancelJob(jobId: string): Promise<void> {
-  await db.publishJob.updateMany({
-    where: { id: jobId, status: { in: ["queued"] } },
-    data: { status: "cancelled" },
+/** M-05: cancel every still-queued PublishJob of a content item. Wired
+ *  into the content cancel/delete flow — previously the queued jobs of a
+ *  cancelled content stayed claimable and were SENT to providers (the
+ *  dead `cancelJob(jobId)` helper had zero callers and no content-level
+ *  cancellation existed). No-op for already-terminal jobs; in-flight
+ *  `processing` jobs are untouched — their lease-owned CAS makes the
+ *  worker's late delivered-write fail harmlessly. */
+export async function cancelQueuedJobsForContent(contentId: string, reasonFa: string): Promise<number> {
+  const res = await db.publishJob.updateMany({
+    where: { contentId, status: "queued" },
+    data: { status: "cancelled", failureReason: reasonFa },
   });
+  return res.count;
 }

@@ -13,7 +13,10 @@
 //      `successful_payment`, call `processBaleUpdate(bot, update)` from
 //      `@/lib/payments/bale`. Else if message or callback_query,
 //      dispatch to the workflow engine.
-//   5. Idempotent on update_id.
+//   5. C-04/H-03: DURABLY idempotent on update_id via the BotInboundEvent
+//      inbox. Payment-bearing updates are additionally protected by the
+//      durable BalePaymentRef UNIQUE constraints (the financial
+//      correctness owner) — see P0.11 below.
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { constantTimeEqual } from "@/lib/security/crypto";
@@ -22,9 +25,17 @@ import {
   computeWebhookBodySignature,
 } from "@/lib/bots/register-webhook";
 import { executeWorkflow, processBaleUpdate, persistInboundOnce } from "@/lib/bots/workflow";
+import {
+  ensureBotEvent,
+  claimBotEvent,
+  completeBotEvent,
+  failBotEvent,
+  recoverBotEvents,
+  runWorkflowOnceForEvent,
+} from "@/lib/bots/event-dedup";
 import { audit } from "@/lib/server/auth";
-import type { BotWorkflow } from "@prisma/client";
-import { webhookRequestGuard, claimUpdateOnce, readBoundedWebhookBody } from "@/lib/bots/webhook-guard";
+import type { Bot, BotWorkflow } from "@prisma/client";
+import { webhookRequestGuard, readBoundedWebhookBody } from "@/lib/bots/webhook-guard";
 
 interface BaleUpdate {
   update_id: number;
@@ -110,43 +121,75 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, errorFa: "بدنه وب‌هوک نامعتبر است." }, { status: 400 });
   }
 
-  // Idempotency at the handler level (atomic claim — audit W2).
-  //
-  // P0.11 ROOT-CAUSE FIX — the volatile INCR claim is AT-MOST-ONCE: if the
-  // process crashed after claiming a `successful_payment` but before
-  // processBaleUpdate persisted the charge, the provider's retry was
-  // dropped as a "duplicate" and a REAL payment was lost forever. Payment-
-  // bearing updates therefore BYPASS the volatile claim entirely:
-  // processBaleUpdate is durably idempotent (BalePaymentRef.chargeId CAS +
-  // activateSubscription healing upserts) and safe to run on every
-  // delivery. Non-payment updates keep the volatile claim (chat UX only).
+  // P0.11 ROOT-CAUSE FIX — payment-bearing updates are durably idempotent
+  // in processBaleUpdate itself (BalePaymentRef.chargeId CAS + healing
+  // upserts + hard amount/secret checks) and MUST run on every delivery;
+  // their event row is recorded for observability, but financial
+  // correctness stays owned by BalePaymentRef (no claim, no skip).
+  // Non-payment updates take the durable BotInboundEvent claim path:
+  // UNIQUE collapses duplicates, the lease + recovery pass make a crash
+  // after claim RETRYABLE instead of lost (the old volatile claim was
+  // at-most-once and permanently suppressed the provider's retry).
   const updateId = update.update_id;
   const isPaymentUpdate = !!(update.pre_checkout_query || update.message?.successful_payment);
-  if (!isPaymentUpdate) {
-    const firstDelivery = await claimUpdateOnce(bot.id, bot.provider, String(updateId));
-    if (!firstDelivery) {
-      return NextResponse.json({ ok: true, duplicate: true });
-    }
-  }
+  const event = await ensureBotEvent(bot, "bale", String(updateId), update);
 
-  // Payment branch — delegate to processBaleUpdate.
   if (isPaymentUpdate) {
     try {
       await processBaleUpdate(bot, update);
+      await completeBotEvent(event.id);
     } catch (err) {
+      await failBotEvent(
+        event.id,
+        err instanceof Error ? `${err.name}: ${err.message}` : "خطای پردازش پرداخت.",
+      );
       await audit({
         userId: bot.ownerId,
         actor: "system",
         action: "bot_bale_payment_handler_failed",
         targetType: "bot",
         targetId: bot.id,
-        meta: { name: err instanceof Error ? err.name : "Error" },
+        meta: { name: err instanceof Error ? err.name : "Error", eventId: event.id },
       });
     }
     // Always ack 200 so Bale doesn't retry.
     return NextResponse.json({ ok: true, payment: true });
   }
 
+  const claimed = await claimBotEvent(event.id);
+  if (!claimed) {
+    return NextResponse.json({ ok: true, duplicate: true });
+  }
+  try {
+    await processBaleNonPaymentUpdate(bot, update, {
+      isRetry: event.attempts > 1,
+      eventId: event.id,
+    });
+    await completeBotEvent(event.id);
+  } catch (err) {
+    await failBotEvent(
+      event.id,
+      err instanceof Error ? `${err.name}: ${err.message}` : "خطای پردازش رویداد.",
+    );
+  }
+
+  // Bounded crash-recovery pass for this bot (C-04/H-03).
+  await recoverBotEvents(bot, (b, payload, o) => processBaleNonPaymentUpdate(b, payload as BaleUpdate, o));
+
+  return NextResponse.json({ ok: true });
+}
+
+/**
+ * Non-payment Bale update processing — shared by live delivery and
+ * durable recovery. Replay-safe: link-code consumption is one-time,
+ * workflow runs are UNIQUE per (event, workflow), and side-effecting
+ * actions carry deterministic idempotency keys.
+ */
+async function processBaleNonPaymentUpdate(
+  bot: Bot,
+  update: BaleUpdate,
+  opts: { isRetry: boolean; eventId: string },
+): Promise<void> {
   // Extract chat id + text
   let chatId = "";
   let incomingText = "";
@@ -160,12 +203,14 @@ export async function POST(req: Request) {
     incomingText = update.callback_query.data ?? "";
   }
   if (!chatId) {
-    return NextResponse.json({ ok: true, noChat: true });
+    return;
   }
 
   // C-11/C-12: persist the inbound history row ONCE per event (owned by
-  // the webhook layer, not per workflow).
-  await persistInboundOnce(bot, chatId, incomingText, update, updateId);
+  // the webhook layer, not per workflow). Skipped on durable retries.
+  if (!opts.isRetry) {
+    await persistInboundOnce(bot, chatId, incomingText, update, update.update_id);
+  }
 
   // Link-code consumption attempt.
   if (incomingText.startsWith("POSTYAR-")) {
@@ -197,41 +242,39 @@ export async function POST(req: Request) {
         },
       });
     } catch { /* best-effort */ }
-    return NextResponse.json({ ok: true, linkConsumed: result.ok });
+    return;
   }
 
-  // Workflow dispatch.
+  // Workflow dispatch — per-event UNIQUE run rows guarantee exactly-once
+  // execution per intended workflow across retries and recovery.
   const workflows = await db.botWorkflow.findMany({
     where: { botId: bot.id, enabled: true },
     take: 50,
   });
-  let matchedAny = false;
   for (const wf of workflows) {
     if (!matchesTrigger(wf, incomingText)) continue;
-    try {
-      const r = await executeWorkflow({
+    const r = await runWorkflowOnceForEvent(opts.eventId, wf.id, async () => {
+      await executeWorkflow({
         bot,
         providerUserId: chatId,
         rawUpdate: update,
         incomingMessage: incomingText,
         callbackQueryId,
-        updateId,
+        updateId: update.update_id,
         workflow: wf,
       });
-      if (r.matched) matchedAny = true;
-    } catch (err) {
+    });
+    if (!r.ok) {
       await audit({
         userId: bot.ownerId,
         actor: "system",
         action: "bot_workflow_execute_failed",
         targetType: "bot",
         targetId: bot.id,
-        meta: { workflowId: wf.id, name: err instanceof Error ? err.name : "Error" },
+        meta: { workflowId: wf.id, eventId: opts.eventId },
       });
     }
   }
-
-  return NextResponse.json({ ok: true, matched: matchedAny });
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {

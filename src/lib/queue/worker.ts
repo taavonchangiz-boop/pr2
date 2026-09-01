@@ -223,6 +223,18 @@ async function processJob(
     }
     return { outcome: "failed", errorFa: "مقصد حذف شده است." };
   }
+  // M-05: a cancelled content's jobs must never be SENT. The content-level
+  // cancel flow cancels queued jobs, but a job claimed between the cancel
+  // and the worker's read can still be in `processing` — the guard below
+  // closes that window (previously processJob never re-checked the
+  // content state after claiming and delivered to a cancelled content).
+  if (content.status === "cancelled") {
+    await db.publishJob.updateMany({
+      where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
+      data: { status: "cancelled", failureReason: "محتوا لغو شده است." },
+    });
+    return { outcome: "failed", errorFa: "محتوا لغو شده است." };
+  }
   if (!isValidProviderName(destination.provider)) {
     await db.publishJob.updateMany({
       where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
@@ -284,6 +296,17 @@ async function processJob(
   }
 
   try {
+    // M-06: durable PRE-SEND attempt marker (conditional on lease
+    // ownership). If this process dies after the provider accepted the
+    // message but before the delivered/failed CAS below, the row proves
+    // an outbound attempt was in flight — at-least-once semantics stay
+    // observable and bounded by maxAttempts (Telegram/Bale/Rubika send
+    // APIs have no idempotency token, so exactly-once is not claimable;
+    // see the at-least-once note at the top of this file).
+    await db.publishJob.updateMany({
+      where: { id: jobId, status: "processing", lockedBy: holder.slice(0, 64) },
+      data: { deliveryAttemptedAt: new Date() },
+    });
     const r = await provider.publishMessage({
       botToken,
       chatId: destination.chatId,

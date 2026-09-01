@@ -228,24 +228,31 @@ export async function adminAdjustWallet(input: {
     });
     let actualBalance = 0;
     for (const t of postTxns) actualBalance += t.direction === "credit" ? t.amountRials : -t.amountRials;
+
+    // M-04: the wallet-adjust audit JOINS the transaction (critical) —
+    // the money move and its audit trail commit atomically; a failed
+    // audit rolls the operation back and the idempotent retry heals.
+    await audit({
+      userId: input.userId,
+      actor: "admin",
+      action: "wallet_adjust",
+      targetType: "wallet",
+      targetId: input.userId,
+      ip: input.ip,
+      tx,
+      critical: true,
+      meta: {
+        adminId: input.adminId,
+        direction,
+        amountRials: amountAbs,
+        reason: input.reason,
+        balanceAfter: actualBalance,
+      },
+    });
+
     return { balanceAfter: actualBalance };
   });
 
-  await audit({
-    userId: input.userId,
-    actor: "admin",
-    action: "wallet_adjust",
-    targetType: "wallet",
-    targetId: input.userId,
-    ip: input.ip,
-    meta: {
-      adminId: input.adminId,
-      direction,
-      amountRials: amountAbs,
-      reason: input.reason,
-      balanceAfter: result.balanceAfter,
-    },
-  });
   return { balanceRials: result.balanceAfter };
 }
 
@@ -381,10 +388,11 @@ export async function refund(input: {
     });
     let actualBalance = 0;
     for (const t of postTxns) actualBalance += t.direction === "credit" ? t.amountRials : -t.amountRials;
-    return { balanceAfter: actualBalance, duplicate: false as const };
-  });
 
-  if (!result.duplicate) {
+    // M-04: the refund audit JOINS the transaction (critical) — one
+    // refund converges on exactly one ledger event, one wallet mutation
+    // and one durable audit row. Idempotent re-entries exited earlier
+    // (duplicate) and never re-audit.
     await audit({
       userId: order.userId,
       actor: "admin",
@@ -392,8 +400,13 @@ export async function refund(input: {
       targetType: "order",
       targetId: order.id,
       ip: input.ip,
-      meta: { adminId: input.adminId, amountRials: input.amount, balanceAfter: result.balanceAfter, kind: order.kind },
+      tx,
+      critical: true,
+      meta: { adminId: input.adminId, amountRials: input.amount, balanceAfter: actualBalance, kind: order.kind },
     });
-  }
+
+    return { balanceAfter: actualBalance, duplicate: false as const };
+  });
+
   return { balanceRials: result.balanceAfter };
 }

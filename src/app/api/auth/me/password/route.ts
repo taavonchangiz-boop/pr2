@@ -76,26 +76,29 @@ export async function POST(req: Request) {
   }
 
   const newHash = await hashPassword(newPassword);
-  await db.user.update({ where: { id: user.id }, data: { passwordHash: newHash } });
-  // Revoke ALL existing sessions for this user EXCEPT the current one so that
-  // any stolen sessions elsewhere are immediately invalidated.
-  const c = await import("next/headers");
-  const cookiesNow = await c.cookies();
-  const cookieToken = cookiesNow.get("postyar_sid")?.value;
-  // The current session is identified by the JWT's sid; we need the hash.
-  // Easier approach: revoke ALL sessions for the user, then re-create the
-  // current one. For simplicity here, revoke every non-current session row.
-  // Read the current session's id from JWT:
-  const { verifyJwt } = await import("@/lib/security/crypto");
-  const payload = cookieToken ? verifyJwt(cookieToken) : null;
-  if (payload?.sid) {
-    await db.session.updateMany({
-      where: { userId: user.id, id: { not: payload.sid }, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
-  } else {
-    await db.session.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } });
-  }
+  // M-11: credential change + mass session revocation commit ATOMICALLY.
+  await db.$transaction(async (tx) => {
+    await tx.user.update({ where: { id: user.id }, data: { passwordHash: newHash } });
+    // Revoke ALL existing sessions for this user EXCEPT the current one so that
+    // any stolen sessions elsewhere are immediately invalidated.
+    const c = await import("next/headers");
+    const cookiesNow = await c.cookies();
+    const cookieToken = cookiesNow.get("postyar_sid")?.value;
+    // The current session is identified by the JWT's sid; we need the hash.
+    // Easier approach: revoke ALL sessions for the user, then re-create the
+    // current one. For simplicity here, revoke every non-current session row.
+    // Read the current session's id from JWT:
+    const { verifyJwt } = await import("@/lib/security/crypto");
+    const payload = cookieToken ? verifyJwt(cookieToken) : null;
+    if (payload?.sid) {
+      await tx.session.updateMany({
+        where: { userId: user.id, id: { not: payload.sid }, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+    } else {
+      await tx.session.updateMany({ where: { userId: user.id, revokedAt: null }, data: { revokedAt: new Date() } });
+    }
+  });
   await audit({
     userId: user.id,
     actor: "user",

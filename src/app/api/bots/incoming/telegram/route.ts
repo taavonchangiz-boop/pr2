@@ -13,8 +13,9 @@
 //   4. Parse update. If message or callback_query, dispatch to the workflow
 //      engine for the bot's enabled workflows. Acknowledge with 200 OK so
 //      Telegram doesn't retry.
-//   5. Idempotent on update_id (24h cache + BotHistory.raw JSON-embedded
-//      `_update_id` for forensic recovery).
+//   5. C-04/H-03: DURABLY idempotent on update_id via the BotInboundEvent
+//      inbox (UNIQUE bot+provider+event, lease + crash-recovery retry);
+//      BotHistory.raw JSON-embedded `_update_id` stays for forensics.
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import {
@@ -26,7 +27,15 @@ import {
   verifyTelegramSecretToken,
   computeWebhookBodySignature,
 } from "@/lib/bots/register-webhook";
-import { webhookRequestGuard, claimUpdateOnce, readBoundedWebhookBody } from "@/lib/bots/webhook-guard";
+import { webhookRequestGuard, readBoundedWebhookBody } from "@/lib/bots/webhook-guard";
+import {
+  ensureBotEvent,
+  claimBotEvent,
+  completeBotEvent,
+  failBotEvent,
+  recoverBotEvents,
+  runWorkflowOnceForEvent,
+} from "@/lib/bots/event-dedup";
 import { executeWorkflow, persistInboundOnce } from "@/lib/bots/workflow";
 import { audit } from "@/lib/server/auth";
 import type { Bot, BotWorkflow } from "@prisma/client";
@@ -123,17 +132,50 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, errorFa: "بدنه وب‌هوک نامعتبر است." }, { status: 400 });
   }
 
-  // Idempotency at the handler level (24h, ATOMIC claim — audit W2).
-  // The workflow engine ALSO has its own dedup — but we check early to
-  // skip workflow loading. The old get-then-set dedup allowed two
-  // concurrent deliveries of the same update_id to both run workflows.
+  // C-04/H-03 — DURABLE event claim (DB inbox, replaces the volatile
+  // cache.incr claim): duplicate deliveries are collapsed by the UNIQUE
+  // constraint, a crash after the claim is recoverable (lease takeover +
+  // bounded recovery pass on the next inbound request for this bot), and
+  // completed events never execute again.
   const updateId = update.update_id;
-  const firstDelivery = await claimUpdateOnce(bot.id, bot.provider, String(updateId));
-  if (!firstDelivery) {
-    // Already processed — ack 200 so Telegram doesn't retry.
+  const event = await ensureBotEvent(bot, "telegram", String(updateId), update);
+  const claimed = await claimBotEvent(event.id);
+  if (!claimed) {
+    // Completed/owned elsewhere/stale-unclaimed — ack 200 so Telegram
+    // doesn't retry; the durable inbox owns any retry.
     return NextResponse.json({ ok: true, duplicate: true });
   }
+  try {
+    await processTelegramUpdate(bot, update, { isRetry: event.attempts > 1, eventId: event.id });
+    await completeBotEvent(event.id);
+  } catch (err) {
+    await failBotEvent(
+      event.id,
+      err instanceof Error ? `${err.name}: ${err.message}` : "خطای پردازش رویداد.",
+    );
+    // Still ack 200 — the durable inbox retries (provider redelivery or
+    // the bounded recovery pass); a 500 would only add unbounded retries.
+  }
 
+  // Bounded crash-recovery pass for this bot (C-04/H-03): re-processes
+  // failed/stale events from their stored payloads.
+  await recoverBotEvents(bot, (b, payload, o) => processTelegramUpdate(b, payload as TgUpdate, o));
+
+  return NextResponse.json({ ok: true });
+}
+
+/**
+ * Provider-specific processing for one Telegram update — the single code
+ * path used by BOTH live delivery and durable recovery. Replay-safety:
+ * link-code consumption is one-time (DB UNIQUE), side-effecting workflow
+ * actions carry deterministic idempotency keys, and per-event workflow
+ * runs (BotWorkflowRun UNIQUE) prevent double execution.
+ */
+async function processTelegramUpdate(
+  bot: Bot,
+  update: TgUpdate,
+  opts: { isRetry: boolean; eventId: string },
+): Promise<void> {
   // Extract chat id + incoming text
   let chatId = "";
   let incomingText = "";
@@ -148,14 +190,17 @@ export async function POST(req: Request) {
   }
 
   if (!chatId) {
-    // Nothing we can do — but ack so Telegram doesn't retry.
-    return NextResponse.json({ ok: true, noChat: true });
+    // Nothing we can do — the caller acks and completes the event.
+    return;
   }
 
   // C-11/C-12: persist the inbound history row ONCE per event (the old
   // code persisted it inside executeWorkflow — once per matched workflow —
   // or here when nothing matched, producing duplicate/missing rows).
-  await persistInboundOnce(bot, chatId, incomingText, update, updateId);
+  // On a durable retry the row already exists — never duplicate it.
+  if (!opts.isRetry) {
+    await persistInboundOnce(bot, chatId, incomingText, update, update.update_id);
+  }
 
   // If the incoming text starts with `POSTYAR-`, it's a link-code consumption
   // attempt — verify + consume.
@@ -190,45 +235,40 @@ export async function POST(req: Request) {
         },
       });
     } catch { /* best-effort */ }
-    return NextResponse.json({ ok: true, linkConsumed: result.ok });
+    return;
   }
 
-  // Otherwise, run enabled workflows that match this trigger.
+  // Otherwise, run enabled workflows that match this trigger. Each
+  // intended workflow gets a UNIQUE per-event run row: executed exactly
+  // once per event, retried when failed, never repeated when completed.
   const workflows = await db.botWorkflow.findMany({
     where: { botId: bot.id, enabled: true },
     take: 50,
   });
-  let matchedAny = false;
   for (const wf of workflows) {
     if (!matchesTrigger(wf, incomingText)) continue;
-    try {
-      const r = await executeWorkflow({
+    const r = await runWorkflowOnceForEvent(opts.eventId, wf.id, async () => {
+      await executeWorkflow({
         bot,
         providerUserId: chatId,
         rawUpdate: update,
         incomingMessage: incomingText,
         callbackQueryId,
-        updateId,
+        updateId: update.update_id,
         workflow: wf,
       });
-      if (r.matched) matchedAny = true;
-    } catch (err) {
+    });
+    if (!r.ok) {
       await audit({
         userId: bot.ownerId,
         actor: "system",
         action: "bot_workflow_execute_failed",
         targetType: "bot",
         targetId: bot.id,
-        meta: {
-          workflowId: wf.id,
-          name: err instanceof Error ? err.name : "Error",
-        },
+        meta: { workflowId: wf.id, eventId: opts.eventId },
       });
     }
   }
-
-  // Always 200 so Telegram doesn't retry.
-  return NextResponse.json({ ok: true, matched: matchedAny });
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {
@@ -254,4 +294,3 @@ export async function GET() {
 }
 
 void hmacSign; // referenced via verifyWebhookSig — kept for clarity
-void executeWorkflow;

@@ -341,15 +341,25 @@ export async function PATCH(req: Request) {
   if (writable.length === 0) {
     return NextResponse.json({ ok: true, count: 0, unchanged: true });
   }
-  // Upsert each row sequentially (Prisma doesn't have batch upsert for a
-  // heterogeneous key set; rows are few — ≤64 — so this is fine).
-  for (const it of writable) {
-    const storedValue = prepareStoredValue(it.key, it.value);
-    await db.systemSetting.upsert({
-      where: { key: it.key },
-      create: { key: it.key, value: storedValue },
-      update: { value: storedValue },
+  // M-01: the WHOLE batch is ONE DB transaction — validate-all-before-
+  // write only covered the key allowlist; a mid-loop DB error previously
+  // committed rows 1..k-1 (partial batch) and surfaced as a 500. Now an
+  // upsert failure rolls back every row of the batch (all-or-nothing),
+  // the shared cache is invalidated and the epoch is bumped ONLY after a
+  // successful commit, and exactly one coherent audit event is written.
+  try {
+    await db.$transaction(async (tx) => {
+      for (const it of writable) {
+        const storedValue = prepareStoredValue(it.key, it.value);
+        await tx.systemSetting.upsert({
+          where: { key: it.key },
+          create: { key: it.key, value: storedValue },
+          update: { value: storedValue },
+        });
+      }
     });
+  } catch {
+    return NextResponse.json({ errorFa: "ذخیره‌سازی تنظیمات ناموفق بود؛ هیچ تغییری اعمال نشد." }, { status: 500 });
   }
   invalidateSettingsCache();
   // C-05: one shared-epoch bump covers the whole batch.

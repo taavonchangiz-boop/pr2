@@ -85,7 +85,7 @@ import { AdSlot } from "@/components/layout/ad-slot";
 import { StickyAdBar } from "@/components/layout/sticky-ad-bar";
 import { cn } from "@/lib/utils";
 import { toPersianDigits, formatJalaliDate } from "@/lib/persian";
-import type { PlanFeatures, PlanBooleanFeatureKey } from "@/lib/payments/plans";
+import type { PlanFeatures, PlanBooleanFeatureKey } from "@/lib/payments/plan-catalog";
 
 import StatsView from "@/components/postyar/dashboard/stats-view";
 import AdminStatsView from "@/components/postyar/admin/stats";

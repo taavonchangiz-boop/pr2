@@ -37,6 +37,7 @@ import { dispatchAi } from "@/lib/ai/dispatch";
 import { notify, type NotificationCategory } from "@/lib/notifications";
 import { createTicket, type TicketCategory, type TicketPriority } from "@/lib/tickets";
 import { getGoldPrice, type GoldInstrument } from "@/lib/providers/gold";
+import { AI_PROVIDER_IDS } from "@/lib/providers/ai";
 import type { Bot, BotWorkflow } from "@prisma/client";
 
 // ---------------------------------------------------------------------
@@ -156,21 +157,25 @@ export async function findLinkedUser(botId: string, providerUserId: string): Pro
 // C-11/C-12 — DEDUPLICATION OWNERSHIP
 // ---------------------------------------------------------------------
 // The inbound-update deduplication has exactly ONE authoritative owner:
-// the webhook/cron layer that receives the event, via the ATOMIC
-// claimUpdateOnce() (atomic INCR in both the Redis and in-memory
-// backends) — or, for payment-bearing Bale events, the durable
-// BalePaymentRef UNIQUE constraints in the database.
+// the DURABLE DB inbox in src/lib/bots/event-dedup.ts —
+// BotInboundEvent (UNIQUE bot+provider+externalEventId, lease,
+// received→processing→completed/failed/dead) + per-workflow
+// BotWorkflowRun (UNIQUE eventId+workflowId). It replaced the volatile
+// cache-INCR claim, which was at-most-once: a crash after the claim
+// permanently suppressed the provider's retry, and without REDIS_URL
+// it degraded to a per-process Map. Payment-bearing Bale events keep
+// their dedicated durable path (BalePaymentRef UNIQUE constraints).
 //
 // executeWorkflow() deliberately performs NO update-level dedup of its
 // own. The previous second layer (cache get-then-set on the same update
 // key) suppressed every workflow AFTER the first one matched the same
 // event — one event with multiple intended workflows executed only the
-// first (self-suppression), the exact C-11/C-12 defect. Removing the
-// second layer gives the required semantics:
+// first (self-suppression), the exact C-11/C-12 defect. With the single
+// durable owner the required semantics hold:
 //
 //   one inbound event → EACH intended workflow executes exactly once
-//   semantically (duplicate EVENT deliveries are still collapsed by the
-//   single owner above).
+//   (across crashes/retries), and a failed workflow never suppresses
+//   its siblings.
 //
 // Side-effecting actions keep their own deterministic idempotency keys
 // (AI: AiJob.idempotencyKey UNIQUE; payments: Order.idempotencyKey), so
@@ -191,6 +196,15 @@ const ACTION_FEATURE_GATE: Partial<Record<ActionKind, PlanBooleanFeatureKey>> = 
   show_gold: "goldMonitor",
   invoke_ai: "smartReply",
 };
+
+// M-07 — validation-time allowlists for action configs (kept in sync
+// with the runtime casts; unknown values are rejected at save time
+// instead of blowing up or misbehaving at execution time).
+const TICKET_CATEGORIES: readonly TicketCategory[] = [
+  "general", "billing", "technical", "ai", "gold", "woo", "bot", "security",
+];
+const TICKET_PRIORITIES: readonly TicketPriority[] = ["low", "normal", "high", "urgent"];
+const GOLD_INSTRUMENTS: readonly GoldInstrument[] = ["18k", "emami", "bahar_azadi", "ounce"];
 
 async function assertActionEntitlement(
   ownerId: string,
@@ -335,6 +349,31 @@ export async function executeWorkflow(ctx: WorkflowContext): Promise<WorkflowRes
   //
   // Resolve linked user once.
   const linkedUser = await findLinkedUser(ctx.bot.id, ctx.providerUserId);
+
+  // H-04 — ENGINE-LEVEL entitlement gate. A workflow is a premium
+  // automation capability ("workflow" boolean): execution requires the
+  // bot OWNER's CURRENT plan to still include it. A workflow created
+  // under an active subscription therefore stops executing after
+  // expiry/downgrade instead of silently retaining the capability.
+  // (Free plans never had bot/workflow enabled — see SEED_PLANS — and
+  // bot/workflow creation is already plan-gated at the API boundary.)
+  const ownerFeatures = await getEffectiveFeatures(ctx.bot.ownerId);
+  if (!getFeatureBoolean(ownerFeatures, "workflow", false)) {
+    await audit({
+      userId: linkedUser?.id ?? null,
+      actor: "system",
+      action: "bot_workflow_entitlement_blocked",
+      targetType: "bot_workflow",
+      targetId: ctx.workflow.id,
+      meta: { botId: ctx.bot.id, feature: "workflow", scope: "engine" },
+    });
+    return {
+      ok: true,
+      matched: false,
+      outboundCount: 0,
+      errorFa: "امکان گردش کار در پلن فعلی مالک ربات فعال نیست.",
+    };
+  }
 
   // Loop protection: cap visited steps at steps.length * 2 (DAG shouldn't
   // exceed linear traversal).
@@ -906,6 +945,24 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
       if (!allowed.includes(step.condition.kind)) {
         return { ok: false, errorFa: `نوع شرط نامعتبر: ${String(step.condition.kind)}` };
       }
+      // M-07: bound the condition value — it is interpolated into cache
+      // keys / comparisons and must never carry control characters or
+      // unbounded payload.
+      if (step.condition.value !== undefined) {
+        const v = step.condition.value;
+        if (typeof v !== "string" || v.length > 200 || /[\u0000-\u001f\u007f]/.test(v)) {
+          return { ok: false, errorFa: `مقدار شرط در گام «${step.id}» نامعتبر است (حداکثر ۲۰۰ نویسه، بدون نویسه کنترلی).` };
+        }
+      }
+    }
+    // M-07: message-type steps are outbound sends — their text must obey
+    // the same 4000-char bound as send_message actions (previously only
+    // the action branch was bounded).
+    if (step.type === "message") {
+      const text = typeof step.text === "string" ? step.text : "";
+      if (text.length > 4000) {
+        return { ok: false, errorFa: `متن گام پیام «${step.id}» بیش از حد طولانی است (حداکثر ۴۰۰۰ نویسه).` };
+      }
     }
   }
   const startSteps = steps.filter((s) => (s as WorkflowStep).type === "start");
@@ -958,11 +1015,61 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
           if (cfg.items !== undefined && !Array.isArray(cfg.items)) {
             return { ok: false, errorFa: `آیتم‌های منو در گام «${step.id}» باید آرایه باشند.` };
           }
+          // M-07: bound menu size and labels (previously unbounded).
+          if (Array.isArray(cfg.items)) {
+            if (cfg.items.length > 20) {
+              return { ok: false, errorFa: `منوی گام «${step.id}» بیش از ۲۰ آیتم دارد.` };
+            }
+            for (const it of cfg.items) {
+              const label = String((it as { label?: string })?.label ?? (it as { text?: string })?.text ?? "");
+              if (label.length > 128) {
+                return { ok: false, errorFa: `برچسب آیتم منو در گام «${step.id}» بیش از حد طولانی است.` };
+              }
+            }
+          }
+          const menuBtns = cfg.buttons;
+          if (menuBtns !== undefined && !Array.isArray(menuBtns)) {
+            return { ok: false, errorFa: `دکمه‌های گام «${step.id}» باید آرایه باشند.` };
+          }
+          if (Array.isArray(menuBtns) && !buttonsAreSafe(menuBtns)) {
+            return { ok: false, errorFa: `دکمه‌های گام «${step.id}» نشانی یا داده نامعتبر دارند.` };
+          }
+          break;
+        }
+        case "create_ticket": {
+          // M-07: ticket fields were previously unvalidated blind casts.
+          const subject = String(cfg.subject ?? "");
+          if (subject.length > 200) {
+            return { ok: false, errorFa: `موضوع تیکت در گام «${step.id}» بیش از حد طولانی است.` };
+          }
+          const body = String(cfg.body ?? "");
+          if (body.length > 4000) {
+            return { ok: false, errorFa: `متن تیکت در گام «${step.id}» بیش از حد طولانی است.` };
+          }
+          const cat = String(cfg.category ?? "bot");
+          if (!(TICKET_CATEGORIES as readonly string[]).includes(cat)) {
+            return { ok: false, errorFa: `دسته‌بندی تیکت در گام «${step.id}» نامعتبر است.` };
+          }
+          const prio = String(cfg.priority ?? "normal");
+          if (!(TICKET_PRIORITIES as readonly string[]).includes(prio)) {
+            return { ok: false, errorFa: `اولویت تیکت در گام «${step.id}» نامعتبر است.` };
+          }
+          break;
+        }
+        case "show_gold": {
+          // M-07: instrument must be a known gold instrument.
+          const instrument = String(cfg.instrument ?? "18k");
+          if (!(GOLD_INSTRUMENTS as readonly string[]).includes(instrument)) {
+            return { ok: false, errorFa: `ابزار طلا در گام «${step.id}» نامعتبر است.` };
+          }
           break;
         }
         case "initiate_payment": {
           const planCode = String(cfg.planCode ?? "").trim();
           if (!planCode) return { ok: false, errorFa: `کد طرح پرداخت در گام «${step.id}» الزامی است.` };
+          if (planCode.length > 64) {
+            return { ok: false, errorFa: `کد طرح پرداخت در گام «${step.id}» بیش از حد طولانی است.` };
+          }
           break;
         }
         case "invoke_ai": {
@@ -970,11 +1077,46 @@ export function validateWorkflowDef(steps: unknown): { ok: boolean; errorFa?: st
           // prompt may fall back to the incoming message at runtime; only
           // validate length when a prompt is configured.
           if (prompt.length > 8000) return { ok: false, errorFa: `پرامپت هوش مصنوعی در گام «${step.id}» بیش از حد طولانی است.` };
+          // M-07: provider/model bounds — an unknown provider id would
+          // previously be passed through and only rejected at runtime.
+          if (cfg.provider !== undefined) {
+            const prov = String(cfg.provider);
+            if (!(AI_PROVIDER_IDS as readonly string[]).includes(prov)) {
+              return { ok: false, errorFa: `ارائه‌دهنده هوش مصنوعی در گام «${step.id}» نامعتبر است.` };
+            }
+          }
+          if (cfg.model !== undefined && String(cfg.model).length > 100) {
+            return { ok: false, errorFa: `نام مدل هوش مصنوعی در گام «${step.id}» بیش از حد طولانی است.` };
+          }
+          if (cfg.systemPrompt !== undefined && String(cfg.systemPrompt).length > 4000) {
+            return { ok: false, errorFa: `پیام سیستم هوش مصنوعی در گام «${step.id}» بیش از حد طولانی است.` };
+          }
           break;
         }
         case "create_notification": {
           const title = String(cfg.titleFa ?? "").trim();
           if (!title) return { ok: false, errorFa: `عنوان اعلان در گام «${step.id}» الزامی است.` };
+          if (title.length > 200) {
+            return { ok: false, errorFa: `عنوان اعلان در گام «${step.id}» بیش از حد طولانی است.` };
+          }
+          // M-07: previously unbounded fields.
+          const nBody = String(cfg.bodyFa ?? "");
+          if (nBody.length > 4000) {
+            return { ok: false, errorFa: `متن اعلان در گام «${step.id}» بیش از حد طولانی است.` };
+          }
+          if (cfg.confirmText !== undefined && String(cfg.confirmText).length > 200) {
+            return { ok: false, errorFa: `متن تأیید اعلان در گام «${step.id}» بیش از حد طولانی است.` };
+          }
+          if (cfg.link !== undefined) {
+            const link = String(cfg.link);
+            // A notification link is a UI navigation target: either a
+            // relative in-app path or an https URL — never a scheme trick.
+            const okLink = (link.startsWith("/") && !link.startsWith("//") && !/[\u0000-\u001f\u007f]/.test(link))
+              || safeButtonUrl(link) !== undefined;
+            if (!okLink || link.length > 512) {
+              return { ok: false, errorFa: `نشانی اعلان در گام «${step.id}» نامعتبر است.` };
+            }
+          }
           break;
         }
         case "show_order":

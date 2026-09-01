@@ -120,7 +120,21 @@ export async function PATCH(
   const data: Record<string, string> = {};
   if (parsed.data.status) data.status = parsed.data.status;
   if (parsed.data.role) data.role = parsed.data.role;
-  const updated = await db.user.update({ where: { id }, data });
+  // M-11: a status change (suspension) and the revocation of the user's
+  // live sessions commit ATOMICALLY — the account is locked out at the
+  // same instant its sessions die (previously the suspension relied
+  // solely on lazy per-request revocation, leaving live session rows
+  // valid until each happened to be used again).
+  const updated = await db.$transaction(async (tx) => {
+    const u = await tx.user.update({ where: { id }, data });
+    if (data.status) {
+      await tx.session.updateMany({
+        where: { userId: id, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+    }
+    return u;
+  });
   await audit({
     userId: user.id,
     actor: "admin",

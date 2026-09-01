@@ -35,6 +35,8 @@ const TABLES = [
   "botHistory",
   "botLinkCode",
   "botWorkflow",
+  "botWorkflowRun",
+  "botInboundEvent",
   "autoResponder",
   "notification",
   "media",

@@ -42,3 +42,9 @@ const TEST_DB_PATH = path.join(process.cwd(), "db", "test.db");
 const TEST_DB_URL = `file:${TEST_DB_PATH}?socket_timeout=30000&busy_timeout=30000&connection_limit=1`;
 process.env.TEST_DATABASE_URL = TEST_DB_URL;
 (process.env as Record<string, string | undefined>).DATABASE_URL = TEST_DB_URL;
+// HERMETIC BUSINESS DEFAULTS: the suite asserts the documented referral
+// defaults (20%, cap 100k — addendum §16). An operator .env carrying
+// different overrides must never flip test expectations (bun auto-loads
+// .env from cwd). Tests that need other values set them explicitly.
+process.env.POSTYAR_REFERRAL_PERCENT = "20";
+process.env.POSTYAR_REFERRAL_CAP_RIALS = "100000";

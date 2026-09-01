@@ -7,15 +7,16 @@
 //     from anyone who has seen the URL), so unauthenticated flooding
 //     must be throttled and oversized bodies rejected BEFORE the DB
 //     lookup and HMAC work (CPU + AuditLog INSERT amplification).
-//   * claimUpdateOnce — ATOMIC update_id dedup. The previous
-//     check-then-set (cache.get then cache.set) let two concurrent
-//     deliveries of the same update BOTH run their workflows. A counter
-//     incr with TTL is atomic in both the Redis-backed and in-memory
-//     implementations: the first caller observes 1 and wins; every
-//     later delivery observes > 1 and is dropped.
+//
+// Event-level deduplication NO LONGER LIVES HERE. The former volatile
+// claim (claimUpdateOnce — atomic INCR with a 24h TTL) was at-most-once:
+// a crash after the claim permanently suppressed the provider's retry,
+// and without REDIS_URL it degraded to a per-process Map. The single
+// authoritative dedup owner is now the durable DB inbox in
+// src/lib/bots/event-dedup.ts (BotInboundEvent UNIQUE + lease + retry).
 // =====================================================================
 import { NextResponse } from "next/server";
-import { cache, rateLimit } from "@/lib/security/cache";
+import { rateLimit } from "@/lib/security/cache";
 import { clientIp } from "@/lib/server/auth";
 
 export const WEBHOOK_MAX_BODY_BYTES = 1 * 1024 * 1024; // 1 MiB — Bot API updates are far smaller
@@ -71,14 +72,4 @@ export async function readBoundedWebhookBody(req: Request): Promise<{ ok: true; 
   }
   const parts = chunks.map((c) => Buffer.from(c));
   return { ok: true, text: Buffer.concat(parts).toString("utf8") };
-}
-
-/**
- * Atomic first-delivery claim. Returns true when THIS call is the first
- * delivery of the update (and therefore should be processed); false when
- * the update was already claimed (duplicate delivery).
- */
-export async function claimUpdateOnce(botId: string, provider: string, updateId: string | number): Promise<boolean> {
-  const n = await cache.incr(`bot:upd:${botId}:${provider}:${String(updateId)}`, 24 * 60 * 60 * 1000);
-  return n === 1;
 }

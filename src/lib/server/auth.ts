@@ -311,6 +311,13 @@ export async function audit(opts: {
    *  single-connection deadlock that happens when a global-client write is
    *  issued from inside an open transaction. */
   tx?: Prisma.TransactionClient;
+  /** M-04: critical audits (financial/security actions) must NEVER be
+   *  lost. Inside a transaction the row commits atomically with the
+   *  action — a failure here throws, rolling back the whole operation so
+   *  committed money can never exist without its audit trail; the
+   *  caller's idempotent retry heals. Non-critical calls stay
+   *  best-effort (logged, never break the main flow). */
+  critical?: boolean;
 }): Promise<void> {
   const client = opts.tx ?? db;
   try {
@@ -326,6 +333,9 @@ export async function audit(opts: {
       },
     });
   } catch (err) {
+    if (opts.critical) {
+      throw err instanceof Error ? err : new Error("audit write failed");
+    }
     // Audit must never break the main flow, but a lost audit row for a
     // security/financial action must at least be VISIBLE to operators
     // (audit §31 — silent failure). Never swallow without a trace.

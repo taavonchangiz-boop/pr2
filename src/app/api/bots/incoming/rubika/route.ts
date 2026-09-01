@@ -12,8 +12,9 @@
 //   2. Load the bot. Verify owner-less (cron owns this) — but verify the
 //      bot exists and is active.
 //   3. Call Rubika `get_updates` (offset = lastUpdateId + 1).
-//   4. For each update: dispatch to the workflow engine (matching
-//      message/callback) — or persist inbound for inbox forensics.
+//   4. For each update: durable BotInboundEvent claim (C-04/H-03), then
+//      dispatch to the workflow engine (matching message/callback) — or
+//      persist inbound for inbox forensics.
 //   5. Return { processed: N, lastUpdateId }.
 import { NextResponse } from "next/server";
 import { z } from "zod";
@@ -21,9 +22,16 @@ import { db } from "@/lib/db";
 import { decryptString } from "@/lib/security/crypto";
 import { requireCronSecret } from "@/lib/server/cron-secret";
 import { audit } from "@/lib/server/auth";
-import { claimUpdateOnce } from "@/lib/bots/webhook-guard";
+import {
+  ensureBotEvent,
+  claimBotEvent,
+  completeBotEvent,
+  failBotEvent,
+  recoverBotEvents,
+  runWorkflowOnceForEvent,
+} from "@/lib/bots/event-dedup";
 import { executeWorkflow, persistInboundOnce } from "@/lib/bots/workflow";
-import type { BotWorkflow } from "@prisma/client";
+import type { Bot, BotWorkflow } from "@prisma/client";
 
 const PollSchema = z.object({
   botId: z.string().min(1),
@@ -129,75 +137,130 @@ export async function POST(req: Request) {
     const uid = typeof update.update_id === "number" ? update.update_id :
       typeof update.update_id === "string" ? Number(update.update_id) : 0;
     if (Number.isFinite(uid) && uid > lastUpdateId) lastUpdateId = uid;
-    // Idempotency (atomic claim — audit W2). Updates without a usable
-    // update_id are NOT deduped onto one shared key anymore (audit W3 —
-    // they used to collapse onto a single key and be silently dropped).
-    if (!Number.isFinite(uid) || uid === 0) {
-      // no dedup key available — process without dedup
-    } else {
-      const firstDelivery = await claimUpdateOnce(bot.id, "rubika", String(uid));
-      if (!firstDelivery) continue;
-    }
 
-    // Extract chat + text
-    let chatId = "";
-    let incomingText = "";
-    let callbackQueryId: string | undefined;
-    let providerMessageId: string | number | undefined;
-    if (update.message) {
-      chatId = String(update.message.chat_id ?? update.message.object_id ?? update.message.from?.id ?? "");
-      incomingText = update.message.text ?? update.message.caption ?? "";
-      providerMessageId = update.message.message_id;
-    } else if (update.callback_query) {
-      callbackQueryId = update.callback_query.callback_id;
-      chatId = String(update.callback_query.from?.id ?? update.callback_query.message?.chat_id ?? "");
-      incomingText = update.callback_query.data ?? "";
-    }
-    if (!chatId) continue;
-
-    // C-11/C-12: persist the inbound history row ONCE per event (owned by
-    // the poller layer, not per workflow).
-    await persistInboundOnce(bot, chatId, incomingText, update, uid, providerMessageId);
-
-    // Link-code consumption attempt.
-    if (incomingText.startsWith("POSTYAR-")) {
-      const { consumeLinkCode } = await import("@/lib/bots/link");
-      const result = await consumeLinkCode({
-        botId: bot.id,
-        code: incomingText.trim(),
-        providerUserId: chatId,
-      });
-      const reply = result.ok
-        ? "حساب پُست‌یار شما با موفقیت به این ربات متصل شد."
-        : (result.errorFa ?? "اتصال ناموفق بود.");
+    if (Number.isFinite(uid) && uid !== 0) {
+      // C-04/H-03 — durable BotInboundEvent claim (replaces the volatile
+      // cache.incr claim): duplicates collapse on the UNIQUE constraint,
+      // a crash after the claim is retryable via lease takeover and the
+      // bounded recovery pass instead of lost forever.
+      const event = await ensureBotEvent(bot, "rubika", String(uid), update);
+      const claimed = await claimBotEvent(event.id);
+      if (!claimed) continue;
       try {
-        const { getDestinationProvider } = await import("@/lib/providers");
-        const provider = getDestinationProvider("rubika");
-        await provider.publishMessage({ botToken, chatId, text: reply });
-        await db.botHistory.create({
-          data: {
-            botId: bot.id,
-            direction: "outbound",
-            providerUserId: chatId,
-            userId: result.userId ?? null,
-            text: reply.slice(0, 4000),
-          },
+        await processRubikaUpdate(bot, update, {
+          isRetry: event.attempts > 1,
+          eventId: event.id,
         });
-      } catch { /* best-effort */ }
-      processed++;
-      continue;
-    }
-
-    // Workflow dispatch
-    const workflows = await db.botWorkflow.findMany({
-      where: { botId: bot.id, enabled: true },
-      take: 50,
-    });
-    let matchedAny = false;
-    for (const wf of workflows) {
-      if (!matchesTrigger(wf, incomingText)) continue;
+        await completeBotEvent(event.id);
+      } catch (err) {
+        await failBotEvent(
+          event.id,
+          err instanceof Error ? `${err.name}: ${err.message}` : "خطای پردازش رویداد.",
+        );
+      }
+    } else {
+      // No dedup key available — process without dedup (audit W3:
+      // distinct updates must never collapse onto one shared key).
       try {
-        const r2 = await executeWorkflow({
+        await processRubikaUpdate(bot, update, { isRetry: false, eventId: null });
+      } catch (err) {
+        await audit({
+          userId: bot.ownerId,
+          actor: "system",
+          action: "bot_workflow_execute_failed",
+          targetType: "bot",
+          targetId: bot.id,
+          meta: { name: err instanceof Error ? err.name : "Error", unkeyed: true },
+        });
+      }
+    }
+    processed++;
+  }
+
+  // Bounded crash-recovery pass for this bot (C-04/H-03).
+  await recoverBotEvents(bot, (b, payload, o) => processRubikaUpdate(b, payload as RubikaUpdate, o));
+
+  return NextResponse.json({ ok: true, processed, lastUpdateId });
+}
+
+/**
+ * Provider-specific processing for one Rubika update — shared by live
+ * polling and durable recovery. `eventId` is null only for updates with
+ * no usable update_id (no dedup key — audit W3); those run without
+ * per-event run rows. Replay-safety otherwise: link-code consumption is
+ * one-time (DB UNIQUE) and side-effecting actions carry deterministic
+ * idempotency keys.
+ */
+async function processRubikaUpdate(
+  bot: Bot,
+  update: RubikaUpdate,
+  opts: { isRetry: boolean; eventId: string | null },
+): Promise<void> {
+  const uid = typeof update.update_id === "number" ? update.update_id :
+    typeof update.update_id === "string" ? Number(update.update_id) : 0;
+
+  // Extract chat + text
+  let chatId = "";
+  let incomingText = "";
+  let callbackQueryId: string | undefined;
+  let providerMessageId: string | number | undefined;
+  if (update.message) {
+    chatId = String(update.message.chat_id ?? update.message.object_id ?? update.message.from?.id ?? "");
+    incomingText = update.message.text ?? update.message.caption ?? "";
+    providerMessageId = update.message.message_id;
+  } else if (update.callback_query) {
+    callbackQueryId = update.callback_query.callback_id;
+    chatId = String(update.callback_query.from?.id ?? update.callback_query.message?.chat_id ?? "");
+    incomingText = update.callback_query.data ?? "";
+  }
+  if (!chatId) return;
+
+  // C-11/C-12: persist the inbound history row ONCE per event (owned by
+  // the poller layer, not per workflow). Skipped on durable retries.
+  if (!opts.isRetry) {
+    await persistInboundOnce(bot, chatId, incomingText, update, uid, providerMessageId);
+  }
+
+  // Link-code consumption attempt.
+  if (incomingText.startsWith("POSTYAR-")) {
+    const { consumeLinkCode } = await import("@/lib/bots/link");
+    const result = await consumeLinkCode({
+      botId: bot.id,
+      code: incomingText.trim(),
+      providerUserId: chatId,
+    });
+    const reply = result.ok
+      ? "حساب پُست‌یار شما با موفقیت به این ربات متصل شد."
+      : (result.errorFa ?? "اتصال ناموفق بود.");
+    try {
+      const { getDestinationProvider } = await import("@/lib/providers");
+      const provider = getDestinationProvider("rubika");
+      await provider.publishMessage({ botToken: decryptString(bot.botTokenEnc), chatId, text: reply });
+      await db.botHistory.create({
+        data: {
+          botId: bot.id,
+          direction: "outbound",
+          providerUserId: chatId,
+          userId: result.userId ?? null,
+          text: reply.slice(0, 4000),
+        },
+      });
+    } catch { /* best-effort */ }
+    return;
+  }
+
+  // Workflow dispatch — per-event UNIQUE run rows guarantee exactly-once
+  // execution per intended workflow across retries and recovery.
+  const workflows = await db.botWorkflow.findMany({
+    where: { botId: bot.id, enabled: true },
+    take: 50,
+  });
+  for (const wf of workflows) {
+    if (!matchesTrigger(wf, incomingText)) continue;
+    if (opts.eventId === null) {
+      // No dedup key: run directly (previous semantics, never collapsed).
+      try {
+        await executeWorkflow({
           bot,
           providerUserId: chatId,
           rawUpdate: update,
@@ -207,7 +270,6 @@ export async function POST(req: Request) {
           providerMessageId,
           workflow: wf,
         });
-        if (r2.matched) matchedAny = true;
       } catch (err) {
         await audit({
           userId: bot.ownerId,
@@ -215,14 +277,34 @@ export async function POST(req: Request) {
           action: "bot_workflow_execute_failed",
           targetType: "bot",
           targetId: bot.id,
-          meta: { workflowId: wf.id, name: err instanceof Error ? err.name : "Error" },
+          meta: { workflowId: wf.id, name: err instanceof Error ? err.name : "Error", unkeyed: true },
         });
       }
+      continue;
     }
-    processed++;
+    const r = await runWorkflowOnceForEvent(opts.eventId, wf.id, async () => {
+      await executeWorkflow({
+        bot,
+        providerUserId: chatId,
+        rawUpdate: update,
+        incomingMessage: incomingText,
+        callbackQueryId,
+        updateId: uid,
+        providerMessageId,
+        workflow: wf,
+      });
+    });
+    if (!r.ok) {
+      await audit({
+        userId: bot.ownerId,
+        actor: "system",
+        action: "bot_workflow_execute_failed",
+        targetType: "bot",
+        targetId: bot.id,
+        meta: { workflowId: wf.id, eventId: opts.eventId },
+      });
+    }
   }
-
-  return NextResponse.json({ ok: true, processed, lastUpdateId });
 }
 
 function matchesTrigger(wf: BotWorkflow, incomingText: string): boolean {

@@ -48,6 +48,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ errorFa: e.message }, { status: e.status });
     }
     const msg = e instanceof Error ? e.message : "خطای داخلی.";
-    return NextResponse.json({ errorFa: msg }, { status: 500 });
+    // M-10: log the raw error server-side, return a bounded generic
+    // message — raw Prisma/provider/SQL text must never reach clients.
+    console.error("admin wallet adjust failed:", msg);
+    return NextResponse.json({ errorFa: "خطا در تعدیل کیف پول." }, { status: 500 });
   }
 }

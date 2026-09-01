@@ -10,6 +10,7 @@ import { db } from "@/lib/db";
 import { requireUser, requireRole, clientIp, audit, AuthError, safeJsonParse } from "@/lib/server/auth";
 import { rateLimit } from "@/lib/security/cache";
 import { isContentStatus, assertTransition } from "@/lib/publishing/state";
+import { cancelQueuedJobsForContent } from "@/lib/queue/scheduler";
 
 const PatchSchema = z.object({
   title: z.string().trim().min(3, "عنوان باید حداقل ۳ نویسه باشد.").max(200).optional(),
@@ -184,6 +185,11 @@ export async function PATCH(req: Request, { params }: Params) {
   if (!fresh) {
     return NextResponse.json({ errorFa: "محتوا یافت نشد." }, { status: 404 });
   }
+  // M-05: cancelling content must also cancel its still-queued publish
+  // jobs — otherwise the worker claims and SENDS them later.
+  if (fresh.status === "cancelled") {
+    await cancelQueuedJobsForContent(id, "محتوا لغو شده است.");
+  }
 
   await audit({
     userId: user.id,
@@ -280,6 +286,9 @@ export async function DELETE(req: Request, { params }: Params) {
         { status: 409 },
       );
     }
+    // M-05: soft-deleted/cancelled content must not leave queued jobs
+    // behind — the worker would still claim and send them.
+    await cancelQueuedJobsForContent(id, "محتوا حذف/لغو شده است.");
     await audit({
       userId: user.id,
       actor: "user",

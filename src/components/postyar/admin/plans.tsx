@@ -91,13 +91,16 @@ import {
 } from "@/components/postyar/api";
 import { AdminGate } from "@/components/postyar/admin/gate";
 import { formatRials, toPersianDigits } from "@/lib/persian";
+// CLIENT BOUNDARY: import the feature catalog from the pure, Prisma-free
+// module — importing it from `@/lib/payments/plans` used to pull the whole
+// Prisma client into the browser bundle and crash at runtime.
 import {
   FEATURE_CATALOG,
   ALL_FEATURE_DEFS,
   countEnabledFeatures,
   isBooleanFeature,
   type PlanFeatureDef,
-} from "@/lib/payments/plans";
+} from "@/lib/payments/plan-catalog";
 
 // =====================================================================
 // Form state — features are kept as a `PlanFeatures` object (not JSON

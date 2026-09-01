@@ -4,13 +4,13 @@
 // §9 (cancelled jobs not published, no double-claim, duplicate
 // callbacks do not duplicate delivery). Tests the REAL lib functions:
 //   - schedulePublishJob  (src/lib/queue/scheduler.ts)
-//   - cancelJob            (src/lib/queue/scheduler.ts)
+//   - cancelQueuedJobsForContent (src/lib/queue/scheduler.ts)
 //   - runWorkerOnce        (src/lib/queue/worker.ts)
 //   - assertTransition     (src/lib/publishing/state.ts)
 // =====================================================================
 import { describe, test, expect, beforeEach, beforeAll } from "bun:test";
 import { db, resetDb, seedUser, seedDestination, seedContent, ensureDbConnected } from "./_db-helpers";
-import { schedulePublishJob, cancelJob } from "../src/lib/queue/scheduler";
+import { schedulePublishJob, cancelQueuedJobsForContent } from "../src/lib/queue/scheduler";
 import { runWorkerOnce } from "../src/lib/queue/worker";
 import { assertTransition, InvalidTransition } from "../src/lib/publishing/state";
 
@@ -108,7 +108,7 @@ describe("worker: cancelled jobs are NEVER claimed", () => {
     expect(after.status).toBe("cancelled"); // unchanged
   });
 
-  test("cancelJob marks a queued job as cancelled; runWorkerOnce then skips it", async () => {
+  test("cancelQueuedJobsForContent marks a queued job as cancelled; runWorkerOnce then skips it", async () => {
     const u = await seedUser();
     const d = await seedDestination({ ownerId: u.id });
     const c = await seedContent({ ownerId: u.id });
@@ -118,7 +118,7 @@ describe("worker: cancelled jobs are NEVER claimed", () => {
       idempotencyKey: `cj2-${Date.now()}`,
       status: "queued",
     });
-    await cancelJob(job.id);
+    await cancelQueuedJobsForContent(c.id, "محتوا لغو شده است.");
     const summary = await runWorkerOnce(5);
     expect(summary.processed).toBe(0);
     const after = await db.publishJob.findUniqueOrThrow({ where: { id: job.id } });

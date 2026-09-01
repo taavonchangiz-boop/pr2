@@ -201,7 +201,7 @@ model PublishJob {
   content       Content  @relation(fields: [contentId], references: [id], onDelete: Cascade)
   destinationId String
   destination   Destination @relation(fields: [destinationId], references: [id], onDelete: Cascade)
-  status        String   @default("queued") // queued|locked|processing|delivered|failed|cancelled
+  status        String   @default("queued") // queued|processing|delivered|failed|cancelled
   runAt         DateTime @default(now())
   lockedAt      DateTime?
   lockedBy      String?
@@ -209,6 +209,12 @@ model PublishJob {
   maxAttempts   Int      @default(3)
   idempotencyKey String  @unique
   resultPayload String?  // JSON
+  // M-06: set immediately BEFORE the provider send. A row carrying this
+  // marker whose process died before the delivered/failed CAS proves an
+  // outbound attempt was in flight — at-least-once semantics are then
+  // observable and bounded by maxAttempts (provider APIs have no
+  // idempotent send, so exactly-once is not claimable).
+  deliveryAttemptedAt DateTime?
   failureReason String?
   deliveredAt   DateTime?
   createdAt     DateTime @default(now())
@@ -704,6 +710,7 @@ model Bot {
   linkCodes     BotLinkCode[]
   history       BotHistory[]
   workflows     BotWorkflow[]
+  inboundEvents BotInboundEvent[]
   @@index([ownerId])
 }
 
@@ -718,6 +725,7 @@ model BotWorkflow {
   triggerValue  String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+  runs          BotWorkflowRun[]
 }
 
 model BotLinkCode {
@@ -751,6 +759,60 @@ model BotHistory {
   raw           String?  // sanitized JSON
   createdAt     DateTime @default(now())
   @@index([botId])
+}
+
+// C-04/H-03 — DURABLE inbound-event inbox (single authoritative dedup
+// owner). The previous volatile claim (cache INCR with TTL) was
+// at-most-once: a crash between the claim and workflow completion made
+// the provider's retry land on an existing claim and be dropped
+// forever, and without REDIS_URL multi-process deployments collapsed
+// per-process. The DB row below is the authoritative event state:
+//   * UNIQUE (botId, provider, externalEventId) collapses duplicates.
+//   * status carries received → processing → completed | failed → dead.
+//   * leaseUntil + CAS takeover recover crashed/stale processing.
+//   * failed events with attempts < max are retryable (provider
+//     redelivery or the bounded recovery scan in the webhook layer).
+// The sanitized provider payload is persisted so a recovery pass can
+// re-execute the event without a live redelivery.
+model BotInboundEvent {
+  id              String    @id @default(cuid())
+  botId           String
+  bot             Bot       @relation(fields: [botId], references: [id], onDelete: Cascade)
+  provider        String    // telegram|bale|rubika
+  externalEventId String    // provider update_id / message_id (string)
+  status          String    @default("received") // received|processing|completed|failed|dead
+  attempts        Int       @default(0)
+  leaseUntil      DateTime?
+  lastError       String?
+  payload         String?   // sanitized JSON of the raw update (recovery input)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  completedAt     DateTime?
+  workflowRuns    BotWorkflowRun[]
+
+  @@unique([botId, provider, externalEventId])
+  @@index([botId, status, leaseUntil])
+  @@index([botId, updatedAt])
+}
+
+// Per-workflow execution record for one inbound event: unique
+// (eventId, workflowId) guarantees each intended workflow executes at
+// most once per event even across crashes and recovery passes; failed
+// runs are retryable while completed runs never repeat.
+model BotWorkflowRun {
+  id          String          @id @default(cuid())
+  eventId     String
+  event       BotInboundEvent @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  workflowId  String
+  workflow    BotWorkflow     @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  status      String          @default("pending") // pending|completed|failed
+  attempts    Int             @default(0)
+  lastError   String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([eventId, workflowId])
+  @@index([workflowId])
 }
 
 model AutoResponder {

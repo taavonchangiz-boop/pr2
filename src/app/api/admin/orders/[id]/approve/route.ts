@@ -161,29 +161,35 @@ export async function POST(req: Request, { params }: Params) {
         : [];
       nextMeta.adminNotes = [...prevNotes, { at: new Date().toISOString(), by: user.id, notes: notes.trim() }];
     }
-    await db.order.update({
-      where: { id: order.id },
-      data: { metadata: JSON.stringify(nextMeta) },
-    });
-
-    await audit({
-      userId: order.userId,
-      actor: "admin",
-      action: "order_manual_override",
-      targetType: "order",
-      targetId: order.id,
-      ip,
-      meta: {
-        adminId: user.id,
-        isSuperAdmin,
-        overrideReason,
-        amountRials: order.amountRials,
-        kind: order.kind,
-        provider: order.provider,
-        providerVerified: false,
-        subscriptionId: result.subscriptionId || undefined,
-        notes: notes ?? null,
-      },
+    // M-04: the manual-override metadata update and its audit row commit
+    // atomically (one transaction) — the override is never recorded
+    // without its durable audit trail.
+    await db.$transaction(async (tx) => {
+      await tx.order.update({
+        where: { id: order.id },
+        data: { metadata: JSON.stringify(nextMeta) },
+      });
+      await audit({
+        userId: order.userId,
+        actor: "admin",
+        action: "order_manual_override",
+        targetType: "order",
+        targetId: order.id,
+        ip,
+        tx,
+        critical: true,
+        meta: {
+          adminId: user.id,
+          isSuperAdmin,
+          overrideReason,
+          amountRials: order.amountRials,
+          kind: order.kind,
+          provider: order.provider,
+          providerVerified: false,
+          subscriptionId: result.subscriptionId || undefined,
+          notes: notes ?? null,
+        },
+      });
     });
 
     // Notify the user. P0.7.7: notification delivery must never invalidate
